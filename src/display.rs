@@ -1,10 +1,12 @@
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::{AnyInputPin, Input, Output, PinDriver, Pull};
+use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver, Pull};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::spi::{config, Dma, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
+use esp_idf_hal::sys;
 use esp_idf_hal::units::*;
 use log::{debug, info, warn};
+use std::ptr;
 
 const DISPLAY_WIDTH: usize = 800;
 const DISPLAY_HEIGHT: usize = 480;
@@ -30,9 +32,14 @@ const CMD_DISPLAY_UPDATE_CTRL2: u8 = 0x22;
 const CMD_MASTER_ACTIVATION: u8 = 0x20;
 
 const CTRL1_BYPASS_RED: u8 = 0x40;
+const BUSY_ACTIVE_HIGH: bool = true;
+const INIT_BUSY_TIMEOUT_MS: u32 = 2_000;
+const REFRESH_BUSY_TIMEOUT_MS: u32 = 30_000;
+const SPI_WRITE_CHUNK: usize = 4096;
 
 pub struct Display {
     spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
+    cs: PinDriver<'static, Output>,
     dc: PinDriver<'static, Output>,
     rst: PinDriver<'static, Output>,
     busy: PinDriver<'static, Input>,
@@ -48,13 +55,17 @@ impl Display {
             peripherals.pins.gpio8,
             peripherals.pins.gpio10,
             None::<AnyInputPin>,
-            Some(peripherals.pins.gpio21),
-            &SpiDriverConfig::new().dma(Dma::Auto(4096)),
-            &config::Config::new().baudrate(10.MHz().into()),
+            None::<AnyOutputPin>,
+            &SpiDriverConfig::new().dma(Dma::Auto(SPI_WRITE_CHUNK)),
+            &config::Config::new()
+                .baudrate(10.MHz().into())
+                .write_only(true)
+                .polling(true),
         )?;
 
         Ok(Self {
             spi,
+            cs: PinDriver::output(peripherals.pins.gpio21)?,
             dc: PinDriver::output(peripherals.pins.gpio4)?,
             rst: PinDriver::output(peripherals.pins.gpio5)?,
             busy: PinDriver::input(peripherals.pins.gpio6, Pull::Floating)?,
@@ -66,6 +77,9 @@ impl Display {
 
     pub fn begin(&mut self) -> Result<()> {
         info!("Initializing X4 SSD1677 e-ink display");
+        self.configure_gpio()?;
+        self.dump_gpio_config();
+        self.cs.set_high()?;
         self.dc.set_high()?;
         self.reset_display()?;
         info!("Display reset complete");
@@ -105,7 +119,7 @@ impl Display {
     fn init_controller(&mut self) -> Result<()> {
         info!("Display init: soft reset");
         self.send_command(CMD_SOFT_RESET)?;
-        self.wait_while_busy("soft reset");
+        self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS);
 
         info!("Display init: temperature sensor");
         self.send_command(CMD_TEMP_SENSOR_CONTROL)?;
@@ -133,12 +147,12 @@ impl Display {
         info!("Display init: clear BW RAM");
         self.send_command(CMD_AUTO_WRITE_BW_RAM)?;
         self.send_data_byte(0xF7)?;
-        self.wait_while_busy("auto write BW RAM");
+        self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS);
 
         info!("Display init: clear RED RAM");
         self.send_command(CMD_AUTO_WRITE_RED_RAM)?;
         self.send_data_byte(0xF7)?;
-        self.wait_while_busy("auto write RED RAM");
+        self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS);
 
         Ok(())
     }
@@ -194,7 +208,7 @@ impl Display {
         self.send_data_byte(0xF4)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("full refresh");
+        self.wait_while_busy("full refresh", REFRESH_BUSY_TIMEOUT_MS);
         info!("Display full refresh complete");
         Ok(())
     }
@@ -207,7 +221,9 @@ impl Display {
 
     fn send_command(&mut self, command: u8) -> Result<()> {
         self.dc.set_low()?;
+        self.cs.set_low()?;
         self.spi.write(&[command])?;
+        self.cs.set_high()?;
         self.dc.set_high()?;
         Ok(())
     }
@@ -218,22 +234,85 @@ impl Display {
 
     fn send_data(&mut self, data: &[u8]) -> Result<()> {
         self.dc.set_high()?;
-        for chunk in data.chunks(2048) {
+        self.cs.set_low()?;
+        for chunk in data.chunks(SPI_WRITE_CHUNK) {
             self.spi.write(chunk)?;
         }
+        self.cs.set_high()?;
         Ok(())
     }
 
-    fn wait_while_busy(&self, label: &str) {
+    fn wait_while_busy(&self, label: &str, timeout_ms: u32) {
         let mut elapsed_ms = 0u32;
-        while self.busy.is_high() && elapsed_ms < 30_000 {
+        let initial_busy = self.is_busy();
+        debug!(
+            "Display wait start: {label}; busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}"
+        );
+
+        while self.is_busy() && elapsed_ms < timeout_ms {
             FreeRtos::delay_ms(1);
             elapsed_ms += 1;
         }
-        if elapsed_ms >= 30_000 {
-            warn!("Display wait timed out: {label}");
+
+        if elapsed_ms >= timeout_ms {
+            warn!("Display wait timed out: {label}; busy={}", self.is_busy());
         } else {
-            debug!("Display wait complete: {label} ({elapsed_ms} ms)");
+            debug!(
+                "Display wait complete: {label} ({elapsed_ms} ms); busy={}",
+                self.is_busy()
+            );
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        if BUSY_ACTIVE_HIGH {
+            self.busy.is_high()
+        } else {
+            self.busy.is_low()
+        }
+    }
+
+    fn configure_gpio(&self) -> Result<()> {
+        let output_mask = (1_u64 << 4) | (1_u64 << 5) | (1_u64 << 21);
+        let input_mask = 1_u64 << 6;
+
+        unsafe {
+            sys::gpio_deep_sleep_hold_dis();
+            for pin in [4, 5, 6, 8, 10, 21] {
+                let _ = sys::gpio_hold_dis(pin);
+            }
+
+            let output_config = sys::gpio_config_t {
+                pin_bit_mask: output_mask,
+                mode: sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+                pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
+                pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
+                intr_type: sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+            };
+            sys::esp!(sys::gpio_config(&output_config))?;
+
+            let input_config = sys::gpio_config_t {
+                pin_bit_mask: input_mask,
+                mode: sys::gpio_mode_t_GPIO_MODE_INPUT,
+                pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
+                pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
+                intr_type: sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+            };
+            sys::esp!(sys::gpio_config(&input_config))?;
+        }
+
+        Ok(())
+    }
+
+    fn dump_gpio_config(&self) {
+        let mask = (1_u64 << 4)
+            | (1_u64 << 5)
+            | (1_u64 << 6)
+            | (1_u64 << 8)
+            | (1_u64 << 10)
+            | (1_u64 << 21);
+        unsafe {
+            let _ = sys::gpio_dump_io_configuration(ptr::null_mut(), mask);
         }
     }
 
