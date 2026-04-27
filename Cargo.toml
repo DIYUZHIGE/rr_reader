@@ -1,0 +1,24 @@
+[package]
+name = "rr_reader"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "rr_reader"
+path = "src/main.rs"
+harness = false
+
+[features]
+default = ["std"]
+std = ["esp-idf-hal/std", "esp-idf-svc/std"]
+
+[dependencies]
+anyhow = "1"
+esp-idf-hal = "0.46.2"
+esp-idf-svc = "0.52.1"
+log = "0.4"
+
+[build-dependencies]
+embuild = "0.33"
