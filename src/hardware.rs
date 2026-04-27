@@ -1,3 +1,5 @@
+use crate::input::InputManager;
+use crate::storage::Storage;
 use anyhow::Result;
 use log::info;
 
@@ -11,33 +13,41 @@ pub enum DeviceModel {
 }
 
 pub struct Hardware {
-    model: DeviceModel,
+    pub model: DeviceModel,
+    pub input: InputManager,
+    pub storage: Storage,
 }
 
 impl Hardware {
-    pub fn new() -> Result<Self> {
+    pub fn new(input: InputManager) -> Result<Self> {
         Ok(Self {
             model: DeviceModel::X4,
+            input,
+            storage: Storage::new(),
         })
     }
 
     pub fn log_detected_model(&self) {
         info!(
-            "Hardware detect: {:?}; board={}; flash={}; serial={} baud",
+            "Hardware: {:?}; board={}; flash={}; serial={} baud",
             self.model, BOARD, FLASH_SIZE, SERIAL_BAUD
         );
     }
 
+    /// Mount SD card storage. Must be called after display SPI init (they share SPI2).
     pub fn mount_storage(&mut self) -> Result<()> {
-        info!("Storage init placeholder");
+        self.storage.mount()?;
+        self.storage.ensure_vault_dirs()?;
         Ok(())
     }
 
-    pub fn update_inputs(&mut self) -> Result<()> {
-        Ok(())
+    /// Update button state. Call once per loop iteration.
+    pub fn update_inputs(&mut self) {
+        self.input.update();
     }
 
+    /// Returns true if any button was pressed or released this tick.
     pub fn has_user_activity(&self) -> bool {
-        false
+        self.input.has_user_activity()
     }
 }

@@ -16,7 +16,7 @@ std = ["esp-idf-hal/std", "esp-idf-svc/std"]
 
 [dependencies]
 anyhow = "1"
-esp-idf-hal = "0.46.2"
+esp-idf-hal = { version = "0.46.2", features = ["adc-oneshot-legacy"] }
 esp-idf-svc = "0.52.1"
 log = "0.4"
 
