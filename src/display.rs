@@ -1,3 +1,4 @@
+use crate::font::Font;
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver, Pull};
@@ -195,6 +196,105 @@ impl Display {
         self.dirty = true;
     }
 
+    /// Render UTF-8 text with the given font at (x, y). Characters not in the
+    /// font are silently skipped. Use this for CJK-capable text rendering.
+    pub fn draw_text_font(
+        &mut self,
+        font: &Font,
+        text: &str,
+        x: usize,
+        y: usize,
+    ) {
+        let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
+        let mut cursor_x = x;
+        let mut cursor_y = y;
+
+        for ch in text.chars() {
+            let cp = ch as u32;
+
+            if cp == b'\n' as u32 {
+                cursor_x = x;
+                cursor_y += font.glyph_height as usize + 2;
+                continue;
+            }
+            if cp == b' ' as u32 {
+                cursor_x += font.glyph_width as usize;
+                continue;
+            }
+
+            if let Some(info) = font.find_glyph(cp) {
+                if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
+                    font.draw_glyph(
+                        &decompress_buf,
+                        cursor_x,
+                        cursor_y,
+                        DISPLAY_WIDTH,
+                        DISPLAY_HEIGHT,
+                        &mut self.framebuffer,
+                    );
+                }
+            }
+            cursor_x += font.glyph_width as usize;
+        }
+        self.dirty = true;
+    }
+
+    /// Render UTF-8 text with line wrapping. Returns the y coordinate after
+    /// the last line rendered.
+    pub fn draw_text_wrapped(
+        &mut self,
+        font: &Font,
+        text: &str,
+        x: usize,
+        mut y: usize,
+        max_x: usize,
+        line_spacing: usize,
+    ) -> usize {
+        let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
+        let start_x = x;
+        let mut cursor_x = x;
+
+        for ch in text.chars() {
+            let cp = ch as u32;
+
+            if cp == b'\n' as u32 {
+                cursor_x = start_x;
+                y += font.glyph_height as usize + line_spacing;
+                continue;
+            }
+
+            if cursor_x + font.glyph_width as usize > max_x {
+                cursor_x = start_x;
+                y += font.glyph_height as usize + line_spacing;
+            }
+
+            if y + font.glyph_height as usize > DISPLAY_HEIGHT {
+                break;
+            }
+
+            if cp == b' ' as u32 {
+                cursor_x += font.glyph_width as usize;
+                continue;
+            }
+
+            if let Some(info) = font.find_glyph(cp) {
+                if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
+                    font.draw_glyph(
+                        &decompress_buf,
+                        cursor_x,
+                        y,
+                        DISPLAY_WIDTH,
+                        DISPLAY_HEIGHT,
+                        &mut self.framebuffer,
+                    );
+                }
+            }
+            cursor_x += font.glyph_width as usize;
+        }
+        self.dirty = true;
+        y + font.glyph_height as usize + line_spacing
+    }
+
     pub fn framebuffer(&self) -> &[u8] {
         &self.framebuffer
     }
@@ -221,12 +321,16 @@ impl Display {
         info!("Display refresh: {:?}", mode);
         self.set_ram_area(0, 0, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)?;
 
-        let fb = self.framebuffer.clone();
+        // Borrow framebuffer without clone (we only read from it during refresh).
+        // SAFETY: framebuffer data is stable; refresh only reads the slice.
+        let fb = unsafe {
+            std::slice::from_raw_parts(self.framebuffer.as_ptr(), self.framebuffer.len())
+        };
 
         match mode {
-            RefreshMode::Full => self.refresh_full(&fb)?,
-            RefreshMode::Half => self.refresh_half(&fb)?,
-            RefreshMode::Fast => self.refresh_fast(&fb)?,
+            RefreshMode::Full => self.refresh_full(fb)?,
+            RefreshMode::Half => self.refresh_half(fb)?,
+            RefreshMode::Fast => self.refresh_fast(fb)?,
         }
 
         Ok(())
@@ -317,17 +421,25 @@ impl Display {
     }
 
     fn init_controller(&mut self) -> Result<()> {
-        info!("Display init: soft reset");
+        info!("Display init: sending soft reset command (0x{:02X})", CMD_SOFT_RESET);
         self.send_command(CMD_SOFT_RESET)?;
+        info!("Display init: soft reset command sent, waiting for busy...");
+
+        // SSD1677 datasheet: BUSY rises within 100μs after reset command.
+        // Give a small safety margin before polling.
+        FreeRtos::delay_ms(5);
         self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS);
+        info!("Display init: soft reset complete");
 
         info!("Display init: temperature sensor (internal)");
         self.send_command(CMD_TEMP_SENSOR_CONTROL)?;
         self.send_data_byte(0x80)?;
+        info!("Display init: temperature sensor done");
 
         info!("Display init: booster soft start");
         self.send_command(CMD_BOOSTER_SOFT_START)?;
         self.send_data(&[0xAE, 0xC7, 0xC3, 0xC0, 0x40])?;
+        info!("Display init: booster soft start done");
 
         info!("Display init: driver output control");
         self.send_command(CMD_DRIVER_OUTPUT_CONTROL)?;
@@ -337,22 +449,27 @@ impl Display {
             (height_minus_one >> 8) as u8,
             0x02, // SM=1: interlaced gate mode
         ])?;
+        info!("Display init: driver output control done");
 
         self.send_command(CMD_BORDER_WAVEFORM)?;
         self.send_data_byte(0x01)?;
+        info!("Display init: border waveform done");
 
         info!("Display init: RAM area");
         self.set_ram_area(0, 0, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)?;
+        info!("Display init: RAM area done");
 
         info!("Display init: clear BW RAM");
         self.send_command(CMD_AUTO_WRITE_BW_RAM)?;
         self.send_data_byte(0xF7)?; // White pattern for all pixels
         self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS);
+        info!("Display init: clear BW RAM done");
 
         info!("Display init: clear RED RAM");
         self.send_command(CMD_AUTO_WRITE_RED_RAM)?;
         self.send_data_byte(0xF7)?;
         self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS);
+        info!("Display init: clear RED RAM done");
 
         Ok(())
     }
@@ -428,19 +545,26 @@ impl Display {
     fn wait_while_busy(&self, label: &str, timeout_ms: u32) {
         let mut elapsed_ms = 0u32;
         let initial_busy = self.is_busy();
-        debug!(
-            "Display wait: {label}; busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}"
+        info!(
+            "Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}"
         );
 
         while self.is_busy() && elapsed_ms < timeout_ms {
             FreeRtos::delay_ms(1);
             elapsed_ms += 1;
+            // Periodically report stuck state for diagnosis
+            if elapsed_ms % 500 == 0 {
+                info!(
+                    "Display wait: {label} ({elapsed_ms} ms); still busy={}",
+                    self.is_busy()
+                );
+            }
         }
 
         if elapsed_ms >= timeout_ms {
             warn!("Display wait timed out: {label}; still busy={}", self.is_busy());
         } else {
-            debug!(
+            info!(
                 "Display wait done: {label} ({elapsed_ms} ms); busy={}",
                 self.is_busy()
             );
@@ -455,7 +579,9 @@ impl Display {
         }
     }
 
-    // ── GPIO config ─────────────────────────────────────────────
+    // ── GPIO debug ────────────────────────────────────────────────
+
+    // ── GPIO config ────────────────────────────────────────────────
 
     fn configure_gpio(&self) -> Result<()> {
         let output_mask = (1_u64 << 4) | (1_u64 << 5) | (1_u64 << 21);

@@ -2,6 +2,7 @@
 
 mod app;
 mod display;
+mod font;
 mod hardware;
 mod input;
 mod power;
