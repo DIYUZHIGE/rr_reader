@@ -31,7 +31,13 @@ fn main() -> Result<()> {
     // Input manager uses raw sys:: calls (doesn't own peripherals)
     let input_manager = input::InputManager::new()?;
 
-    // Display takes the full Peripherals (owns SPI2 + GPIO pins)
+    // Initialize the shared SPI2 bus via SDSPI host.
+    // This must happen BEFORE Display::new() so the display can add itself
+    // as a device on the already-initialized bus.
+    storage::init_spi_bus()?;
+
+    // Display adds itself as a raw SPI device on the shared bus.
+    // Takes full Peripherals (uses GPIO pins; SPI peripherals are unused here).
     let display = display::Display::new(peripherals)?;
 
     // Initialize hardware (combines input and storage)

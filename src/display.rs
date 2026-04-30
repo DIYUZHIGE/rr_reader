@@ -1,11 +1,9 @@
 use crate::font::Font;
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver, Pull};
+use esp_idf_hal::gpio::{Input, Output, PinDriver, Pull};
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::spi::{config, Dma, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
 use esp_idf_hal::sys;
-use esp_idf_hal::units::*;
 use log::{debug, info, warn};
 use std::ptr;
 
@@ -74,7 +72,7 @@ pub enum RefreshMode {
 }
 
 pub struct Display {
-    spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
+    spi_handle: sys::spi_device_handle_t,
     cs: PinDriver<'static, Output>,
     dc: PinDriver<'static, Output>,
     rst: PinDriver<'static, Output>,
@@ -89,22 +87,32 @@ pub struct Display {
 }
 
 impl Display {
+    /// Create display driver. The SPI bus must already be initialized
+    /// (typically by sdspi_host_init for SD card sharing). This adds the
+    /// display as a device on the shared SPI2 bus.
     pub fn new(peripherals: Peripherals) -> Result<Self> {
-        let spi = SpiDeviceDriver::new_single(
-            peripherals.spi2,
-            peripherals.pins.gpio8,
-            peripherals.pins.gpio10,
-            None::<AnyInputPin>,
-            None::<AnyOutputPin>,
-            &SpiDriverConfig::new().dma(Dma::Auto(SPI_WRITE_CHUNK)),
-            &config::Config::new()
-                .baudrate(40.MHz().into())
-                .write_only(true)
-                .polling(true),
-        )?;
+        // Add display as a device on the shared SPI2 bus (no CS — manual control)
+        let device_config = sys::spi_device_interface_config_t {
+            spics_io_num: -1, // Manual CS control
+            clock_speed_hz: 40_000_000,
+            mode: 0,
+            queue_size: 1,
+            ..Default::default()
+        };
+
+        let mut handle: sys::spi_device_handle_t = ptr::null_mut();
+        unsafe {
+            sys::esp!(sys::spi_bus_add_device(
+                sys::spi_host_device_t_SPI2_HOST,
+                &device_config,
+                &mut handle,
+            ))?;
+        }
+
+        info!("Display SPI device added to shared bus (40 MHz)");
 
         Ok(Self {
-            spi,
+            spi_handle: handle,
             cs: PinDriver::output(peripherals.pins.gpio21)?,
             dc: PinDriver::output(peripherals.pins.gpio4)?,
             rst: PinDriver::output(peripherals.pins.gpio5)?,
@@ -120,7 +128,7 @@ impl Display {
     // ── public API ──────────────────────────────────────────────
 
     pub fn begin(&mut self) -> Result<()> {
-        info!("Initializing X4 SSD1677 e-ink display (40 MHz SPI)");
+        info!("Initializing X4 SSD1677 e-ink display (40 MHz SPI, shared bus)");
         self.configure_gpio()?;
         self.dump_gpio_config();
         self.cs.set_high()?;
@@ -515,12 +523,22 @@ impl Display {
         Ok(())
     }
 
-    // ── SPI helpers ─────────────────────────────────────────────
+    // ── SPI helpers (raw spi_device_transmit) ───────────────────
+
+    fn spi_transmit(&mut self, data: &[u8]) -> Result<()> {
+        let mut trans: sys::spi_transaction_t = unsafe { std::mem::zeroed() };
+        trans.length = (data.len() * 8) as usize;
+        trans.__bindgen_anon_1.tx_buffer = data.as_ptr() as *const _;
+        unsafe {
+            sys::esp!(sys::spi_device_transmit(self.spi_handle, &mut trans))?;
+        }
+        Ok(())
+    }
 
     fn send_command(&mut self, command: u8) -> Result<()> {
         self.dc.set_low()?;
         self.cs.set_low()?;
-        self.spi.write(&[command])?;
+        self.spi_transmit(&[command])?;
         self.cs.set_high()?;
         self.dc.set_high()?;
         Ok(())
@@ -534,7 +552,7 @@ impl Display {
         self.dc.set_high()?;
         self.cs.set_low()?;
         for chunk in data.chunks(SPI_WRITE_CHUNK) {
-            self.spi.write(chunk)?;
+            self.spi_transmit(chunk)?;
         }
         self.cs.set_high()?;
         Ok(())
@@ -578,8 +596,6 @@ impl Display {
             self.busy.is_low()
         }
     }
-
-    // ── GPIO debug ────────────────────────────────────────────────
 
     // ── GPIO config ────────────────────────────────────────────────
 

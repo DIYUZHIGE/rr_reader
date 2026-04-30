@@ -23,3 +23,7 @@ log = "0.4"
 
 [build-dependencies]
 embuild = "0.33"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["native"]
+bindings_header = "native/include/rr_idf_shim.h"
