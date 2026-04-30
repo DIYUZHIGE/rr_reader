@@ -130,7 +130,6 @@ impl Display {
     pub fn begin(&mut self) -> Result<()> {
         info!("Initializing X4 SSD1677 e-ink display (40 MHz SPI, shared bus)");
         self.configure_gpio()?;
-        self.dump_gpio_config();
         self.cs.set_high()?;
         self.dc.set_high()?;
         self.reset_display()?;
@@ -629,18 +628,6 @@ impl Display {
         }
 
         Ok(())
-    }
-
-    fn dump_gpio_config(&self) {
-        let mask = (1_u64 << 4)
-            | (1_u64 << 5)
-            | (1_u64 << 6)
-            | (1_u64 << 8)
-            | (1_u64 << 10)
-            | (1_u64 << 21);
-        unsafe {
-            let _ = sys::gpio_dump_io_configuration(ptr::null_mut(), mask);
-        }
     }
 
     // ── basic drawing ───────────────────────────────────────────
