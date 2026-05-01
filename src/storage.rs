@@ -13,9 +13,10 @@ use esp_idf_hal::sys;
 use log::{info, warn};
 use std::ffi::CString;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 const SD_MOUNT_POINT: &str = "/sdcard";
+const VAULT_DIR: &str = "vault";
 const SPI2_HOST: sys::spi_host_device_t = sys::spi_host_device_t_SPI2_HOST;
 
 pub struct Storage {
@@ -89,7 +90,7 @@ impl Storage {
             use_one_fat: false,
         };
 
-        let base_path = CString::new(SD_MOUNT_POINT).unwrap();
+        let base_path = CString::new(SD_MOUNT_POINT)?;
         let ret = unsafe {
             sys::esp_vfs_fat_sdspi_mount(
                 base_path.as_ptr(),
@@ -117,7 +118,7 @@ impl Storage {
 
     /// Ensure the vault directory structure exists.
     pub fn ensure_vault_dirs(&self) -> Result<()> {
-        let vault = Path::new(SD_MOUNT_POINT).join("vault");
+        let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
         let notes = vault.join("notes");
         fs::create_dir_all(&notes).map_err(|e| anyhow!("mkdir {:?}: {}", notes, e))?;
         info!("Vault dirs ready: {:?}", vault);
@@ -129,7 +130,8 @@ impl Storage {
     /// This covers both a copied Obsidian vault directly under /sdcard/vault
     /// and the eventual sync cache layout under /sdcard/vault/notes.
     pub fn list_markdown_files(&self, base: &str) -> Result<Vec<String>> {
-        let scan_root = Path::new(SD_MOUNT_POINT).join("vault").join(base);
+        let base = Self::validated_relative_path(base)?;
+        let scan_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(base);
         let mut files = Vec::new();
         self.collect_markdown_files(&scan_root, &scan_root, &mut files)?;
 
@@ -179,25 +181,52 @@ impl Storage {
 
     /// Read a markdown file relative to /sdcard/vault.
     pub fn read_markdown_file(&self, rel_path: &str) -> Result<String> {
-        let rel = Path::new(rel_path);
-        if rel.is_absolute() {
-            return Err(anyhow!(
-                "absolute markdown path is not allowed: {}",
-                rel_path
-            ));
-        }
-
-        let full = Path::new(SD_MOUNT_POINT).join("vault").join(rel);
+        let rel = Self::validated_relative_path(rel_path)?;
+        let full = Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel);
         fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
     /// Read any file by absolute path under /sdcard.
     pub fn read_file(&self, path: &str) -> Result<String> {
-        fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path, e))
+        let path = Self::validated_sdcard_absolute_path(path)?;
+        fs::read_to_string(path).map_err(|e| anyhow!("read {:?}: {}", path, e))
     }
 
     pub fn vault_path(&self) -> String {
-        format!("{}/vault", SD_MOUNT_POINT)
+        format!("{}/{}", SD_MOUNT_POINT, VAULT_DIR)
+    }
+
+    fn validated_relative_path(path: &str) -> Result<&Path> {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            return Err(anyhow!("absolute path is not allowed: {:?}", path));
+        }
+
+        for component in path.components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!("path escapes vault: {:?}", path));
+                }
+            }
+        }
+
+        Ok(path)
+    }
+
+    fn validated_sdcard_absolute_path(path: &str) -> Result<&Path> {
+        let path = Path::new(path);
+        if !path.is_absolute() || !path.starts_with(SD_MOUNT_POINT) {
+            return Err(anyhow!("path is outside {}: {:?}", SD_MOUNT_POINT, path));
+        }
+
+        for component in path.components() {
+            if matches!(component, Component::ParentDir | Component::Prefix(_)) {
+                return Err(anyhow!("path escapes {}: {:?}", SD_MOUNT_POINT, path));
+            }
+        }
+
+        Ok(path)
     }
 }
 
@@ -205,10 +234,11 @@ impl Drop for Storage {
     fn drop(&mut self) {
         if self.mounted {
             info!("Unmounting SD card");
-            let base_path = CString::new(SD_MOUNT_POINT).unwrap();
-            unsafe {
-                if !self.card.is_null() {
-                    sys::esp_vfs_fat_sdcard_unmount(base_path.as_ptr(), self.card);
+            if let Ok(base_path) = CString::new(SD_MOUNT_POINT) {
+                unsafe {
+                    if !self.card.is_null() {
+                        sys::esp_vfs_fat_sdcard_unmount(base_path.as_ptr(), self.card);
+                    }
                 }
             }
         }

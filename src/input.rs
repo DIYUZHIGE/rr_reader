@@ -1,6 +1,6 @@
 use anyhow::Result;
 use esp_idf_hal::sys;
-use log::info;
+use log::debug;
 
 // ── Hardware button indices ──────────────────────────────────────
 pub const BTN_BACK: u8 = 0;
@@ -158,7 +158,7 @@ impl InputManager {
             }
 
             self.current_state = state;
-            info!(
+            debug!(
                 "Input state: pressed={}, released={}, current=0x{:02x}",
                 Self::format_button_mask(pressed_events),
                 Self::format_button_mask(released_events),

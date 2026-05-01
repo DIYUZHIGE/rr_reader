@@ -456,28 +456,22 @@ impl Display {
             self.begin()?;
         }
 
-        info!("Display refresh: {:?}", mode);
+        debug!("Display refresh: {:?}", mode);
         self.set_ram_area(0, 0, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)?;
 
-        // Borrow framebuffer without clone (we only read from it during refresh).
-        // SAFETY: framebuffer data is stable; refresh only reads the slice.
-        let fb = unsafe {
-            std::slice::from_raw_parts(self.framebuffer.as_ptr(), self.framebuffer.len())
-        };
-
         match mode {
-            RefreshMode::Full => self.refresh_full(fb, poll)?,
-            RefreshMode::Half => self.refresh_half(fb, poll)?,
-            RefreshMode::Fast => self.refresh_fast(fb, poll)?,
+            RefreshMode::Full => self.refresh_full(poll)?,
+            RefreshMode::Half => self.refresh_half(poll)?,
+            RefreshMode::Fast => self.refresh_fast(poll)?,
         }
 
         Ok(())
     }
 
     /// Full refresh: write both RAM, bypass RED, full waveform.
-    fn refresh_full(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
-        self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
-        self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
+    fn refresh_full(&mut self, poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
+        self.write_framebuffer(CMD_WRITE_RAM_BW)?;
+        self.write_framebuffer(CMD_WRITE_RAM_RED)?;
 
         self.send_command(CMD_DISPLAY_UPDATE_CTRL1)?;
         self.send_data_byte(CTRL1_BYPASS_RED)?;
@@ -495,9 +489,9 @@ impl Display {
     }
 
     /// Half refresh: write both RAM, inject high temperature, skip temp load.
-    fn refresh_half(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
-        self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
-        self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
+    fn refresh_half(&mut self, poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
+        self.write_framebuffer(CMD_WRITE_RAM_BW)?;
+        self.write_framebuffer(CMD_WRITE_RAM_RED)?;
 
         // Inject high temperature to accelerate response
         self.send_command(CMD_WRITE_TEMPERATURE)?;
@@ -520,10 +514,10 @@ impl Display {
 
     /// Fast (differential) refresh: write only BW RAM, compare against RED RAM.
     /// Only pixels that differ from the previous frame are driven.
-    fn refresh_fast(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
+    fn refresh_fast(&mut self, poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
         // Write new frame to BW RAM only. RED RAM keeps the previous frame
         // so the controller can compute the delta.
-        self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
+        self.write_framebuffer(CMD_WRITE_RAM_BW)?;
         // Do NOT write RED RAM — keep the old frame for differential compare.
 
         // Normal mode: controller compares BW vs RED, only drives changed pixels
@@ -537,7 +531,7 @@ impl Display {
         self.wait_while_busy("fast refresh", REFRESH_BUSY_TIMEOUT_MS, poll)?;
 
         // After display, copy new frame to RED RAM as baseline for next differential
-        self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
+        self.write_framebuffer(CMD_WRITE_RAM_RED)?;
 
         self.red_ram_synced = true;
         self.fast_refresh_count += 1;
@@ -653,20 +647,38 @@ impl Display {
         Ok(())
     }
 
-    fn write_ram_buffer(&mut self, command: u8, data: &[u8]) -> Result<()> {
+    fn write_framebuffer(&mut self, command: u8) -> Result<()> {
         self.send_command(command)?;
-        self.send_data(data)?;
+        self.dc.set_high()?;
+        self.cs.set_low()?;
+
+        let handle = self.spi_handle;
+        let mut result = Ok(());
+        for chunk in self.framebuffer.chunks(SPI_WRITE_CHUNK) {
+            if let Err(e) = Self::spi_transmit_handle(handle, chunk) {
+                result = Err(e);
+                break;
+            }
+        }
+
+        let cs_result = self.cs.set_high();
+        result?;
+        cs_result?;
         Ok(())
     }
 
     // ── SPI helpers (raw spi_device_transmit) ───────────────────
 
     fn spi_transmit(&mut self, data: &[u8]) -> Result<()> {
+        Self::spi_transmit_handle(self.spi_handle, data)
+    }
+
+    fn spi_transmit_handle(handle: sys::spi_device_handle_t, data: &[u8]) -> Result<()> {
         let mut trans: sys::spi_transaction_t = unsafe { std::mem::zeroed() };
         trans.length = data.len() * 8;
         trans.__bindgen_anon_1.tx_buffer = data.as_ptr() as *const _;
         unsafe {
-            sys::esp!(sys::spi_device_transmit(self.spi_handle, &mut trans))?;
+            sys::esp!(sys::spi_device_transmit(handle, &mut trans))?;
         }
         Ok(())
     }
@@ -687,10 +699,16 @@ impl Display {
     fn send_data(&mut self, data: &[u8]) -> Result<()> {
         self.dc.set_high()?;
         self.cs.set_low()?;
+        let mut result = Ok(());
         for chunk in data.chunks(SPI_WRITE_CHUNK) {
-            self.spi_transmit(chunk)?;
+            if let Err(e) = self.spi_transmit(chunk) {
+                result = Err(e);
+                break;
+            }
         }
-        self.cs.set_high()?;
+        let cs_result = self.cs.set_high();
+        result?;
+        cs_result?;
         Ok(())
     }
 
@@ -704,7 +722,9 @@ impl Display {
     ) -> Result<()> {
         let mut elapsed_ms = 0u32;
         let initial_busy = self.is_busy();
-        info!("Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}");
+        debug!(
+            "Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}"
+        );
 
         while self.is_busy() && elapsed_ms < timeout_ms {
             if let Some(poll) = poll.as_deref_mut() {
@@ -714,7 +734,7 @@ impl Display {
             elapsed_ms += 1;
             // Periodically report stuck state for diagnosis
             if elapsed_ms % 500 == 0 {
-                info!(
+                debug!(
                     "Display wait: {label} ({elapsed_ms} ms); still busy={}",
                     self.is_busy()
                 );
@@ -728,7 +748,7 @@ impl Display {
             );
             return Err(anyhow!("display wait timed out: {label}"));
         } else {
-            info!(
+            debug!(
                 "Display wait done: {label} ({elapsed_ms} ms); busy={}",
                 self.is_busy()
             );

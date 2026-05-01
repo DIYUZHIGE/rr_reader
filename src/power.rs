@@ -10,37 +10,35 @@ const DEFAULT_SLEEP_TIMEOUT_SECS: u32 = 5 * 60; // 5 minutes
 pub const POWER_BUTTON_SLEEP_MS: u32 = 2000;
 
 pub struct PowerManager {
-    idle_ticks: u32,
-    sleep_timeout_ticks: u32, // in main loop ticks (~10ms each)
+    last_activity_ms: u64,
+    sleep_timeout_ms: u64,
     power_saving: bool,
 }
 
 impl PowerManager {
     pub fn new() -> Self {
         Self {
-            idle_ticks: 0,
-            sleep_timeout_ticks: DEFAULT_SLEEP_TIMEOUT_SECS * 100, // 5 min
+            last_activity_ms: now_ms(),
+            sleep_timeout_ms: DEFAULT_SLEEP_TIMEOUT_SECS as u64 * 1000,
             power_saving: false,
         }
     }
 
     pub fn mark_activity(&mut self) {
-        self.idle_ticks = 0;
+        self.last_activity_ms = now_ms();
         if self.power_saving {
             self.set_power_saving(false);
         }
     }
 
-    pub fn tick(&mut self) {
-        self.idle_ticks = self.idle_ticks.saturating_add(1);
-    }
+    pub fn tick(&mut self) {}
 
     pub fn should_sleep(&self) -> bool {
-        self.idle_ticks >= self.sleep_timeout_ticks
+        now_ms().saturating_sub(self.last_activity_ms) >= self.sleep_timeout_ms
     }
 
     pub fn set_sleep_timeout_secs(&mut self, secs: u32) {
-        self.sleep_timeout_ticks = secs * 100;
+        self.sleep_timeout_ms = secs as u64 * 1000;
     }
 
     pub fn set_power_saving(&mut self, enable: bool) {
