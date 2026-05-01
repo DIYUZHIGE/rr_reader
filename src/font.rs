@@ -49,7 +49,7 @@ impl Font {
         let glyph_width = data[4];
         let glyph_height = data[5];
         let glyph_count = u16::from_le_bytes([data[6], data[7]]);
-        let row_bytes = (glyph_width + 7) / 8;
+        let row_bytes = glyph_width.div_ceil(8);
         let glyph_bytes = row_bytes as u16 * glyph_height as u16;
 
         let min_len = 8 + glyph_count as usize * INDEX_ENTRY_SIZE;
@@ -162,7 +162,7 @@ impl Font {
         fb_height: usize,
         fb: &mut [u8],
     ) {
-        let fb_row_bytes = (fb_width + 7) / 8;
+        let fb_row_bytes = fb_width.div_ceil(8);
         for row in 0..self.glyph_height as usize {
             let screen_y = y + row;
             if screen_y >= fb_height {
@@ -208,17 +208,19 @@ pub fn utf8_codepoints(s: &str) -> impl Iterator<Item = (u32, usize)> + '_ {
 /// `max_x` (in pixels). Returns the y coordinate of the next line.
 /// `line_spacing` is extra pixels between lines (added to glyph height).
 /// Characters not found in the font are silently skipped (treated as space).
-pub fn draw_text_wrapped(
-    font: &Font,
-    text: &str,
-    mut x: usize,
-    mut y: usize,
-    max_x: usize,
-    fb_width: usize,
-    fb_height: usize,
-    line_spacing: usize,
-    fb: &mut [u8],
-) -> usize {
+pub struct TextWrapTarget<'a> {
+    pub x: usize,
+    pub y: usize,
+    pub max_x: usize,
+    pub fb_width: usize,
+    pub fb_height: usize,
+    pub line_spacing: usize,
+    pub fb: &'a mut [u8],
+}
+
+pub fn draw_text_wrapped(font: &Font, text: &str, target: TextWrapTarget<'_>) -> usize {
+    let mut x = target.x;
+    let mut y = target.y;
     let start_x = x;
     let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
 
@@ -228,18 +230,18 @@ pub fn draw_text_wrapped(
         // Handle newlines
         if cp == b'\n' as u32 {
             x = start_x;
-            y += font.glyph_height as usize + line_spacing;
+            y += font.glyph_height as usize + target.line_spacing;
             continue;
         }
 
         // Word-wrap: if the next glyph would overflow, advance to next line
         let advance = font.char_advance_width(ch);
-        if x + advance > max_x {
+        if x + advance > target.max_x {
             x = start_x;
-            y += font.glyph_height as usize + line_spacing;
+            y += font.glyph_height as usize + target.line_spacing;
         }
 
-        if y + font.glyph_height as usize > fb_height {
+        if y + font.glyph_height as usize > target.fb_height {
             break; // off screen
         }
 
@@ -251,12 +253,19 @@ pub fn draw_text_wrapped(
 
         if let Some(info) = font.find_glyph(cp) {
             if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
-                font.draw_glyph(&decompress_buf, x, y, fb_width, fb_height, fb);
+                font.draw_glyph(
+                    &decompress_buf,
+                    x,
+                    y,
+                    target.fb_width,
+                    target.fb_height,
+                    target.fb,
+                );
             }
         }
         // Glyph not found → skip (advance cursor anyway)
         x += advance;
     }
 
-    y + font.glyph_height as usize + line_spacing
+    y + font.glyph_height as usize + target.line_spacing
 }

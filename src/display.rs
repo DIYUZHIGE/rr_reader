@@ -53,8 +53,9 @@ const CTRL2_FAST: u8 = CTRL2_LUT | CTRL2_MODE | CTRL2_DISPLAY; // 0x1C
 
 // High temperature value to accelerate refresh in half mode
 const HALF_TEMPERATURE: u8 = 0x5A;
-// Insert a full refresh every N fast refreshes to clear ghosting
-const FAST_REFRESH_LIMIT: u32 = 20;
+// Insert a half refresh every N fast refreshes to clear ghosting without the
+// latency of a full refresh. CrossPoint defaults to a 15-page cleanup cadence.
+const FAST_REFRESH_CLEANUP_INTERVAL: u32 = 15;
 
 const BUSY_ACTIVE_HIGH: bool = true;
 const INIT_BUSY_TIMEOUT_MS: u32 = 2_000;
@@ -82,7 +83,7 @@ pub struct Display {
     initialized: bool,
     /// Whether RED RAM currently holds the same frame as framebuffer
     red_ram_synced: bool,
-    /// Count of consecutive fast refreshes since last full refresh
+    /// Count of consecutive fast refreshes since last cleanup refresh
     fast_refresh_count: u32,
 }
 
@@ -150,21 +151,22 @@ impl Display {
     }
 
     /// Flush the dirty framebuffer to the display. First display after init
-    /// always uses Full refresh. After that uses Fast refresh with automatic
-    /// Full insertion every N refreshes to clear ghosting.
+    /// uses Fast refresh whenever possible, with automatic Half insertion every
+    /// N refreshes to clear ghosting. Full is reserved for explicit forced
+    /// cleanup and boot screens that need the highest-quality baseline.
     pub fn flush_if_dirty(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
 
         let mode = if !self.red_ram_synced {
-            RefreshMode::Full
-        } else if self.fast_refresh_count >= FAST_REFRESH_LIMIT {
+            RefreshMode::Half
+        } else if self.fast_refresh_count >= FAST_REFRESH_CLEANUP_INTERVAL {
             debug!(
-                "Inserting periodic full refresh after {} fast refreshes",
+                "Inserting periodic half refresh after {} fast refreshes",
                 self.fast_refresh_count
             );
-            RefreshMode::Full
+            RefreshMode::Half
         } else {
             RefreshMode::Fast
         };
@@ -561,7 +563,7 @@ impl Display {
 
     fn spi_transmit(&mut self, data: &[u8]) -> Result<()> {
         let mut trans: sys::spi_transaction_t = unsafe { std::mem::zeroed() };
-        trans.length = (data.len() * 8) as usize;
+        trans.length = data.len() * 8;
         trans.__bindgen_anon_1.tx_buffer = data.as_ptr() as *const _;
         unsafe {
             sys::esp!(sys::spi_device_transmit(self.spi_handle, &mut trans))?;
