@@ -142,26 +142,6 @@ cargo fmt
 cargo check
 ```
 
-## 当前代码结构
-
-```text
-rr_reader/
-├── src/
-│   ├── main.rs       # 启动入口，初始化外设并进入主循环
-│   ├── app.rs        # 文件浏览器、Reader、输入处理和 UI 流程
-│   ├── display.rs    # SSD1677 显示驱动，Full/Half/Fast refresh
-│   ├── input.rs      # ADC 按键读取、去抖、逻辑按键映射
-│   ├── storage.rs    # SD 卡挂载和 vault 文件扫描
-│   ├── font.rs       # 压缩点阵字体解析和绘制
-│   ├── hardware.rs   # 硬件封装
-│   └── power.rs      # 深度睡眠
-├── generated/
-│   └── font_16.bin   # 内置 16px 字体
-├── native/           # ESP-IDF C shim
-└── tools/
-    └── generate_font.py
-```
-
 ## 设计取舍
 
 ### 先做本地 vault，再做同步
