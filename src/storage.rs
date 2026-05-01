@@ -12,11 +12,13 @@ use anyhow::{anyhow, Result};
 use esp_idf_hal::sys;
 use log::{info, warn};
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path};
 
 const SD_MOUNT_POINT: &str = "/sdcard";
 const VAULT_DIR: &str = "vault";
+const READ_CHUNK_SIZE: usize = 1024;
 const SPI2_HOST: sys::spi_host_device_t = sys::spi_host_device_t_SPI2_HOST;
 
 pub struct Storage {
@@ -186,6 +188,88 @@ impl Storage {
         fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
+    pub fn markdown_file_len(&self, rel_path: &str) -> Result<usize> {
+        let full = self.markdown_full_path(rel_path)?;
+        let len = fs::metadata(&full)
+            .map_err(|e| anyhow!("metadata {:?}: {}", full, e))?
+            .len();
+        usize::try_from(len).map_err(|_| anyhow!("file too large for platform: {:?}", full))
+    }
+
+    pub fn read_markdown_range(&self, rel_path: &str, start: usize, end: usize) -> Result<String> {
+        if start > end {
+            return Err(anyhow!("invalid read range: {}..{}", start, end));
+        }
+
+        let full = self.markdown_full_path(rel_path)?;
+        let mut file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| anyhow!("metadata {:?}: {}", full, e))?
+            .len() as usize;
+        if end > len {
+            return Err(anyhow!(
+                "read range exceeds file length: {}..{} > {}",
+                start,
+                end,
+                len
+            ));
+        }
+
+        let mut buf = vec![0u8; end - start];
+        file.seek(SeekFrom::Start(start as u64))
+            .map_err(|e| anyhow!("seek {:?}: {}", full, e))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| anyhow!("read {:?}: {}", full, e))?;
+        String::from_utf8(buf).map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))
+    }
+
+    pub fn scan_markdown_chars<F>(&self, rel_path: &str, mut visit: F) -> Result<()>
+    where
+        F: FnMut(usize, char) -> Result<()>,
+    {
+        let full = self.markdown_full_path(rel_path)?;
+        let mut file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
+        let mut chunk = [0u8; READ_CHUNK_SIZE];
+        let mut pending = Vec::with_capacity(READ_CHUNK_SIZE + 4);
+        let mut pending_offset = 0usize;
+
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|e| anyhow!("read {:?}: {}", full, e))?;
+            if read == 0 {
+                break;
+            }
+
+            pending.extend_from_slice(&chunk[..read]);
+            let valid_len = match std::str::from_utf8(&pending) {
+                Ok(valid) => valid.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(e) => return Err(anyhow!("read {:?}: invalid UTF-8: {}", full, e)),
+            };
+
+            let valid = std::str::from_utf8(&pending[..valid_len])
+                .map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))?;
+            for (offset, ch) in valid.char_indices() {
+                visit(pending_offset + offset, ch)?;
+            }
+
+            pending.drain(..valid_len);
+            pending_offset += valid_len;
+        }
+
+        if !pending.is_empty() {
+            let valid = std::str::from_utf8(&pending)
+                .map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))?;
+            for (offset, ch) in valid.char_indices() {
+                visit(pending_offset + offset, ch)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Read any file by absolute path under /sdcard.
     pub fn read_file(&self, path: &str) -> Result<String> {
         let path = Self::validated_sdcard_absolute_path(path)?;
@@ -194,6 +278,11 @@ impl Storage {
 
     pub fn vault_path(&self) -> String {
         format!("{}/{}", SD_MOUNT_POINT, VAULT_DIR)
+    }
+
+    fn markdown_full_path(&self, rel_path: &str) -> Result<std::path::PathBuf> {
+        let rel = Self::validated_relative_path(rel_path)?;
+        Ok(Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel))
     }
 
     fn validated_relative_path(path: &str) -> Result<&Path> {

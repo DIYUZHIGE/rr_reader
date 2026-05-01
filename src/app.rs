@@ -49,8 +49,159 @@ struct ReaderState {
 #[derive(Debug)]
 struct ReaderCache {
     file_index: usize,
-    content: String,
+    file_len: usize,
     page_starts: Vec<usize>,
+}
+
+struct ReaderPaginator<'a> {
+    font: &'a Font,
+    page_starts: Vec<usize>,
+    cursor_x: usize,
+    y: usize,
+    max_x: usize,
+    bottom_y: usize,
+    line_height: usize,
+    line_width: usize,
+    pending_word_start: usize,
+    pending_word_end: usize,
+    pending_word_width: usize,
+    pending_word: String,
+}
+
+impl<'a> ReaderPaginator<'a> {
+    fn new(font: &'a Font) -> Self {
+        let max_x = Display::width() - READER_RIGHT_MARGIN;
+        Self {
+            font,
+            page_starts: vec![0],
+            cursor_x: READER_X,
+            y: READER_TEXT_Y,
+            max_x,
+            bottom_y: Display::height() - READER_BOTTOM_MARGIN,
+            line_height: font.glyph_height as usize + 5,
+            line_width: max_x.saturating_sub(READER_X).max(1),
+            pending_word_start: 0,
+            pending_word_end: 0,
+            pending_word_width: 0,
+            pending_word: String::with_capacity(32),
+        }
+    }
+
+    fn push_char(&mut self, byte_index: usize, ch: char) {
+        if ch == '\r' {
+            return;
+        }
+
+        if ReaderApp::is_ascii_word_char(ch) {
+            if self.pending_word.is_empty() {
+                self.pending_word_start = byte_index;
+            }
+            self.pending_word_end = byte_index + ch.len_utf8();
+            self.pending_word_width += self.font.char_advance_width(ch);
+            self.pending_word.push(ch);
+            return;
+        }
+
+        self.flush_pending_word();
+
+        if ch == '\n' {
+            if !self.advance_line() {
+                self.page_starts.push(byte_index + ch.len_utf8());
+                self.y = READER_TEXT_Y;
+            }
+            return;
+        }
+
+        let width = self.font.char_advance_width(ch);
+        self.process_unit(
+            byte_index,
+            byte_index + ch.len_utf8(),
+            width,
+            ch == ' ' || ch == '\t',
+        );
+    }
+
+    fn finish(mut self, file_len: usize) -> Vec<usize> {
+        self.flush_pending_word();
+        self.page_starts.dedup();
+        if self.page_starts.len() > 1 && self.page_starts.last().copied() == Some(file_len) {
+            self.page_starts.pop();
+        }
+        self.page_starts
+    }
+
+    fn flush_pending_word(&mut self) {
+        if self.pending_word.is_empty() {
+            return;
+        }
+
+        if self.cursor_x > READER_X
+            && self.cursor_x + self.pending_word_width > self.max_x
+            && !self.advance_line()
+        {
+            self.page_starts.push(self.pending_word_start);
+            self.y = READER_TEXT_Y;
+        }
+
+        if self.pending_word_width <= self.line_width {
+            self.cursor_x += self.pending_word_width;
+        } else {
+            let word_len = self.pending_word.len();
+            for offset in 0..word_len {
+                let byte = self.pending_word.as_bytes()[offset];
+                let absolute_index = self.pending_word_start + offset;
+                let width = self.font.char_advance_width(byte as char);
+                if self.cursor_x > READER_X
+                    && self.cursor_x + width > self.max_x
+                    && !self.advance_line()
+                {
+                    self.page_starts.push(absolute_index);
+                    self.y = READER_TEXT_Y;
+                }
+                self.cursor_x += width;
+            }
+        }
+
+        self.pending_word.clear();
+        self.pending_word_width = 0;
+    }
+
+    fn process_unit(&mut self, start: usize, end: usize, width: usize, is_space: bool) {
+        if is_space {
+            if self.cursor_x == READER_X {
+                return;
+            }
+            if self.cursor_x + width > self.max_x {
+                if !self.advance_line() {
+                    self.page_starts.push(end);
+                    self.y = READER_TEXT_Y;
+                }
+            } else {
+                self.cursor_x += width;
+            }
+            return;
+        }
+
+        if self.cursor_x > READER_X && self.cursor_x + width > self.max_x && !self.advance_line() {
+            self.page_starts.push(start);
+            self.y = READER_TEXT_Y;
+        }
+        self.cursor_x += width;
+    }
+
+    fn advance_line(&mut self) -> bool {
+        self.cursor_x = READER_X;
+        if self
+            .y
+            .saturating_add(self.line_height)
+            .saturating_add(self.font.glyph_height as usize)
+            > self.bottom_y
+        {
+            return false;
+        }
+        self.y += self.line_height;
+        true
+    }
 }
 
 pub struct ReaderApp {
@@ -546,8 +697,26 @@ impl ReaderApp {
                     .page_starts
                     .get(page_index + 1)
                     .copied()
-                    .unwrap_or(cache.content.len());
-                let page_text = &cache.content[page_start..page_end];
+                    .unwrap_or(cache.file_len);
+                let page_text = match self
+                    .hardware
+                    .storage
+                    .read_markdown_range(&rel_path, page_start, page_end)
+                {
+                    Ok(page_text) => page_text,
+                    Err(e) => {
+                        self.display.draw_text_wrapped(
+                            &self.ui_font,
+                            &format!("Error reading {}:\n{}", rel_path, e),
+                            24,
+                            20,
+                            Display::width() - 24,
+                            4,
+                        );
+                        warn!("Failed to read {} page {}: {}", rel_path, page_index + 1, e);
+                        return;
+                    }
+                };
 
                 let (_, name) = Self::file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
@@ -558,7 +727,7 @@ impl ReaderApp {
                     .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
                 self.display.draw_text_wrapped(
                     &self.reader_font,
-                    page_text,
+                    &page_text,
                     READER_X,
                     READER_TEXT_Y,
                     Display::width() - READER_RIGHT_MARGIN,
@@ -608,11 +777,11 @@ impl ReaderApp {
         }
 
         let rel_path = &self.md_files[file_index];
-        let content = self.hardware.storage.read_markdown_file(rel_path)?;
-        let page_starts = self.paginate_reader_text(&content);
+        let file_len = self.hardware.storage.markdown_file_len(rel_path)?;
+        let page_starts = self.paginate_reader_file(rel_path, file_len)?;
         self.reader_cache = Some(ReaderCache {
             file_index,
-            content,
+            file_len,
             page_starts,
         });
         Ok(())
@@ -625,143 +794,19 @@ impl ReaderApp {
             .unwrap_or(0)
     }
 
-    fn paginate_reader_text(&self, text: &str) -> Vec<usize> {
-        let mut page_starts = vec![0];
-        let mut cursor_x = READER_X;
-        let mut y = READER_TEXT_Y;
-        let max_x = Display::width() - READER_RIGHT_MARGIN;
-        let bottom_y = Display::height() - READER_BOTTOM_MARGIN;
-        let line_height = self.reader_font.glyph_height as usize + 5;
-        let line_width = max_x.saturating_sub(READER_X).max(1);
-        let mut iter = text.char_indices().peekable();
-
-        while let Some((byte_index, ch)) = iter.next() {
-            if ch == '\r' {
-                continue;
-            }
-
-            if ch == '\n' {
-                if !Self::advance_reader_line(
-                    &mut cursor_x,
-                    &mut y,
-                    line_height,
-                    self.reader_font.glyph_height as usize,
-                    bottom_y,
-                ) {
-                    page_starts.push(Self::next_char_boundary(text, byte_index + ch.len_utf8()));
-                    y = READER_TEXT_Y;
-                }
-                continue;
-            }
-
-            let unit_start = byte_index;
-            let mut unit_end = byte_index + ch.len_utf8();
-            let mut unit_width = self.reader_font.char_advance_width(ch);
-            let is_space_unit = ch == ' ' || ch == '\t';
-
-            if Self::is_ascii_word_char(ch) {
-                while let Some(&(next_index, next)) = iter.peek() {
-                    if !Self::is_ascii_word_char(next) {
-                        break;
-                    }
-                    unit_end = next_index + next.len_utf8();
-                    unit_width += self.reader_font.char_advance_width(next);
-                    iter.next();
-                }
-            }
-
-            if is_space_unit {
-                if cursor_x == READER_X {
-                    continue;
-                }
-                if cursor_x + unit_width > max_x {
-                    if !Self::advance_reader_line(
-                        &mut cursor_x,
-                        &mut y,
-                        line_height,
-                        self.reader_font.glyph_height as usize,
-                        bottom_y,
-                    ) {
-                        page_starts.push(unit_end);
-                        y = READER_TEXT_Y;
-                    }
-                } else {
-                    cursor_x += unit_width;
-                }
-                continue;
-            }
-
-            if cursor_x > READER_X
-                && cursor_x + unit_width > max_x
-                && !Self::advance_reader_line(
-                    &mut cursor_x,
-                    &mut y,
-                    line_height,
-                    self.reader_font.glyph_height as usize,
-                    bottom_y,
-                )
-            {
-                page_starts.push(unit_start);
-                y = READER_TEXT_Y;
-            }
-
-            if unit_width <= line_width {
-                cursor_x += unit_width;
-                continue;
-            }
-
-            for (char_index, word_ch) in text[unit_start..unit_end].char_indices() {
-                let absolute_index = unit_start + char_index;
-                let advance = self.reader_font.char_advance_width(word_ch);
-                if cursor_x > READER_X
-                    && cursor_x + advance > max_x
-                    && !Self::advance_reader_line(
-                        &mut cursor_x,
-                        &mut y,
-                        line_height,
-                        self.reader_font.glyph_height as usize,
-                        bottom_y,
-                    )
-                {
-                    page_starts.push(absolute_index);
-                    y = READER_TEXT_Y;
-                }
-                cursor_x += advance;
-            }
-        }
-
-        page_starts.dedup();
-        if page_starts.len() > 1 && page_starts.last().copied() == Some(text.len()) {
-            page_starts.pop();
-        }
-        page_starts
-    }
-
-    fn advance_reader_line(
-        cursor_x: &mut usize,
-        y: &mut usize,
-        line_height: usize,
-        glyph_height: usize,
-        bottom_y: usize,
-    ) -> bool {
-        *cursor_x = READER_X;
-        if y.saturating_add(line_height).saturating_add(glyph_height) > bottom_y {
-            return false;
-        }
-        *y += line_height;
-        true
+    fn paginate_reader_file(&self, rel_path: &str, file_len: usize) -> Result<Vec<usize>> {
+        let mut paginator = ReaderPaginator::new(&self.reader_font);
+        self.hardware
+            .storage
+            .scan_markdown_chars(rel_path, |byte_index, ch| {
+                paginator.push_char(byte_index, ch);
+                Ok(())
+            })?;
+        Ok(paginator.finish(file_len))
     }
 
     fn is_ascii_word_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '#' | ':' | '@')
-    }
-
-    fn next_char_boundary(text: &str, mut index: usize) -> usize {
-        index = index.min(text.len());
-        while index < text.len() && !text.is_char_boundary(index) {
-            index += 1;
-        }
-        index
     }
 
     fn browser_row_count(&self) -> usize {
