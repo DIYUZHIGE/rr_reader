@@ -1,4 +1,5 @@
 use crate::input::{InputManager, BTN_POWER};
+use crate::time::now_ms;
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::reset::WakeupReason;
@@ -130,8 +131,4 @@ fn wait_for_power_button_release() {
     while unsafe { sys::gpio_get_level(sys::gpio_num_t_GPIO_NUM_3) } == 0 {
         FreeRtos::delay_ms(50);
     }
-}
-
-fn now_ms() -> u64 {
-    unsafe { (sys::esp_timer_get_time() / 1000) as u64 }
 }

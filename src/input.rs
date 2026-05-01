@@ -1,3 +1,4 @@
+use crate::time::now_ms;
 use anyhow::Result;
 use esp_idf_hal::sys;
 use log::debug;
@@ -382,8 +383,4 @@ impl InputManager {
     pub fn set_side_layout(&mut self, layout: SideButtonLayout) {
         self.side_layout = layout;
     }
-}
-
-fn now_ms() -> u64 {
-    unsafe { (sys::esp_timer_get_time() / 1000) as u64 }
 }

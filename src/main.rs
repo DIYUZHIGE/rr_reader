@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 
 mod app;
+mod browser;
 mod display;
 mod font;
 mod hardware;
 mod input;
 mod power;
+mod reader;
 mod storage;
+mod text;
+mod time;
 
 use anyhow::Result;
 use app::ReaderApp;

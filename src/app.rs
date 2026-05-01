@@ -1,12 +1,17 @@
+use crate::browser::{
+    file_browser_parts, sort_markdown_files, truncate_for_width, FileBrowserState,
+};
 use crate::display::{Display, RefreshMode};
 use crate::font::Font;
 use crate::hardware::Hardware;
 use crate::input::Button;
 use crate::power::{PowerManager, POWER_BUTTON_SLEEP_MS};
+use crate::reader::{
+    ReaderCache, ReaderPaginator, ReaderState, READER_RIGHT_MARGIN, READER_TEXT_Y, READER_X,
+};
+use crate::time::now_ms;
 use anyhow::Result;
-use esp_idf_hal::sys;
 use log::{info, warn};
-use std::borrow::Cow;
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
@@ -14,10 +19,6 @@ const LIST_TOP_Y: usize = 28;
 const LIST_BOTTOM_MARGIN: usize = 36;
 const LIST_X: usize = 48;
 const LIST_RIGHT_MARGIN: usize = 24;
-const READER_X: usize = 24;
-const READER_TEXT_Y: usize = 42;
-const READER_RIGHT_MARGIN: usize = 24;
-const READER_BOTTOM_MARGIN: usize = 36;
 const INPUT_STARTUP_IGNORE_MS: u64 = 300;
 const BROWSER_REPEAT_START_MS: u32 = 280;
 const BROWSER_REPEAT_INTERVAL_MS: u64 = 140;
@@ -32,176 +33,6 @@ static FONT_18_DATA: &[u8] = include_bytes!("../generated/font_18.bin");
 enum Activity {
     FileBrowser(FileBrowserState),
     Reader(ReaderState),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FileBrowserState {
-    selected: usize,
-    first_visible: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ReaderState {
-    file_index: usize,
-    page_index: usize,
-}
-
-#[derive(Debug)]
-struct ReaderCache {
-    file_index: usize,
-    file_len: usize,
-    page_starts: Vec<usize>,
-}
-
-struct ReaderPaginator<'a> {
-    font: &'a Font,
-    page_starts: Vec<usize>,
-    cursor_x: usize,
-    y: usize,
-    max_x: usize,
-    bottom_y: usize,
-    line_height: usize,
-    line_width: usize,
-    pending_word_start: usize,
-    pending_word_end: usize,
-    pending_word_width: usize,
-    pending_word: String,
-}
-
-impl<'a> ReaderPaginator<'a> {
-    fn new(font: &'a Font) -> Self {
-        let max_x = Display::width() - READER_RIGHT_MARGIN;
-        Self {
-            font,
-            page_starts: vec![0],
-            cursor_x: READER_X,
-            y: READER_TEXT_Y,
-            max_x,
-            bottom_y: Display::height() - READER_BOTTOM_MARGIN,
-            line_height: font.glyph_height as usize + 5,
-            line_width: max_x.saturating_sub(READER_X).max(1),
-            pending_word_start: 0,
-            pending_word_end: 0,
-            pending_word_width: 0,
-            pending_word: String::with_capacity(32),
-        }
-    }
-
-    fn push_char(&mut self, byte_index: usize, ch: char) {
-        if ch == '\r' {
-            return;
-        }
-
-        if ReaderApp::is_ascii_word_char(ch) {
-            if self.pending_word.is_empty() {
-                self.pending_word_start = byte_index;
-            }
-            self.pending_word_end = byte_index + ch.len_utf8();
-            self.pending_word_width += self.font.char_advance_width(ch);
-            self.pending_word.push(ch);
-            return;
-        }
-
-        self.flush_pending_word();
-
-        if ch == '\n' {
-            if !self.advance_line() {
-                self.page_starts.push(byte_index + ch.len_utf8());
-                self.y = READER_TEXT_Y;
-            }
-            return;
-        }
-
-        let width = self.font.char_advance_width(ch);
-        self.process_unit(
-            byte_index,
-            byte_index + ch.len_utf8(),
-            width,
-            ch == ' ' || ch == '\t',
-        );
-    }
-
-    fn finish(mut self, file_len: usize) -> Vec<usize> {
-        self.flush_pending_word();
-        self.page_starts.dedup();
-        if self.page_starts.len() > 1 && self.page_starts.last().copied() == Some(file_len) {
-            self.page_starts.pop();
-        }
-        self.page_starts
-    }
-
-    fn flush_pending_word(&mut self) {
-        if self.pending_word.is_empty() {
-            return;
-        }
-
-        if self.cursor_x > READER_X
-            && self.cursor_x + self.pending_word_width > self.max_x
-            && !self.advance_line()
-        {
-            self.page_starts.push(self.pending_word_start);
-            self.y = READER_TEXT_Y;
-        }
-
-        if self.pending_word_width <= self.line_width {
-            self.cursor_x += self.pending_word_width;
-        } else {
-            let word_len = self.pending_word.len();
-            for offset in 0..word_len {
-                let byte = self.pending_word.as_bytes()[offset];
-                let absolute_index = self.pending_word_start + offset;
-                let width = self.font.char_advance_width(byte as char);
-                if self.cursor_x > READER_X
-                    && self.cursor_x + width > self.max_x
-                    && !self.advance_line()
-                {
-                    self.page_starts.push(absolute_index);
-                    self.y = READER_TEXT_Y;
-                }
-                self.cursor_x += width;
-            }
-        }
-
-        self.pending_word.clear();
-        self.pending_word_width = 0;
-    }
-
-    fn process_unit(&mut self, start: usize, end: usize, width: usize, is_space: bool) {
-        if is_space {
-            if self.cursor_x == READER_X {
-                return;
-            }
-            if self.cursor_x + width > self.max_x {
-                if !self.advance_line() {
-                    self.page_starts.push(end);
-                    self.y = READER_TEXT_Y;
-                }
-            } else {
-                self.cursor_x += width;
-            }
-            return;
-        }
-
-        if self.cursor_x > READER_X && self.cursor_x + width > self.max_x && !self.advance_line() {
-            self.page_starts.push(start);
-            self.y = READER_TEXT_Y;
-        }
-        self.cursor_x += width;
-    }
-
-    fn advance_line(&mut self) -> bool {
-        self.cursor_x = READER_X;
-        if self
-            .y
-            .saturating_add(self.line_height)
-            .saturating_add(self.font.glyph_height as usize)
-            > self.bottom_y
-        {
-            return false;
-        }
-        self.y += self.line_height;
-        true
-    }
 }
 
 pub struct ReaderApp {
@@ -246,7 +77,7 @@ impl ReaderApp {
                 Vec::new()
             }
         };
-        Self::sort_markdown_files(&mut md_files);
+        sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
         // Show boot screen with status
@@ -612,8 +443,8 @@ impl ReaderApp {
                 self.display.fill_rect(24, y - 3, 4, row_height - 8, 0x00);
             }
 
-            let (_, name) = Self::file_browser_parts(&self.md_files[idx]);
-            let name = Self::truncate_for_width(
+            let (_, name) = file_browser_parts(&self.md_files[idx]);
+            let name = truncate_for_width(
                 &self.ui_font,
                 name,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN,
@@ -718,9 +549,9 @@ impl ReaderApp {
                     }
                 };
 
-                let (_, name) = Self::file_browser_parts(&rel_path);
+                let (_, name) = file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
-                let title = Self::truncate_for_width(&self.ui_font, &title, Display::width() - 48);
+                let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
                 self.display
                     .draw_text_font(&self.ui_font, &title, READER_X, 10);
                 self.display
@@ -805,10 +636,6 @@ impl ReaderApp {
         Ok(paginator.finish(file_len))
     }
 
-    fn is_ascii_word_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '#' | ':' | '@')
-    }
-
     fn browser_row_count(&self) -> usize {
         let row_height = self.browser_row_height();
         (Display::height() - LIST_TOP_Y - LIST_BOTTOM_MARGIN) / row_height
@@ -825,59 +652,6 @@ impl ReaderApp {
             .min(self.md_files.len().saturating_sub(row_count))
     }
 
-    fn truncate_for_width<'a>(font: &Font, text: &'a str, max_px: usize) -> Cow<'a, str> {
-        if font.text_width(text) <= max_px {
-            return Cow::Borrowed(text);
-        }
-
-        let ellipsis = "...";
-        let ellipsis_width = font.text_width(ellipsis);
-        if max_px <= ellipsis_width {
-            return Cow::Owned(".".repeat((max_px / font.char_advance_width('.')).max(1)));
-        }
-
-        let mut out = String::new();
-        let mut width = 0;
-        let limit = max_px - ellipsis_width;
-        for ch in text.chars() {
-            let advance = font.char_advance_width(ch);
-            if width + advance > limit {
-                break;
-            }
-            out.push(ch);
-            width += advance;
-        }
-        out.push_str(ellipsis);
-        Cow::Owned(out)
-    }
-
-    fn sort_markdown_files(files: &mut [String]) {
-        files.sort_by_cached_key(|path| {
-            let (folder, name) = Self::file_browser_parts(path);
-            (folder.to_lowercase(), name.to_lowercase(), path.to_string())
-        });
-    }
-
-    fn file_browser_parts(path: &str) -> (&str, &str) {
-        let (folder, file_name) = match path.rsplit_once('/') {
-            Some((folder, file_name)) if !folder.is_empty() => (folder, file_name),
-            _ => ("根目录", path),
-        };
-
-        (folder, Self::strip_markdown_extension(file_name))
-    }
-
-    fn strip_markdown_extension(file_name: &str) -> &str {
-        let lower = file_name.to_lowercase();
-        if lower.ends_with(".markdown") {
-            &file_name[..file_name.len() - ".markdown".len()]
-        } else if lower.ends_with(".md") {
-            &file_name[..file_name.len() - ".md".len()]
-        } else {
-            file_name
-        }
-    }
-
     pub fn loop_delay_ms(&self) -> u32 {
         if self.idle_ticks > 500 {
             IDLE_LOOP_DELAY_MS
@@ -885,8 +659,4 @@ impl ReaderApp {
             DEFAULT_LOOP_DELAY_MS
         }
     }
-}
-
-fn now_ms() -> u64 {
-    unsafe { (sys::esp_timer_get_time() / 1000) as u64 }
 }
