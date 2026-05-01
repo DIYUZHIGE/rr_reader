@@ -18,7 +18,7 @@ const LIST_INDENT: usize = 18;
 const CODE_INDENT: usize = 10;
 const IMAGE_TOP_GAP: usize = 6;
 const IMAGE_BOTTOM_GAP: usize = 8;
-const IMAGE_PLACEHOLDER_HEIGHT: usize = 384;
+const IMAGE_PLACEHOLDER_HEIGHT: usize = 402;
 const JPEG_DECODE_MAX_WIDTH: usize = 256;
 const JPEG_DECODE_MAX_HEIGHT: usize = 256;
 const MAX_JPEG_DIMENSION: u16 = 4096;
@@ -278,8 +278,12 @@ fn draw_reader_image<F, R>(
         if let Ok(decoded) = load_image(&image.path)
             .and_then(|reader| decode_jpeg_to_mono(reader, image.width, image.height))
         {
-            let (target_width, target_height) =
-                fit_dimensions(decoded.width, decoded.height, image.width, image.height);
+            let (target_width, target_height) = fit_dimensions_allow_upscale(
+                decoded.width,
+                decoded.height,
+                image.width,
+                image.height,
+            );
             let x = image.x + image.width.saturating_sub(target_width) / 2;
             display.draw_mono_bitmap_scaled(
                 x,
@@ -1248,6 +1252,26 @@ fn fit_dimensions(
     } else {
         let width = source_width.saturating_mul(max_height) / source_height.max(1);
         (width.max(1), max_height.max(1))
+    }
+}
+
+fn fit_dimensions_allow_upscale(
+    source_width: usize,
+    source_height: usize,
+    max_width: usize,
+    max_height: usize,
+) -> (usize, usize) {
+    let source_width = source_width.max(1);
+    let source_height = source_height.max(1);
+    let max_width = max_width.max(1);
+    let max_height = max_height.max(1);
+
+    let width_limited_height = source_height.saturating_mul(max_width) / source_width;
+    if width_limited_height <= max_height {
+        (max_width, width_limited_height.max(1))
+    } else {
+        let width = source_width.saturating_mul(max_height) / source_height;
+        (width.max(1), max_height)
     }
 }
 
