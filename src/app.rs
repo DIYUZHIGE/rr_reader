@@ -93,7 +93,7 @@ impl ReaderApp {
         info!("Found {} markdown files in vault", md_files.len());
 
         // Show boot screen with status
-        display.show_boot_screen()?;
+        draw_boot_screen(&mut display);
         display.draw_text_font(&ui_font, &format!("文件: {}", md_files.len()), 220, 280);
         display.flush_with_mode(RefreshMode::Full)?;
 
@@ -643,4 +643,10 @@ impl ReaderApp {
             DEFAULT_LOOP_DELAY_MS
         }
     }
+}
+
+fn draw_boot_screen(display: &mut Display) {
+    info!("Drawing boot screen");
+    display.clear(0xFF);
+    display.draw_text("rr_reader", 220, 210, 7);
 }

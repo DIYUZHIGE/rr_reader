@@ -1,3 +1,7 @@
+mod spi;
+
+pub use self::spi::init_shared_spi_bus;
+
 use crate::input::InputManager;
 use crate::storage::Storage;
 use anyhow::Result;

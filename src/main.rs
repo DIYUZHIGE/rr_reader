@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     // Initialize the shared SPI2 bus via SDSPI host.
     // This must happen BEFORE Display::new() so the display can add itself
     // as a device on the already-initialized bus.
-    storage::init_spi_bus()?;
+    hardware::init_shared_spi_bus()?;
 
     // Display adds itself as a raw SPI device on the shared bus.
     // Takes full Peripherals (uses GPIO pins; SPI peripherals are unused here).
