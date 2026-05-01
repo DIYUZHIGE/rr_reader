@@ -2,8 +2,8 @@ use super::{
     Display, BUSY_ACTIVE_HIGH, CMD_AUTO_WRITE_BW_RAM, CMD_AUTO_WRITE_RED_RAM,
     CMD_BOOSTER_SOFT_START, CMD_BORDER_WAVEFORM, CMD_DATA_ENTRY_MODE, CMD_DRIVER_OUTPUT_CONTROL,
     CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
-    CMD_SOFT_RESET, CMD_TEMP_SENSOR_CONTROL, DISPLAY_HEIGHT, DISPLAY_WIDTH, INIT_BUSY_TIMEOUT_MS,
-    SPI_WRITE_CHUNK,
+    CMD_SOFT_RESET, CMD_TEMP_SENSOR_CONTROL, INIT_BUSY_TIMEOUT_MS, PHYSICAL_DISPLAY_HEIGHT,
+    PHYSICAL_DISPLAY_WIDTH, SPI_WRITE_CHUNK,
 };
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
@@ -48,7 +48,7 @@ impl Display {
 
         info!("Display init: driver output control");
         self.send_command(CMD_DRIVER_OUTPUT_CONTROL)?;
-        let height_minus_one = (DISPLAY_HEIGHT - 1) as u16;
+        let height_minus_one = (PHYSICAL_DISPLAY_HEIGHT - 1) as u16;
         self.send_data(&[
             (height_minus_one & 0xFF) as u8,
             (height_minus_one >> 8) as u8,
@@ -61,7 +61,12 @@ impl Display {
         info!("Display init: border waveform done");
 
         info!("Display init: RAM area");
-        self.set_ram_area(0, 0, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)?;
+        self.set_ram_area(
+            0,
+            0,
+            PHYSICAL_DISPLAY_WIDTH as u16,
+            PHYSICAL_DISPLAY_HEIGHT as u16,
+        )?;
         info!("Display init: RAM area done");
 
         info!("Display init: clear BW RAM");
@@ -83,7 +88,7 @@ impl Display {
 
     pub(super) fn set_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) -> Result<()> {
         // Y coordinate is reversed due to gate driver orientation
-        let reversed_y = DISPLAY_HEIGHT as u16 - y - h;
+        let reversed_y = PHYSICAL_DISPLAY_HEIGHT as u16 - y - h;
         let x_end = x + w - 1;
         let y_start = reversed_y + h - 1;
 

@@ -1,4 +1,7 @@
-use super::{Display, DISPLAY_HEIGHT, DISPLAY_WIDTH, DISPLAY_WIDTH_BYTES};
+use super::{
+    Display, DISPLAY_HEIGHT, DISPLAY_WIDTH, PHYSICAL_DISPLAY_HEIGHT, PHYSICAL_DISPLAY_WIDTH,
+    PHYSICAL_DISPLAY_WIDTH_BYTES,
+};
 use crate::font::Font;
 use crate::text::is_ascii_word_char;
 
@@ -231,25 +234,20 @@ impl Display {
         decompress_buf: &mut [u8],
     ) {
         let cp = ch as u32;
-        let rendered = if let Some(info) = font.find_glyph(cp) {
-            if let Some(bitmap) = self
-                .glyph_cache
-                .get_or_insert(font, cp, &info, decompress_buf)
-            {
-                font.draw_glyph(
-                    bitmap,
-                    x,
-                    y,
-                    DISPLAY_WIDTH,
-                    DISPLAY_HEIGHT,
-                    &mut self.framebuffer,
-                );
-                true
+        let rendered = {
+            let glyph_cache = &mut self.glyph_cache;
+            let framebuffer = &mut self.framebuffer;
+
+            if let Some(info) = font.find_glyph(cp) {
+                if let Some(bitmap) = glyph_cache.get_or_insert(font, cp, &info, decompress_buf) {
+                    draw_font_bitmap(framebuffer, font, bitmap, x, y);
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
-        } else {
-            false
         };
 
         if !rendered {
@@ -298,13 +296,56 @@ impl Display {
             return;
         }
 
-        let index = y * DISPLAY_WIDTH_BYTES + x / 8;
-        let mask = 0x80 >> (x % 8);
+        let (physical_x, physical_y) = logical_to_physical(x, y);
+        let index = physical_y * PHYSICAL_DISPLAY_WIDTH_BYTES + physical_x / 8;
+        let mask = 0x80 >> (physical_x % 8);
         if white {
             self.framebuffer[index] |= mask;
         } else {
             self.framebuffer[index] &= !mask;
         }
+    }
+}
+
+fn logical_to_physical(x: usize, y: usize) -> (usize, usize) {
+    debug_assert!(x < DISPLAY_WIDTH);
+    debug_assert!(y < DISPLAY_HEIGHT);
+    debug_assert_eq!(DISPLAY_WIDTH, PHYSICAL_DISPLAY_HEIGHT);
+    debug_assert_eq!(DISPLAY_HEIGHT, PHYSICAL_DISPLAY_WIDTH);
+
+    (y, PHYSICAL_DISPLAY_HEIGHT - 1 - x)
+}
+
+fn draw_font_bitmap(fb: &mut [u8], font: &Font, bitmap: &[u8], x: usize, y: usize) {
+    for row in 0..font.glyph_height as usize {
+        let screen_y = y + row;
+        if screen_y >= DISPLAY_HEIGHT {
+            break;
+        }
+
+        for col in 0..font.glyph_width as usize {
+            let screen_x = x + col;
+            if screen_x >= DISPLAY_WIDTH {
+                break;
+            }
+
+            let byte_idx = row * font.row_bytes as usize + col / 8;
+            let bit = (bitmap[byte_idx] >> (7 - col % 8)) & 1;
+            if bit != 0 {
+                set_framebuffer_pixel(fb, screen_x, screen_y, false);
+            }
+        }
+    }
+}
+
+fn set_framebuffer_pixel(fb: &mut [u8], x: usize, y: usize, white: bool) {
+    let (physical_x, physical_y) = logical_to_physical(x, y);
+    let index = physical_y * PHYSICAL_DISPLAY_WIDTH_BYTES + physical_x / 8;
+    let mask = 0x80 >> (physical_x % 8);
+    if white {
+        fb[index] |= mask;
+    } else {
+        fb[index] &= !mask;
     }
 }
 

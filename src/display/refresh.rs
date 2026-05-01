@@ -1,6 +1,7 @@
 use super::{
     Display, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
-    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, REFRESH_BUSY_TIMEOUT_MS,
+    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, PHYSICAL_DISPLAY_HEIGHT,
+    PHYSICAL_DISPLAY_WIDTH, REFRESH_BUSY_TIMEOUT_MS,
 };
 use anyhow::Result;
 use log::{debug, info};
@@ -109,7 +110,12 @@ impl Display {
         }
 
         debug!("Display refresh: {:?}", mode);
-        self.set_ram_area(0, 0, Self::width() as u16, Self::height() as u16)?;
+        self.set_ram_area(
+            0,
+            0,
+            PHYSICAL_DISPLAY_WIDTH as u16,
+            PHYSICAL_DISPLAY_HEIGHT as u16,
+        )?;
 
         match mode {
             RefreshMode::Full => self.refresh_full(poll)?,
