@@ -23,6 +23,9 @@ jpeg-decoder = { version = "0.3", default-features = false }
 log = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
 
+[patch.crates-io]
+jpeg-decoder = { path = "vendor/jpeg-decoder" }
+
 [build-dependencies]
 embuild = "0.33"
 

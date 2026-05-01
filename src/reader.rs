@@ -3,7 +3,7 @@ use crate::font::Font;
 use crate::text::is_ascii_word_char;
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
-use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
+use jpeg_decoder::{ColorTransform, Decoder as JpegDecoder, PixelFormat};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::io::Cursor;
 
@@ -22,7 +22,7 @@ const IMAGE_PLACEHOLDER_HEIGHT: usize = 240;
 const JPEG_DECODE_MAX_WIDTH: usize = 128;
 const JPEG_DECODE_MAX_HEIGHT: usize = 128;
 const MAX_JPEG_FILE_BYTES: usize = 384 * 1024;
-const MAX_JPEG_DIMENSION: u16 = 1024;
+const MAX_JPEG_DIMENSION: u16 = 4096;
 const MAX_JPEG_DECODE_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -1016,6 +1016,7 @@ fn decode_jpeg_to_mono(
     FreeRtos::delay_ms(1);
     let mut decoder = JpegDecoder::new(Cursor::new(bytes));
     decoder.set_max_decoding_buffer_size(MAX_JPEG_DECODE_BUFFER_BYTES);
+    decoder.set_color_transform(ColorTransform::Grayscale);
     decoder
         .read_info()
         .map_err(|e| anyhow!("read jpeg info: {}", e))?;
@@ -1028,8 +1029,8 @@ fn decode_jpeg_to_mono(
         ));
     }
 
-    let decode_max_width = max_width.min(JPEG_DECODE_MAX_WIDTH).max(1);
-    let decode_max_height = max_height.min(JPEG_DECODE_MAX_HEIGHT).max(1);
+    let decode_max_width = max_width.clamp(1, JPEG_DECODE_MAX_WIDTH);
+    let decode_max_height = max_height.clamp(1, JPEG_DECODE_MAX_HEIGHT);
     let requested =
         jpeg_scale_request(info.width, info.height, decode_max_width, decode_max_height);
     let (scaled_width, scaled_height) = decoder
@@ -1057,7 +1058,11 @@ fn decode_jpeg_to_mono(
         .ok_or_else(|| anyhow!("decoded jpeg info missing"))?;
     let source_width = usize::from(info.width);
     let source_height = usize::from(info.height);
-    let source_channels = info.pixel_format.pixel_bytes();
+    let (source_channels, pixel_format) = if decoded.len() == source_width * source_height {
+        (1, PixelFormat::L8)
+    } else {
+        (info.pixel_format.pixel_bytes(), info.pixel_format)
+    };
     if source_width == 0 || source_height == 0 || source_channels == 0 {
         return Err(anyhow!("invalid jpeg output"));
     }
@@ -1073,7 +1078,7 @@ fn decode_jpeg_to_mono(
         source_width,
         source_height,
         source_channels,
-        info.pixel_format,
+        pixel_format,
         target_width,
         target_height,
     )?;
