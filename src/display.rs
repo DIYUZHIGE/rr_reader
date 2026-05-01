@@ -46,9 +46,9 @@ const CTRL2_DISPLAY: u8 = 0x04;
 
 // Full: CLOCK + ANALOG + TEMP + LUT + DISPLAY
 const CTRL2_FULL: u8 = CTRL2_CLOCK | CTRL2_ANALOG | CTRL2_TEMP | CTRL2_LUT | CTRL2_DISPLAY; // 0xF4
-// Half: CLOCK + ANALOG + LUT + DISPLAY (skip temperature load)
+                                                                                            // Half: CLOCK + ANALOG + LUT + DISPLAY (skip temperature load)
 const CTRL2_HALF: u8 = CTRL2_CLOCK | CTRL2_ANALOG | CTRL2_LUT | CTRL2_DISPLAY; // 0xD4
-// Fast: LUT + MODE + DISPLAY (differential, uses internal temperature)
+                                                                               // Fast: LUT + MODE + DISPLAY (differential, uses internal temperature)
 const CTRL2_FAST: u8 = CTRL2_LUT | CTRL2_MODE | CTRL2_DISPLAY; // 0x1C
 
 // High temperature value to accelerate refresh in half mode
@@ -160,7 +160,10 @@ impl Display {
         let mode = if !self.red_ram_synced {
             RefreshMode::Full
         } else if self.fast_refresh_count >= FAST_REFRESH_LIMIT {
-            debug!("Inserting periodic full refresh after {} fast refreshes", self.fast_refresh_count);
+            debug!(
+                "Inserting periodic full refresh after {} fast refreshes",
+                self.fast_refresh_count
+            );
             RefreshMode::Full
         } else {
             RefreshMode::Fast
@@ -205,13 +208,7 @@ impl Display {
 
     /// Render UTF-8 text with the given font at (x, y). Characters not in the
     /// font are silently skipped. Use this for CJK-capable text rendering.
-    pub fn draw_text_font(
-        &mut self,
-        font: &Font,
-        text: &str,
-        x: usize,
-        y: usize,
-    ) {
+    pub fn draw_text_font(&mut self, font: &Font, text: &str, x: usize, y: usize) {
         let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
         let mut cursor_x = x;
         let mut cursor_y = y;
@@ -428,7 +425,10 @@ impl Display {
     }
 
     fn init_controller(&mut self) -> Result<()> {
-        info!("Display init: sending soft reset command (0x{:02X})", CMD_SOFT_RESET);
+        info!(
+            "Display init: sending soft reset command (0x{:02X})",
+            CMD_SOFT_RESET
+        );
         self.send_command(CMD_SOFT_RESET)?;
         info!("Display init: soft reset command sent, waiting for busy...");
 
@@ -562,9 +562,7 @@ impl Display {
     fn wait_while_busy(&self, label: &str, timeout_ms: u32) {
         let mut elapsed_ms = 0u32;
         let initial_busy = self.is_busy();
-        info!(
-            "Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}"
-        );
+        info!("Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}");
 
         while self.is_busy() && elapsed_ms < timeout_ms {
             FreeRtos::delay_ms(1);
@@ -579,7 +577,10 @@ impl Display {
         }
 
         if elapsed_ms >= timeout_ms {
-            warn!("Display wait timed out: {label}; still busy={}", self.is_busy());
+            warn!(
+                "Display wait timed out: {label}; still busy={}",
+                self.is_busy()
+            );
         } else {
             info!(
                 "Display wait done: {label} ({elapsed_ms} ms); busy={}",

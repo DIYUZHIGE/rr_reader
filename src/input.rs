@@ -78,10 +78,7 @@ impl InputManager {
             );
 
             // GPIO3: power button (digital input with pull-up)
-            sys::gpio_set_direction(
-                sys::gpio_num_t_GPIO_NUM_3,
-                sys::gpio_mode_t_GPIO_MODE_INPUT,
-            );
+            sys::gpio_set_direction(sys::gpio_num_t_GPIO_NUM_3, sys::gpio_mode_t_GPIO_MODE_INPUT);
             sys::gpio_set_pull_mode(
                 sys::gpio_num_t_GPIO_NUM_3,
                 sys::gpio_pull_mode_t_GPIO_PULLUP_ONLY,
@@ -185,6 +182,10 @@ impl InputManager {
 
     pub fn has_user_activity(&self) -> bool {
         self.pressed_events != 0 || self.released_events != 0
+    }
+
+    pub fn any_pressed(&self) -> bool {
+        self.debounced_state != 0
     }
 
     pub fn held_ms(&self, button_index: u8) -> u32 {

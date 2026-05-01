@@ -34,12 +34,8 @@ pub fn init_spi_bus() -> Result<()> {
         __bindgen_anon_1: sys::spi_bus_config_t__bindgen_ty_1 { mosi_io_num: 10 },
         __bindgen_anon_2: sys::spi_bus_config_t__bindgen_ty_2 { miso_io_num: 7 },
         sclk_io_num: 8,
-        __bindgen_anon_3: sys::spi_bus_config_t__bindgen_ty_3 {
-            quadwp_io_num: -1,
-        },
-        __bindgen_anon_4: sys::spi_bus_config_t__bindgen_ty_4 {
-            quadhd_io_num: -1,
-        },
+        __bindgen_anon_3: sys::spi_bus_config_t__bindgen_ty_3 { quadwp_io_num: -1 },
+        __bindgen_anon_4: sys::spi_bus_config_t__bindgen_ty_4 { quadhd_io_num: -1 },
         max_transfer_sz: 16384,
         ..Default::default()
     };
@@ -78,8 +74,8 @@ impl Storage {
         let device_config = sys::sdspi_device_config_t {
             host_id: SPI2_HOST,
             gpio_cs: 12,
-            gpio_cd: -1, // not connected
-            gpio_wp: -1, // not connected
+            gpio_cd: -1,  // not connected
+            gpio_wp: -1,  // not connected
             gpio_int: -1, // not connected
             gpio_wp_polarity: false,
         };
@@ -140,11 +136,7 @@ impl Storage {
         if files.is_empty() {
             info!("No markdown files found under {:?}", scan_root);
         } else {
-            info!(
-                "Found {} markdown files under {:?}",
-                files.len(),
-                scan_root
-            );
+            info!("Found {} markdown files under {:?}", files.len(), scan_root);
         }
 
         Ok(files)
@@ -189,7 +181,10 @@ impl Storage {
     pub fn read_markdown_file(&self, rel_path: &str) -> Result<String> {
         let rel = Path::new(rel_path);
         if rel.is_absolute() {
-            return Err(anyhow!("absolute markdown path is not allowed: {}", rel_path));
+            return Err(anyhow!(
+                "absolute markdown path is not allowed: {}",
+                rel_path
+            ));
         }
 
         let full = Path::new(SD_MOUNT_POINT).join("vault").join(rel);

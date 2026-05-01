@@ -54,7 +54,9 @@ impl Font {
         if data.len() < min_len {
             return Err(anyhow!(
                 "Font data too short for index: {} glyphs, need {} bytes, got {}",
-                glyph_count, min_len, data.len()
+                glyph_count,
+                min_len,
+                data.len()
             ));
         }
 
