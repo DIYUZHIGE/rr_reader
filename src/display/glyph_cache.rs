@@ -1,7 +1,7 @@
 use crate::font::{Font, GlyphInfo};
 use flate2::Decompress;
 
-const GLYPH_CACHE_CAPACITY: usize = 64;
+const GLYPH_CACHE_CAPACITY: usize = 32;
 
 struct GlyphCacheEntry {
     font_id: usize,
@@ -87,5 +87,7 @@ impl GlyphCache {
     /// Free all cached glyph bitmaps to reclaim heap for large allocations.
     pub(super) fn clear(&mut self) {
         self.entries.clear();
+        self.scratch.clear();
+        self.scratch.shrink_to_fit();
     }
 }

@@ -7,6 +7,8 @@ pub use self::refresh::RefreshMode;
 
 use self::glyph_cache::GlyphCache;
 use anyhow::Result;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
 use esp_idf_hal::gpio::{Input, Output, PinDriver, Pins, Pull};
 use esp_idf_hal::sys;
 use log::info;
@@ -46,18 +48,41 @@ const INIT_BUSY_TIMEOUT_MS: u32 = 2_000;
 const REFRESH_BUSY_TIMEOUT_MS: u32 = 30_000;
 const SPI_WRITE_CHUNK: usize = 4096;
 
+// Framebuffer in static .bss section instead of heap — saves 48KB of heap.
+// SyncUnsafeCell wraps UnsafeCell and asserts thread-safety; safe because the
+// framebuffer is only accessed from the main task.
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+static FRAMEBUFFER: SyncUnsafeCell<[u8; BUFFER_SIZE]> =
+    SyncUnsafeCell(UnsafeCell::new([0u8; BUFFER_SIZE]));
+
+/// Zero-sized wrapper that derefs to the static framebuffer.
+struct StaticFramebuffer;
+
+impl Deref for StaticFramebuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { &*FRAMEBUFFER.0.get() }
+    }
+}
+
+impl DerefMut for StaticFramebuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut *FRAMEBUFFER.0.get() }
+    }
+}
+
 pub struct Display {
     spi_handle: sys::spi_device_handle_t,
     cs: PinDriver<'static, Output>,
     dc: PinDriver<'static, Output>,
     rst: PinDriver<'static, Output>,
     busy: PinDriver<'static, Input>,
-    framebuffer: Vec<u8>,
+    framebuffer: StaticFramebuffer,
     dirty: bool,
     initialized: bool,
-    /// Whether RED RAM currently holds the same frame as framebuffer
     red_ram_synced: bool,
-    /// Count of consecutive fast refreshes since last cleanup refresh
     fast_refresh_count: u32,
     glyph_cache: GlyphCache,
 }
@@ -93,7 +118,7 @@ impl Display {
             dc: PinDriver::output(pins.gpio4)?,
             rst: PinDriver::output(pins.gpio5)?,
             busy: PinDriver::input(pins.gpio6, Pull::Floating)?,
-            framebuffer: vec![0xFF; BUFFER_SIZE],
+            framebuffer: StaticFramebuffer,
             dirty: false,
             initialized: false,
             red_ram_synced: false,
@@ -104,6 +129,7 @@ impl Display {
 
     pub fn begin(&mut self) -> Result<()> {
         info!("Initializing X4 SSD1677 e-ink display (40 MHz SPI, shared bus)");
+        self.framebuffer.fill(0xFF);
         self.configure_gpio()?;
         self.cs.set_high()?;
         self.dc.set_high()?;

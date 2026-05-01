@@ -52,8 +52,11 @@ fn main() -> Result<()> {
     // Handle wakeup
     power::handle_wakeup(WakeupReason::get(), &mut hardware.input)?;
 
-    // Boot the app (mounts SD, initializes display, shows boot screen)
+    // Boot the app (mounts SD, initializes display, loads fonts, shows boot screen)
     let mut app = ReaderApp::boot(hardware, display)?;
+
+    // Connect WiFi after boot to avoid stack frame overlap with display/font init
+    app.connect_wifi();
 
     info!("Entering main loop");
     loop {

@@ -40,7 +40,8 @@ impl super::Storage {
 fn parse_wifi_credentials(contents: &str) -> Result<WifiCredentials> {
     let mut ssid = None;
     let mut password = None;
-    let mut positional = Vec::with_capacity(2);
+    let mut positional: [Option<String>; 2] = [None, None];
+    let mut positional_count = 0;
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -55,16 +56,17 @@ fn parse_wifi_credentials(contents: &str) -> Result<WifiCredentials> {
                 "password" | "pass" | "wifi_pass" | "wifi_password" => password = Some(value),
                 _ => {}
             }
-        } else {
-            positional.push(unquote(line));
+        } else if positional_count < 2 {
+            positional[positional_count] = Some(unquote(line));
+            positional_count += 1;
         }
     }
 
-    if ssid.is_none() && !positional.is_empty() {
-        ssid = Some(positional.remove(0));
+    if ssid.is_none() {
+        ssid = positional[0].take();
     }
-    if password.is_none() && !positional.is_empty() {
-        password = Some(positional.remove(0));
+    if password.is_none() {
+        password = positional[1].take();
     }
 
     let ssid = ssid.ok_or_else(|| anyhow!("missing ssid"))?;

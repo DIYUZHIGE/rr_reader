@@ -82,7 +82,6 @@ impl ReaderApp {
             script_font.glyph_width, script_font.glyph_height, script_font.glyph_count
         );
 
-        // Scan vault for markdown files
         let mut md_files = match hardware.storage.list_markdown_files("") {
             Ok(files) => files,
             Err(e) => {
@@ -93,15 +92,12 @@ impl ReaderApp {
         sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
-        let wifi_status = hardware.connect_wifi_from_storage();
-        info!("WiFi boot status: {:?}", wifi_status);
-
-        // Show boot screen with status
+        // Show boot screen (WiFi status will be added after connection)
         draw_boot_screen(&mut display);
         display.draw_text_font(&ui_font, &format!("文件: {}", md_files.len()), 220, 280);
         display.draw_text_wrapped(
             &ui_font,
-            &wifi_status.boot_line(),
+            "WiFi: 正在连接...",
             140,
             310,
             Display::width() - 140,
@@ -109,7 +105,7 @@ impl ReaderApp {
         );
         display.flush_with_mode(RefreshMode::Full)?;
 
-        info!("Boot complete");
+        info!("Boot phase 1 complete");
 
         let mut app = Self {
             hardware,
@@ -130,6 +126,31 @@ impl ReaderApp {
         app.render_current_activity();
         app.flush_ui_refresh();
         Ok(app)
+    }
+
+    /// Connect WiFi after boot. Called separately so WiFi stack frames don't
+    /// overlap with display/font init frames, reducing peak stack usage.
+    pub fn connect_wifi(&mut self) {
+        let wifi_status = self.hardware.connect_wifi_from_storage();
+        info!("WiFi boot status: {:?}", wifi_status);
+
+        // Update boot screen status text area
+        self.display.fill_rect(
+            140,
+            310,
+            Display::width() - 140,
+            self.ui_font.glyph_height as usize * 4 + 4 * 4,
+            0xFF,
+        );
+        self.display.draw_text_wrapped(
+            &self.ui_font,
+            &wifi_status.boot_line(),
+            140,
+            310,
+            Display::width() - 140,
+            4,
+        );
+        let _ = self.flush_display_if_dirty();
     }
 
     pub fn tick(&mut self) -> Result<()> {
@@ -483,6 +504,12 @@ impl ReaderApp {
         self.reader_cache = None;
         self.display.clear_glyph_cache();
 
+        #[cfg(debug_assertions)]
+        {
+            let free_before = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() };
+            info!("Free heap before parsing: {} bytes", free_before);
+        }
+
         let rel_path = &self.md_files[file_index];
         let markdown = self.hardware.storage.read_markdown_file(rel_path)?;
         let fonts = FontSet::new(
@@ -493,6 +520,17 @@ impl ReaderApp {
         );
         let pages = markdown_pages(&markdown, &fonts);
         self.reader_cache = Some(ReaderCache { file_index, pages });
+
+        #[cfg(debug_assertions)]
+        {
+            let free_after = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() };
+            let min_free = unsafe { esp_idf_hal::sys::esp_get_minimum_free_heap_size() };
+            info!(
+                "Free heap after parsing: {} bytes (min ever: {})",
+                free_after, min_free
+            );
+        }
+
         Ok(())
     }
 

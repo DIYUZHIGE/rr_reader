@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
 use jpeg_decoder::{ColorTransform, Decoder as JpegDecoder, PixelFormat};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
 use crate::display::Display;
 use crate::font::Font;
@@ -11,7 +11,9 @@ use super::{RenderImage, QUOTE_BAR_WIDTH, QUOTE_INDENT, READER_X};
 const JPEG_DECODE_MAX_WIDTH: usize = 256;
 const JPEG_DECODE_MAX_HEIGHT: usize = 256;
 const MAX_JPEG_DIMENSION: u16 = 4096;
-const MAX_JPEG_DECODE_BUFFER_BYTES: usize = 256 * 1024;
+// Limit JPEG decode buffer to 64KB. This allows ~256×256 mono output while
+// rejecting images that need more. Photos that exceed this will show a placeholder.
+const MAX_JPEG_DECODE_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct DecodedImage {
@@ -99,22 +101,10 @@ fn is_jpeg_path(path: &str) -> bool {
 }
 
 fn decode_jpeg_to_mono<R: Read + Seek>(
-    mut reader: R,
+    reader: R,
     max_width: usize,
     max_height: usize,
 ) -> Result<DecodedImage> {
-    let header = inspect_jpeg_header(&mut reader)?;
-    if header.width > MAX_JPEG_DIMENSION || header.height > MAX_JPEG_DIMENSION {
-        return Err(anyhow!(
-            "jpeg dimensions too large: {}x{}",
-            header.width,
-            header.height
-        ));
-    }
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| anyhow!("rewind jpeg: {}", e))?;
-
     FreeRtos::delay_ms(1);
     let mut decoder = JpegDecoder::new(reader);
     decoder.set_max_decoding_buffer_size(MAX_JPEG_DECODE_BUFFER_BYTES);
@@ -197,97 +187,6 @@ fn decode_jpeg_to_mono<R: Read + Seek>(
         height: target_height,
         pixels,
     })
-}
-
-#[derive(Debug)]
-struct JpegHeader {
-    width: u16,
-    height: u16,
-}
-
-fn inspect_jpeg_header<R: Read + Seek>(reader: &mut R) -> Result<JpegHeader> {
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| anyhow!("seek jpeg: {}", e))?;
-    let mut soi = [0u8; 2];
-    reader
-        .read_exact(&mut soi)
-        .map_err(|e| anyhow!("read jpeg soi: {}", e))?;
-    if soi != [0xFF, 0xD8] {
-        return Err(anyhow!("not a jpeg"));
-    }
-
-    loop {
-        let marker = read_jpeg_marker(reader)?;
-        if marker == 0xD9 {
-            return Err(anyhow!("jpeg ended before frame header"));
-        }
-
-        if jpeg_marker_has_no_length(marker) {
-            continue;
-        }
-
-        let segment_len = read_be_u16(reader)?;
-        if segment_len < 2 {
-            return Err(anyhow!("invalid jpeg segment length"));
-        }
-        let payload_len = u64::from(segment_len - 2);
-
-        if is_jpeg_sof_marker(marker) {
-            if payload_len < 6 {
-                return Err(anyhow!("invalid jpeg frame header"));
-            }
-            let mut frame = [0u8; 6];
-            reader
-                .read_exact(&mut frame)
-                .map_err(|e| anyhow!("read jpeg frame header: {}", e))?;
-            return Ok(JpegHeader {
-                height: u16::from_be_bytes([frame[1], frame[2]]),
-                width: u16::from_be_bytes([frame[3], frame[4]]),
-            });
-        }
-
-        reader
-            .seek(SeekFrom::Current(payload_len as i64))
-            .map_err(|e| anyhow!("skip jpeg segment: {}", e))?;
-    }
-}
-
-fn read_jpeg_marker<R: Read>(reader: &mut R) -> Result<u8> {
-    let mut byte = [0u8; 1];
-    loop {
-        reader
-            .read_exact(&mut byte)
-            .map_err(|e| anyhow!("read jpeg marker prefix: {}", e))?;
-        if byte[0] == 0xFF {
-            break;
-        }
-    }
-
-    loop {
-        reader
-            .read_exact(&mut byte)
-            .map_err(|e| anyhow!("read jpeg marker: {}", e))?;
-        if byte[0] != 0xFF {
-            return Ok(byte[0]);
-        }
-    }
-}
-
-fn read_be_u16<R: Read>(reader: &mut R) -> Result<u16> {
-    let mut bytes = [0u8; 2];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| anyhow!("read jpeg segment length: {}", e))?;
-    Ok(u16::from_be_bytes(bytes))
-}
-
-fn jpeg_marker_has_no_length(marker: u8) -> bool {
-    marker == 0x01 || marker == 0xD8 || (0xD0..=0xD9).contains(&marker)
-}
-
-fn is_jpeg_sof_marker(marker: u8) -> bool {
-    (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
 }
 
 fn jpeg_scale_request(
