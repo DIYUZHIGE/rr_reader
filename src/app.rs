@@ -8,7 +8,10 @@ use crate::display::{Display, RefreshMode};
 use crate::font::{Font, FontSet};
 use crate::hardware::Hardware;
 use crate::power::PowerManager;
-use crate::reader::{draw_reader_page, markdown_pages, ReaderCache, ReaderState, READER_X};
+use crate::reader::{
+    draw_reader_page, markdown_blocks_and_pages, ReaderCache, ReaderPage, ReaderState,
+    PAGE_CACHE_SIZE, READER_X,
+};
 use anyhow::Result;
 use log::{info, warn};
 
@@ -420,11 +423,7 @@ impl ReaderApp {
         let rel_path = self.md_files[file_index].clone();
         match self.ensure_reader_cache(file_index) {
             Ok(()) => {
-                let cache = match self.reader_cache.as_ref() {
-                    Some(cache) if cache.file_index == file_index => cache,
-                    _ => return,
-                };
-                let page_count = cache.pages.len().max(1);
+                let page_count = self.reader_page_count().max(1);
                 let page_index = reader
                     .map(|reader| reader.page_index.min(page_count - 1))
                     .unwrap_or(0);
@@ -437,6 +436,16 @@ impl ReaderApp {
                     }
                 }
 
+                let fonts = FontSet::new(
+                    &self.ui_font,
+                    &self.reader_font,
+                    &self.math_font,
+                    &self.script_font,
+                );
+                if let Some(cache) = self.reader_cache.as_mut() {
+                    cache.ensure_window(page_index, &fonts);
+                }
+
                 let (_, name) = file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
                 let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
@@ -444,13 +453,12 @@ impl ReaderApp {
                     .draw_text_font(&self.ui_font, &title, READER_X, 10);
                 self.display
                     .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
-                if let Some(page) = cache.pages.get(page_index) {
-                    let fonts = FontSet::new(
-                        &self.ui_font,
-                        &self.reader_font,
-                        &self.math_font,
-                        &self.script_font,
-                    );
+
+                let cache = self
+                    .reader_cache
+                    .as_ref()
+                    .filter(|c| c.file_index == file_index);
+                if let Some(page) = cache.and_then(|c| c.get_page(page_index)) {
                     draw_reader_page(&mut self.display, &fonts, page, |image_path| {
                         self.hardware
                             .storage
@@ -518,8 +526,33 @@ impl ReaderApp {
             &self.math_font,
             &self.script_font,
         );
-        let pages = markdown_pages(&markdown, &fonts);
-        self.reader_cache = Some(ReaderCache { file_index, pages });
+
+        // Parse blocks and paginate. We keep blocks for re-pagination and
+        // only cache a sliding window of rendered pages to save RAM.
+        let (blocks, all_pages) = markdown_blocks_and_pages(&markdown, &fonts);
+        let page_count = all_pages.len().max(1);
+
+        // Build cache with first window of pages
+        let mut page_window: [(usize, Option<ReaderPage>); PAGE_CACHE_SIZE] =
+            core::array::from_fn(|_| (0, None));
+        let window_start = 0usize;
+        let window_end = PAGE_CACHE_SIZE.min(page_count);
+        for (i, page) in all_pages.into_iter().enumerate().take(window_end) {
+            if i < PAGE_CACHE_SIZE {
+                page_window[i] = (i, Some(page));
+            }
+        }
+
+        self.reader_cache = Some(ReaderCache {
+            file_index,
+            blocks,
+            page_count,
+            page_window,
+            window_start,
+        });
+
+        // Drop the markdown string (blocks own their text now)
+        drop(markdown);
 
         #[cfg(debug_assertions)]
         {
@@ -537,7 +570,7 @@ impl ReaderApp {
     fn reader_page_count(&self) -> usize {
         self.reader_cache
             .as_ref()
-            .map(|cache| cache.pages.len())
+            .map(|cache| cache.page_count)
             .unwrap_or(0)
     }
 

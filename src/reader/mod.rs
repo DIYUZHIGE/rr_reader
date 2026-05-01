@@ -1,6 +1,7 @@
 use crate::display::Display;
 use crate::font::FontSet;
 use anyhow::Result;
+use log::warn;
 mod image;
 mod markdown;
 mod math;
@@ -27,25 +28,102 @@ const IMAGE_PLACEHOLDER_HEIGHT: usize = 402;
 const INLINE_MATH_START: char = '\u{E000}';
 const INLINE_MATH_END: char = '\u{E001}';
 
+/// Number of rendered pages to keep in the sliding window cache.
+/// Window covers current_page ± WINDOW_RADIUS pages.
+pub const PAGE_CACHE_SIZE: usize = 5;
+const WINDOW_RADIUS: usize = PAGE_CACHE_SIZE / 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderState {
     pub file_index: usize,
     pub page_index: usize,
 }
 
+/// Lightweight page cache that only keeps a sliding window of rendered pages.
+/// Blocks are retained so pages outside the window can be re-generated on demand
+/// without re-reading the SD card or re-parsing markdown.
 #[derive(Debug)]
 pub struct ReaderCache {
     pub file_index: usize,
-    pub pages: Vec<ReaderPage>,
+    /// Parsed markdown blocks (kept for re-pagination)
+    pub blocks: Vec<RenderBlock>,
+    /// Total number of pages in this file
+    pub page_count: usize,
+    /// Sliding window of cached pages: [(page_index, page), ...]
+    /// Unused slots contain (0, None).
+    pub page_window: [(usize, Option<ReaderPage>); PAGE_CACHE_SIZE],
+    /// Starting page index of the current window
+    pub window_start: usize,
+}
+
+impl ReaderCache {
+    /// Ensure the window covers the given page, sliding and re-paginating
+    /// if necessary. Call this before `get_page` when the page may have changed.
+    pub fn ensure_window(&mut self, page_index: usize, fonts: &FontSet<'_>) {
+        if page_index >= self.page_count {
+            return;
+        }
+
+        // Already in window?
+        if self
+            .page_window
+            .iter()
+            .any(|(idx, page)| *idx == page_index && page.is_some())
+        {
+            return;
+        }
+
+        self.slide_window(page_index, fonts);
+    }
+
+    /// Get a page by index from the current window. Returns None if the page
+    /// is not cached (call `ensure_window` first).
+    pub fn get_page(&self, page_index: usize) -> Option<&ReaderPage> {
+        self.page_window
+            .iter()
+            .find(|(idx, page)| *idx == page_index && page.is_some())
+            .and_then(|slot| slot.1.as_ref())
+    }
+
+    fn slide_window(&mut self, target_page: usize, fonts: &FontSet<'_>) {
+        let new_start = target_page
+            .saturating_sub(WINDOW_RADIUS)
+            .min(self.page_count.saturating_sub(PAGE_CACHE_SIZE));
+
+        // Re-paginate all blocks to get fresh pages, then extract only the window
+        let all_pages = paginate_blocks(&self.blocks, fonts);
+        let actual_page_count = all_pages.len();
+        if actual_page_count != self.page_count {
+            warn!(
+                "Page count mismatch on re-pagination: {} vs {}",
+                actual_page_count, self.page_count
+            );
+        }
+
+        self.page_window = core::array::from_fn(|_| (0, None));
+        let window_end = (new_start + PAGE_CACHE_SIZE).min(all_pages.len());
+        for (i, page) in all_pages
+            .into_iter()
+            .enumerate()
+            .skip(new_start)
+            .take(window_end.saturating_sub(new_start))
+        {
+            let slot = i - new_start;
+            if slot < PAGE_CACHE_SIZE {
+                self.page_window[slot] = (i, Some(page));
+            }
+        }
+        self.window_start = new_start;
+    }
 }
 
 #[derive(Debug)]
 pub struct ReaderPage {
-    elements: Vec<PageElement>,
+    pub elements: Vec<PageElement>,
 }
 
 #[derive(Debug)]
-enum PageElement {
+pub enum PageElement {
     Line(RenderLine),
     InlineLine(RenderInlineLine),
     Math(RenderMath),
@@ -53,76 +131,76 @@ enum PageElement {
 }
 
 #[derive(Clone, Debug)]
-struct RenderBlock {
-    text: String,
-    style: BlockStyle,
-    indent_level: usize,
-    quote_depth: usize,
-    prefix: String,
-    image: Option<MarkdownImage>,
+pub struct RenderBlock {
+    pub text: String,
+    pub style: BlockStyle,
+    pub indent_level: usize,
+    pub quote_depth: usize,
+    pub prefix: String,
+    pub image: Option<MarkdownImage>,
 }
 
 #[derive(Clone, Debug)]
-struct RenderLine {
-    text: String,
-    style: BlockStyle,
-    x: usize,
-    y: usize,
-    quote_depth: usize,
+pub struct RenderLine {
+    pub text: String,
+    pub style: BlockStyle,
+    pub x: usize,
+    pub y: usize,
+    pub quote_depth: usize,
 }
 
 #[derive(Debug)]
-struct RenderInlineLine {
-    style: BlockStyle,
-    runs: Vec<RenderInlineRun>,
-    x: usize,
-    y: usize,
-    height: usize,
-    quote_depth: usize,
+pub struct RenderInlineLine {
+    pub style: BlockStyle,
+    pub runs: Vec<RenderInlineRun>,
+    pub x: usize,
+    pub y: usize,
+    pub height: usize,
+    pub quote_depth: usize,
 }
 
 #[derive(Debug)]
-struct RenderInlineRun {
-    x: usize,
-    y: usize,
-    kind: RenderInlineRunKind,
+pub struct RenderInlineRun {
+    pub x: usize,
+    pub y: usize,
+    pub kind: RenderInlineRunKind,
 }
 
 #[derive(Clone, Debug)]
-enum RenderInlineRunKind {
+pub enum RenderInlineRunKind {
     Text(String),
     Math(String),
 }
 
 #[derive(Debug)]
-struct RenderMath {
-    source: String,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    quote_depth: usize,
+pub struct RenderMath {
+    pub source: String,
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub quote_depth: usize,
 }
 
 #[derive(Debug)]
-struct RenderImage {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    path: String,
-    alt: String,
-    quote_depth: usize,
+pub struct RenderImage {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub path: String,
+    pub alt: String,
+    pub quote_depth: usize,
 }
 
 #[derive(Clone, Debug)]
-struct MarkdownImage {
-    path: String,
-    alt: String,
+pub struct MarkdownImage {
+    pub path: String,
+    pub alt: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockStyle {
+pub enum BlockStyle {
     Paragraph,
     Heading(u8),
     ListItem,
@@ -138,6 +216,18 @@ pub fn markdown_pages(markdown: &str, fonts: &FontSet<'_>) -> Vec<ReaderPage> {
     let markdown = preprocess_obsidian_embeds(markdown);
     let blocks = parse_markdown_blocks(&markdown);
     paginate_blocks(&blocks, fonts)
+}
+
+/// Parse markdown and return both blocks and all pages.
+/// The caller should keep blocks for re-pagination and only cache a window of pages.
+pub fn markdown_blocks_and_pages(
+    markdown: &str,
+    fonts: &FontSet<'_>,
+) -> (Vec<RenderBlock>, Vec<ReaderPage>) {
+    let markdown = preprocess_obsidian_embeds(markdown);
+    let blocks = parse_markdown_blocks(&markdown);
+    let pages = paginate_blocks(&blocks, fonts);
+    (blocks, pages)
 }
 
 pub fn draw_reader_page<F, R>(

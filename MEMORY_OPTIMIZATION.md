@@ -55,8 +55,19 @@
 
 **预计节省**: ~1-2KB RAM (减少堆碎片)
 
+### 5. 滑动窗口页缓存 (ReaderCache 重构)
+- **策略**: 解析后保留 `Vec<RenderBlock>`(~100KB)，只缓存当前页 +/-2 页(共5页，~15KB)
+- **窗口滑动**: 翻页超出窗口时，从保留的 blocks 重新分页，无需重新读取 SD 卡或重新解析 Markdown
+- **内存生命周期**:
+  - 解析阶段峰值: markdown 原文 + 预处理 + blocks + 全量 pages(~450KB，短暂存在)
+  - 稳态: 仅 blocks + 5页窗口(~115KB)
+- **对比旧方案**: 旧方案稳态保留全量 pages(~150KB)，峰值 ~650KB
+- **API**: `ensure_window(page_index)` 滑动窗口，`get_page(page_index)` 不可变查找
+
+**预计节省**: ~100-150KB RAM(稳态)，峰值降低 ~200KB
+
 ## 总计预计节省
-- **RAM**: 50-75KB
+- **RAM**: 150-225KB（含滑动窗口优化）
 - **Flash**: 10-15KB
 
 ## 进一步优化建议
@@ -65,11 +76,10 @@
 1. **Framebuffer优化** (当前: 48KB)
    - 考虑使用外部PSRAM (如果硬件支持)
    - 或使用分块渲染 (tile-based rendering)
-   
-2. **ReaderCache优化**
-   - 限制最大页面数
-   - 使用更紧凑的数据结构
-   - 考虑按需解析而非全文件缓存
+
+2. **解析阶段峰值优化**
+   - 当前解析时同时存在 markdown 原文 + 预处理 + blocks + 全量 pages
+   - 可改为边解析边分页边丢弃，避免同时持有全量 pages
 
 3. **字符串优化**
    - 更多使用 &str 而非 String
