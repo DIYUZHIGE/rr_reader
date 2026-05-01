@@ -176,6 +176,33 @@ impl Display {
         self.dirty = true;
     }
 
+    pub fn draw_mono_bitmap_scaled(
+        &mut self,
+        x: usize,
+        y: usize,
+        source_size: (usize, usize),
+        target_size: (usize, usize),
+        pixels: &[u8],
+    ) {
+        let (source_width, source_height) = source_size;
+        let (target_width, target_height) = target_size;
+        if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+            return;
+        }
+
+        for py in 0..target_height {
+            let source_y = py * source_height / target_height;
+            for px in 0..target_width {
+                let source_x = px * source_width / target_width;
+                let index = source_y * source_width + source_x;
+                if let Some(&gray) = pixels.get(index) {
+                    self.set_pixel(x + px, y + py, gray >= 128);
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     fn draw_text_run(
         &mut self,
         font: &Font,

@@ -13,7 +13,7 @@ use esp_idf_hal::sys;
 use log::{info, warn};
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 const SD_MOUNT_POINT: &str = "/sdcard";
@@ -211,6 +211,36 @@ impl Storage {
         if let Some(file_name) = Path::new(&asset_path).file_name() {
             if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
                 return fs::read(&full).map_err(|e| anyhow!("read {:?}: {}", full, e));
+            }
+        }
+
+        Err(anyhow!(
+            "image not found: {} (tried {:?})",
+            asset_path,
+            candidates
+        ))
+    }
+
+    pub fn open_asset_relative_to(
+        &self,
+        markdown_rel_path: &str,
+        asset_path: &str,
+    ) -> Result<BufReader<File>> {
+        let candidates = Self::asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
+        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+
+        for rel in &candidates {
+            let full = vault_root.join(rel);
+            if let Ok(file) = File::open(&full) {
+                return Ok(BufReader::with_capacity(2048, file));
+            }
+        }
+
+        let asset_path = Self::clean_asset_path(asset_path);
+        if let Some(file_name) = Path::new(&asset_path).file_name() {
+            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
+                let file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
+                return Ok(BufReader::with_capacity(2048, file));
             }
         }
 

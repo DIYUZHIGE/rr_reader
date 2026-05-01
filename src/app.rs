@@ -537,7 +537,7 @@ impl ReaderApp {
                         |image_path| {
                             self.hardware
                                 .storage
-                                .read_asset_relative_to(&rel_path, image_path)
+                                .open_asset_relative_to(&rel_path, image_path)
                         },
                     );
                 }

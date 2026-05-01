@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
 use jpeg_decoder::{ColorTransform, Decoder as JpegDecoder, PixelFormat};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use std::io::Cursor;
+use std::io::{Read, Seek, SeekFrom};
 
 pub const READER_X: usize = 24;
 pub const READER_TEXT_Y: usize = 42;
@@ -18,10 +18,9 @@ const LIST_INDENT: usize = 18;
 const CODE_INDENT: usize = 10;
 const IMAGE_TOP_GAP: usize = 6;
 const IMAGE_BOTTOM_GAP: usize = 8;
-const IMAGE_PLACEHOLDER_HEIGHT: usize = 240;
-const JPEG_DECODE_MAX_WIDTH: usize = 128;
-const JPEG_DECODE_MAX_HEIGHT: usize = 128;
-const MAX_JPEG_FILE_BYTES: usize = 384 * 1024;
+const IMAGE_PLACEHOLDER_HEIGHT: usize = 384;
+const JPEG_DECODE_MAX_WIDTH: usize = 256;
+const JPEG_DECODE_MAX_HEIGHT: usize = 256;
 const MAX_JPEG_DIMENSION: u16 = 4096;
 const MAX_JPEG_DECODE_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -186,14 +185,15 @@ pub fn markdown_pages(markdown: &str, reader_font: &Font, ui_font: &Font) -> Vec
     paginate_blocks(&blocks, reader_font, ui_font)
 }
 
-pub fn draw_reader_page<F>(
+pub fn draw_reader_page<F, R>(
     display: &mut Display,
     reader_font: &Font,
     ui_font: &Font,
     page: &ReaderPage,
     mut load_image: F,
 ) where
-    F: FnMut(&str) -> Result<Vec<u8>>,
+    F: FnMut(&str) -> Result<R>,
+    R: Read + Seek,
 {
     for element in &page.elements {
         match element {
@@ -260,13 +260,14 @@ fn draw_reader_line(display: &mut Display, reader_font: &Font, ui_font: &Font, l
     }
 }
 
-fn draw_reader_image<F>(
+fn draw_reader_image<F, R>(
     display: &mut Display,
     ui_font: &Font,
     image: &RenderImage,
     load_image: &mut F,
 ) where
-    F: FnMut(&str) -> Result<Vec<u8>>,
+    F: FnMut(&str) -> Result<R>,
+    R: Read + Seek,
 {
     for depth in 0..image.quote_depth {
         let x = READER_X + depth * QUOTE_INDENT;
@@ -275,13 +276,16 @@ fn draw_reader_image<F>(
 
     if is_jpeg_path(&image.path) {
         if let Ok(decoded) = load_image(&image.path)
-            .and_then(|bytes| decode_jpeg_to_mono(bytes, image.width, image.height))
+            .and_then(|reader| decode_jpeg_to_mono(reader, image.width, image.height))
         {
-            display.draw_mono_bitmap(
-                image.x,
+            let (target_width, target_height) =
+                fit_dimensions(decoded.width, decoded.height, image.width, image.height);
+            let x = image.x + image.width.saturating_sub(target_width) / 2;
+            display.draw_mono_bitmap_scaled(
+                x,
                 image.y,
-                decoded.width,
-                decoded.height,
+                (decoded.width, decoded.height),
+                (target_width, target_height),
                 &decoded.pixels,
             );
             return;
@@ -1000,21 +1004,25 @@ fn is_jpeg_path(path: &str) -> bool {
     lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
-fn decode_jpeg_to_mono(
-    bytes: Vec<u8>,
+fn decode_jpeg_to_mono<R: Read + Seek>(
+    mut reader: R,
     max_width: usize,
     max_height: usize,
 ) -> Result<DecodedImage> {
-    if bytes.len() > MAX_JPEG_FILE_BYTES {
+    let header = inspect_jpeg_header(&mut reader)?;
+    if header.width > MAX_JPEG_DIMENSION || header.height > MAX_JPEG_DIMENSION {
         return Err(anyhow!(
-            "jpeg file too large: {} > {} bytes",
-            bytes.len(),
-            MAX_JPEG_FILE_BYTES
+            "jpeg dimensions too large: {}x{}",
+            header.width,
+            header.height
         ));
     }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow!("rewind jpeg: {}", e))?;
 
     FreeRtos::delay_ms(1);
-    let mut decoder = JpegDecoder::new(Cursor::new(bytes));
+    let mut decoder = JpegDecoder::new(reader);
     decoder.set_max_decoding_buffer_size(MAX_JPEG_DECODE_BUFFER_BYTES);
     decoder.set_color_transform(ColorTransform::Grayscale);
     decoder
@@ -1031,8 +1039,15 @@ fn decode_jpeg_to_mono(
 
     let decode_max_width = max_width.clamp(1, JPEG_DECODE_MAX_WIDTH);
     let decode_max_height = max_height.clamp(1, JPEG_DECODE_MAX_HEIGHT);
-    let requested =
-        jpeg_scale_request(info.width, info.height, decode_max_width, decode_max_height);
+    let source_channels = info.pixel_format.pixel_bytes().max(1);
+    let requested = jpeg_scale_request(
+        info.width,
+        info.height,
+        decode_max_width,
+        decode_max_height,
+        source_channels,
+        MAX_JPEG_DECODE_BUFFER_BYTES,
+    );
     let (scaled_width, scaled_height) = decoder
         .scale(requested.0, requested.1)
         .map_err(|e| anyhow!("scale jpeg: {}", e))?;
@@ -1074,7 +1089,7 @@ fn decode_jpeg_to_mono(
         decode_max_height,
     );
     let pixels = jpeg_to_mono_nearest(
-        &decoded,
+        decoded,
         source_width,
         source_height,
         source_channels,
@@ -1090,31 +1105,131 @@ fn decode_jpeg_to_mono(
     })
 }
 
+#[derive(Debug)]
+struct JpegHeader {
+    width: u16,
+    height: u16,
+}
+
+fn inspect_jpeg_header<R: Read + Seek>(reader: &mut R) -> Result<JpegHeader> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow!("seek jpeg: {}", e))?;
+    let mut soi = [0u8; 2];
+    reader
+        .read_exact(&mut soi)
+        .map_err(|e| anyhow!("read jpeg soi: {}", e))?;
+    if soi != [0xFF, 0xD8] {
+        return Err(anyhow!("not a jpeg"));
+    }
+
+    loop {
+        let marker = read_jpeg_marker(reader)?;
+        if marker == 0xD9 {
+            return Err(anyhow!("jpeg ended before frame header"));
+        }
+
+        if jpeg_marker_has_no_length(marker) {
+            continue;
+        }
+
+        let segment_len = read_be_u16(reader)?;
+        if segment_len < 2 {
+            return Err(anyhow!("invalid jpeg segment length"));
+        }
+        let payload_len = u64::from(segment_len - 2);
+
+        if is_jpeg_sof_marker(marker) {
+            if payload_len < 6 {
+                return Err(anyhow!("invalid jpeg frame header"));
+            }
+            let mut frame = [0u8; 6];
+            reader
+                .read_exact(&mut frame)
+                .map_err(|e| anyhow!("read jpeg frame header: {}", e))?;
+            return Ok(JpegHeader {
+                height: u16::from_be_bytes([frame[1], frame[2]]),
+                width: u16::from_be_bytes([frame[3], frame[4]]),
+            });
+        }
+
+        reader
+            .seek(SeekFrom::Current(payload_len as i64))
+            .map_err(|e| anyhow!("skip jpeg segment: {}", e))?;
+    }
+}
+
+fn read_jpeg_marker<R: Read>(reader: &mut R) -> Result<u8> {
+    let mut byte = [0u8; 1];
+    loop {
+        reader
+            .read_exact(&mut byte)
+            .map_err(|e| anyhow!("read jpeg marker prefix: {}", e))?;
+        if byte[0] == 0xFF {
+            break;
+        }
+    }
+
+    loop {
+        reader
+            .read_exact(&mut byte)
+            .map_err(|e| anyhow!("read jpeg marker: {}", e))?;
+        if byte[0] != 0xFF {
+            return Ok(byte[0]);
+        }
+    }
+}
+
+fn read_be_u16<R: Read>(reader: &mut R) -> Result<u16> {
+    let mut bytes = [0u8; 2];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|e| anyhow!("read jpeg segment length: {}", e))?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn jpeg_marker_has_no_length(marker: u8) -> bool {
+    marker == 0x01 || marker == 0xD8 || (0xD0..=0xD9).contains(&marker)
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
+}
+
 fn jpeg_scale_request(
     source_width: u16,
     source_height: u16,
     max_width: usize,
     max_height: usize,
+    source_channels: usize,
+    max_buffer_bytes: usize,
 ) -> (u16, u16) {
-    let max_width = max_width.min(u16::MAX as usize).max(1) as u16;
-    let max_height = max_height.min(u16::MAX as usize).max(1) as u16;
-    let width_ratio = source_width.div_ceil(max_width).max(1);
-    let height_ratio = source_height.div_ceil(max_height).max(1);
-    let ratio = width_ratio.max(height_ratio);
-    let scale = if ratio <= 1 {
-        1
-    } else if ratio <= 2 {
-        2
-    } else if ratio <= 4 {
-        4
-    } else {
-        8
-    };
+    let max_width = max_width.max(1);
+    let max_height = max_height.max(1);
+    let source_channels = source_channels.max(1);
+    let mut best = (1u16, 1u16);
 
-    (
-        (source_width / scale).max(1),
-        (source_height / scale).max(1),
-    )
+    for idct_scale in [1usize, 2, 4, 8] {
+        let width = scaled_jpeg_dimension(source_width, idct_scale);
+        let height = scaled_jpeg_dimension(source_height, idct_scale);
+        let fits_view = usize::from(width) <= max_width && usize::from(height) <= max_height;
+        let fits_memory = usize::from(width)
+            .saturating_mul(usize::from(height))
+            .saturating_mul(source_channels)
+            <= max_buffer_bytes;
+
+        if fits_view && fits_memory {
+            best = (width, height);
+        }
+    }
+
+    best
+}
+
+fn scaled_jpeg_dimension(length: u16, idct_scale: usize) -> u16 {
+    ((usize::from(length) * idct_scale).saturating_sub(1) / 8 + 1)
+        .min(u16::MAX as usize)
+        .max(1) as u16
 }
 
 fn fit_dimensions(
@@ -1137,7 +1252,7 @@ fn fit_dimensions(
 }
 
 fn jpeg_to_mono_nearest(
-    decoded: &[u8],
+    mut decoded: Vec<u8>,
     source_width: usize,
     source_height: usize,
     source_channels: usize,
@@ -1145,22 +1260,30 @@ fn jpeg_to_mono_nearest(
     target_width: usize,
     target_height: usize,
 ) -> Result<Vec<u8>> {
-    let mut mono = vec![0xFF; target_width * target_height];
+    let target_len = target_width.saturating_mul(target_height);
+    if target_len > decoded.len() {
+        return Err(anyhow!(
+            "jpeg output buffer too small for mono conversion: {} < {}",
+            decoded.len(),
+            target_len
+        ));
+    }
 
     for y in 0..target_height {
         let source_y = y * source_height / target_height;
         for x in 0..target_width {
             let source_x = x * source_width / target_width;
             let source_index = (source_y * source_width + source_x) * source_channels;
-            let gray = jpeg_gray_at(decoded, source_index, pixel_format)?;
-            mono[y * target_width + x] = if gray < 150 { 0x00 } else { 0xFF };
+            let gray = jpeg_gray_at(&decoded, source_index, pixel_format)?;
+            decoded[y * target_width + x] = if gray < 150 { 0x00 } else { 0xFF };
         }
         if y % 24 == 0 {
             FreeRtos::delay_ms(1);
         }
     }
 
-    Ok(mono)
+    decoded.truncate(target_len);
+    Ok(decoded)
 }
 
 fn jpeg_gray_at(decoded: &[u8], index: usize, pixel_format: PixelFormat) -> Result<u8> {

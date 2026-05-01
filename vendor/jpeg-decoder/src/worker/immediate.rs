@@ -37,6 +37,10 @@ impl ImmediateWorker {
     }
 
     pub fn append_row_immediate(&mut self, (index, data): (usize, Vec<i16>)) {
+        self.append_row_slice_immediate(index, &data);
+    }
+
+    pub fn append_row_slice_immediate(&mut self, index: usize, data: &[i16]) {
         // Convert coefficients from a MCU row to samples.
 
         let component = self.components[index].as_ref().unwrap();
@@ -71,6 +75,10 @@ impl Worker for ImmediateWorker {
     }
     fn append_row(&mut self, row: (usize, Vec<i16>)) -> Result<()> {
         self.append_row_immediate(row);
+        Ok(())
+    }
+    fn append_row_ref(&mut self, index: usize, row: &[i16]) -> Result<()> {
+        self.append_row_slice_immediate(index, row);
         Ok(())
     }
     fn get_result(&mut self, index: usize) -> Result<Vec<u8>> {

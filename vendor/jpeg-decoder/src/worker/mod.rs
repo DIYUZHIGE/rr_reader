@@ -24,6 +24,9 @@ pub struct RowData {
 pub trait Worker {
     fn start(&mut self, row_data: RowData) -> Result<()>;
     fn append_row(&mut self, row: (usize, Vec<i16>)) -> Result<()>;
+    fn append_row_ref(&mut self, index: usize, row: &[i16]) -> Result<()> {
+        self.append_row((index, row.to_vec()))
+    }
     fn get_result(&mut self, index: usize) -> Result<Vec<u8>>;
     /// Default implementation for spawning multiple tasks.
     fn append_rows(&mut self, row: &mut dyn Iterator<Item = (usize, Vec<i16>)>) -> Result<()> {

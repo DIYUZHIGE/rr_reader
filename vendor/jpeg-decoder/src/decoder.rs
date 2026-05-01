@@ -1018,7 +1018,7 @@ impl<R: Read> Decoder<R> {
                         * component.vertical_sampling_factor as usize
                         * 64;
 
-                    let row_coefficients = if is_progressive {
+                    if is_progressive {
                         // Because non-interleaved streams will have multiple MCU rows concatenated together,
                         // the row for calculating the offset is different.
                         let worker_mcu_y = if is_interleaved {
@@ -1029,19 +1029,13 @@ impl<R: Read> Decoder<R> {
                         };
 
                         let offset = worker_mcu_y as usize * coefficients_per_mcu_row;
-                        self.coefficients[scan.component_indices[i]]
-                            [offset..offset + coefficients_per_mcu_row]
-                            .to_vec()
+                        let row_coefficients = &self.coefficients[scan.component_indices[i]]
+                            [offset..offset + coefficients_per_mcu_row];
+                        worker.append_row_ref(i, row_coefficients)?;
                     } else {
-                        mem::replace(
-                            &mut mcu_row_coefficients[i],
-                            vec![0i16; coefficients_per_mcu_row],
-                        )
-                    };
-
-                    // FIXME: additional potential work stealing opportunities for rayon case if we
-                    // also internally can parallelize over components.
-                    worker.append_row((i, row_coefficients))?;
+                        worker.append_row_ref(i, &mcu_row_coefficients[i])?;
+                        mcu_row_coefficients[i].fill(0);
+                    }
                 }
             }
         }
