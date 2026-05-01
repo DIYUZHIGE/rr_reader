@@ -1,7 +1,7 @@
 use super::{
     Display, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
-    CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, PHYSICAL_DISPLAY_HEIGHT,
-    PHYSICAL_DISPLAY_WIDTH, REFRESH_BUSY_TIMEOUT_MS,
+    CMD_WRITE_LUT, CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE,
+    PHYSICAL_DISPLAY_HEIGHT, PHYSICAL_DISPLAY_WIDTH, REFRESH_BUSY_TIMEOUT_MS,
 };
 use anyhow::Result;
 use log::{debug, info};
@@ -22,14 +22,37 @@ const CTRL2_DISPLAY: u8 = 0x04;
 const CTRL2_FULL: u8 = CTRL2_CLOCK | CTRL2_ANALOG | CTRL2_TEMP | CTRL2_LUT | CTRL2_DISPLAY;
 // Half: CLOCK + ANALOG + LUT + DISPLAY (skip temperature load)
 const CTRL2_HALF: u8 = CTRL2_CLOCK | CTRL2_ANALOG | CTRL2_LUT | CTRL2_DISPLAY;
-// Fast: LUT + MODE + DISPLAY (differential, uses internal temperature)
+// Fast: LUT + MODE + DISPLAY (differential, uses the controller's current
+// temperature state). Do not write CMD_WRITE_TEMPERATURE immediately before
+// this mode on X4: in practice that makes the update behave like a global
+// refresh instead of a differential refresh.
 const CTRL2_FAST: u8 = CTRL2_LUT | CTRL2_MODE | CTRL2_DISPLAY;
 
-// High temperature value to accelerate refresh in half mode
+// High temperature value to accelerate half refresh.
 const HALF_TEMPERATURE: u8 = 0x5A;
 // Insert a half refresh every N fast refreshes to clear ghosting without the
-// latency of a full refresh. CrossPoint defaults to a 15-page cleanup cadence.
-const FAST_REFRESH_CLEANUP_INTERVAL: u32 = 15;
+// latency of a full refresh. Aggressive fast refresh uses a longer cleanup
+// cadence to avoid interrupting reading flow.
+const FAST_REFRESH_CLEANUP_INTERVAL: u32 = 50;
+
+// SSD1677 custom fast LUT, adapted from h0rv/ssd1677's LUT_FAST. This is a
+// deliberately short single-phase waveform for latency testing.
+const FAST_LUT: [u8; 112] = [
+    // VCOM
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // White -> White
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Black -> White
+    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // White -> Black
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Black -> Black
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // VCOM DC
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Timing
+    0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -173,6 +196,8 @@ impl Display {
     /// Fast (differential) refresh: write only BW RAM, compare against RED RAM.
     /// Only pixels that differ from the previous frame are driven.
     fn refresh_fast(&mut self, poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
+        self.load_fast_lut()?;
+
         // Write new frame to BW RAM only. RED RAM keeps the previous frame
         // so the controller can compute the delta.
         self.write_framebuffer(CMD_WRITE_RAM_BW)?;
@@ -195,5 +220,10 @@ impl Display {
 
         info!("Fast refresh complete (count: {})", self.fast_refresh_count);
         Ok(())
+    }
+
+    fn load_fast_lut(&mut self) -> Result<()> {
+        self.send_command(CMD_WRITE_LUT)?;
+        self.send_data(&FAST_LUT)
     }
 }
