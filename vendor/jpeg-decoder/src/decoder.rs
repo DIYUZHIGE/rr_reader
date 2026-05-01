@@ -2,9 +2,9 @@ use crate::error::{Error, Result, UnsupportedFeature};
 use crate::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable};
 use crate::marker::Marker;
 use crate::parser::{
-    parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
-    AdobeColorTransform, AppData, CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo,
-    IccChunk, ScanInfo,
+    parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
+    AdobeColorTransform, CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo,
+    ScanInfo, parse_app,
 };
 use crate::read_u8;
 use crate::upsampler::Upsampler;
@@ -19,9 +19,6 @@ use core::ops::Range;
 use std::io::Read;
 
 pub const MAX_COMPONENTS: usize = 4;
-
-mod lossless;
-use self::lossless::compute_image_lossless;
 
 #[rustfmt::skip]
 static UNZIGZAG: [u8; 64] = [
@@ -114,11 +111,7 @@ pub struct Decoder<R> {
     is_jfif: bool,
     is_mjpeg: bool,
 
-    icc_markers: Vec<IccChunk>,
-
-    exif_data: Option<Vec<u8>>,
-    xmp_data: Option<Vec<u8>>,
-    psir_data: Option<Vec<u8>>,
+    // Metadata storage removed for memory-constrained targets.
 
     // Used for progressive JPEGs.
     coefficients: Vec<Vec<i16>>,
@@ -143,10 +136,6 @@ impl<R: Read> Decoder<R> {
             color_transform: None,
             is_jfif: false,
             is_mjpeg: false,
-            icc_markers: Vec::new(),
-            exif_data: None,
-            xmp_data: None,
-            psir_data: None,
             coefficients: Vec::new(),
             coefficients_finished: [0; MAX_COMPONENTS],
             decoding_buffer_size_limit: usize::MAX,
@@ -172,11 +161,7 @@ impl<R: Read> Decoder<R> {
         match self.frame {
             Some(ref frame) => {
                 let pixel_format = match frame.components.len() {
-                    1 => match frame.precision {
-                        2..=8 => PixelFormat::L8,
-                        9..=16 => PixelFormat::L16,
-                        _ => panic!(),
-                    },
+                    1 => PixelFormat::L8,
                     3 => PixelFormat::RGB24,
                     4 => PixelFormat::CMYK32,
                     _ => panic!(),
@@ -193,52 +178,7 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    /// Returns raw exif data, starting at the TIFF header, if the image contains any.
-    ///
-    /// The returned value will be `None` until a call to `decode` has returned `Ok`.    
-    pub fn exif_data(&self) -> Option<&[u8]> {
-        self.exif_data.as_deref()
-    }
 
-    /// Returns the raw XMP packet if there is any.
-    ///
-    /// The returned value will be `None` until a call to `decode` has returned `Ok`.
-    pub fn xmp_data(&self) -> Option<&[u8]> {
-        self.xmp_data.as_deref()
-    }
-
-    /// Returns the embeded icc profile if the image contains one.
-    pub fn icc_profile(&self) -> Option<Vec<u8>> {
-        let mut marker_present: [Option<&IccChunk>; 256] = [None; 256];
-        let num_markers = self.icc_markers.len();
-        if num_markers == 0 || num_markers >= 255 {
-            return None;
-        }
-        // check the validity of the markers
-        for chunk in &self.icc_markers {
-            if usize::from(chunk.num_markers) != num_markers {
-                // all the lengths must match
-                return None;
-            }
-            if chunk.seq_no == 0 {
-                return None;
-            }
-            if marker_present[usize::from(chunk.seq_no)].is_some() {
-                // duplicate seq_no
-                return None;
-            } else {
-                marker_present[usize::from(chunk.seq_no)] = Some(chunk);
-            }
-        }
-
-        // assemble them together by seq_no failing if any are missing
-        let mut data = Vec::new();
-        // seq_no's start at 1
-        for &chunk in marker_present.get(1..=num_markers)? {
-            data.extend_from_slice(&chunk?.data);
-        }
-        Some(data)
-    }
 
     /// Embedded targets usually do not have enough spare task stack/heap for the threaded worker.
     fn select_worker(_frame: &FrameInfo, _worker_preference: PreferWorkerKind) -> PreferWorkerKind {
@@ -306,12 +246,6 @@ impl<R: Read> Decoder<R> {
                 .as_ref()
                 .map_or(0, |frame| frame.components.len())
         ];
-        let mut planes_u16 = vec![
-            Vec::<u16>::new();
-            self.frame
-                .as_ref()
-                .map_or(0, |frame| frame.components.len())
-        ];
 
         loop {
             let marker = match pending_marker.take() {
@@ -341,12 +275,7 @@ impl<R: Read> Decoder<R> {
                             UnsupportedFeature::ArithmeticEntropyCoding,
                         ));
                     }
-                    if frame.precision != 8 && frame.coding_process != CodingProcess::Lossless {
-                        return Err(Error::Unsupported(UnsupportedFeature::SamplePrecision(
-                            frame.precision,
-                        )));
-                    }
-                    if !(2..=16).contains(&frame.precision) {
+                    if frame.precision != 8 {
                         return Err(Error::Unsupported(UnsupportedFeature::SamplePrecision(
                             frame.precision,
                         )));
@@ -371,7 +300,6 @@ impl<R: Read> Decoder<R> {
                     }
 
                     planes = vec![Vec::new(); component_count];
-                    planes_u16 = vec![Vec::new(); component_count];
                 }
 
                 // Scan header
@@ -397,71 +325,58 @@ impl<R: Read> Decoder<R> {
                             .collect();
                     }
 
-                    if frame.coding_process == CodingProcess::Lossless {
-                        let (marker, data) = self.decode_scan_lossless(&frame, &scan)?;
+                    // This was previously buggy, so let's explain the log here a bit. When a
+                    // progressive frame is encoded then the coefficients (DC, AC) of each
+                    // component (=color plane) can be split amongst scans. In particular it can
+                    // happen or at least occurs in the wild that a scan contains coefficient 0 of
+                    // all components. If now one but not all components had all other coefficients
+                    // delivered in previous scans then such a scan contains all components but
+                    // completes only some of them! (This is technically NOT permitted for all
+                    // other coefficients as the standard dictates that scans with coefficients
+                    // other than the 0th must only contain ONE component so we would either
+                    // complete it or not. We may want to detect and error in case more component
+                    // are part of a scan than allowed.) What a weird edge case.
+                    //
+                    // But this means we track precisely which components get completed here.
+                    let mut finished = [false; MAX_COMPONENTS];
 
+                    if scan.successive_approximation_low == 0 {
+                        for (&i, component_finished) in
+                            scan.component_indices.iter().zip(&mut finished)
+                        {
+                            if self.coefficients_finished[i] == !0 {
+                                continue;
+                            }
+                            for j in scan.spectral_selection.clone() {
+                                self.coefficients_finished[i] |= 1 << j;
+                            }
+                            if self.coefficients_finished[i] == !0 {
+                                *component_finished = true;
+                            }
+                        }
+                    }
+
+                    let preference =
+                        Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
+
+                    let (marker, data) = worker_scope
+                        .get_or_init_worker(preference, |worker| {
+                            self.decode_scan(&frame, &scan, worker, &finished)
+                        })?;
+
+                    if let Some(data) = data {
                         for (i, plane) in data
                             .into_iter()
                             .enumerate()
                             .filter(|(_, plane)| !plane.is_empty())
                         {
-                            planes_u16[i] = plane;
-                        }
-                        pending_marker = marker;
-                    } else {
-                        // This was previously buggy, so let's explain the log here a bit. When a
-                        // progressive frame is encoded then the coefficients (DC, AC) of each
-                        // component (=color plane) can be split amongst scans. In particular it can
-                        // happen or at least occurs in the wild that a scan contains coefficient 0 of
-                        // all components. If now one but not all components had all other coefficients
-                        // delivered in previous scans then such a scan contains all components but
-                        // completes only some of them! (This is technically NOT permitted for all
-                        // other coefficients as the standard dictates that scans with coefficients
-                        // other than the 0th must only contain ONE component so we would either
-                        // complete it or not. We may want to detect and error in case more component
-                        // are part of a scan than allowed.) What a weird edge case.
-                        //
-                        // But this means we track precisely which components get completed here.
-                        let mut finished = [false; MAX_COMPONENTS];
-
-                        if scan.successive_approximation_low == 0 {
-                            for (&i, component_finished) in
-                                scan.component_indices.iter().zip(&mut finished)
-                            {
-                                if self.coefficients_finished[i] == !0 {
-                                    continue;
-                                }
-                                for j in scan.spectral_selection.clone() {
-                                    self.coefficients_finished[i] |= 1 << j;
-                                }
-                                if self.coefficients_finished[i] == !0 {
-                                    *component_finished = true;
-                                }
+                            if self.coefficients_finished[i] == !0 {
+                                planes[i] = plane;
                             }
                         }
-
-                        let preference =
-                            Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
-
-                        let (marker, data) = worker_scope
-                            .get_or_init_worker(preference, |worker| {
-                                self.decode_scan(&frame, &scan, worker, &finished)
-                            })?;
-
-                        if let Some(data) = data {
-                            for (i, plane) in data
-                                .into_iter()
-                                .enumerate()
-                                .filter(|(_, plane)| !plane.is_empty())
-                            {
-                                if self.coefficients_finished[i] == !0 {
-                                    planes[i] = plane;
-                                }
-                            }
-                        }
-
-                        pending_marker = marker;
                     }
+
+                    pending_marker = marker;
 
                     scans_processed += 1;
                 }
@@ -516,32 +431,9 @@ impl<R: Read> Decoder<R> {
                 }
                 // Application data
                 Marker::APP(..) => {
-                    if let Some(data) = parse_app(&mut self.reader, marker)? {
-                        match data {
-                            AppData::Adobe(color_transform) => {
-                                self.adobe_color_transform = Some(color_transform)
-                            }
-                            AppData::Jfif => {
-                                // From the JFIF spec:
-                                // "The APP0 marker is used to identify a JPEG FIF file.
-                                //     The JPEG FIF APP0 marker is mandatory right after the SOI marker."
-                                // Some JPEGs in the wild does not follow this though, so we allow
-                                // JFIF headers anywhere APP0 markers are allowed.
-                                /*
-                                if previous_marker != Marker::SOI {
-                                    return Err(Error::Format("the JFIF APP0 marker must come right after the SOI marker".to_owned()));
-                                }
-                                */
-
-                                self.is_jfif = true;
-                            }
-                            AppData::Avi1 => self.is_mjpeg = true,
-                            AppData::Icc(icc) => self.icc_markers.push(icc),
-                            AppData::Exif(data) => self.exif_data = Some(data),
-                            AppData::Xmp(data) => self.xmp_data = Some(data),
-                            AppData::Psir(data) => self.psir_data = Some(data),
-                        }
-                    }
+                    // Only parse Adobe color transform and JFIF/AVI1 markers.
+                    // ICC, EXIF, XMP, PSIR metadata omitted for memory-constrained targets.
+                    let _ = parse_app(&mut self.reader, marker, &mut self.adobe_color_transform, &mut self.is_jfif, &mut self.is_mjpeg);
                 }
                 // Restart
                 Marker::RST(..) => {
@@ -596,7 +488,7 @@ impl<R: Read> Decoder<R> {
         let preference = Self::select_worker(frame, PreferWorkerKind::Multithreaded);
 
         worker_scope.get_or_init_worker(preference, |worker| {
-            self.decode_planes(worker, planes, planes_u16)
+            self.decode_planes(worker, planes)
         })
     }
 
@@ -604,7 +496,6 @@ impl<R: Read> Decoder<R> {
         &mut self,
         worker: &mut dyn Worker,
         mut planes: Vec<Vec<u8>>,
-        planes_u16: Vec<Vec<u16>>,
     ) -> Result<Vec<u8>> {
         if self.frame.is_none() {
             return Err(Error::Format(
@@ -669,16 +560,12 @@ impl<R: Read> Decoder<R> {
             }
         }
 
-        if frame.coding_process == CodingProcess::Lossless {
-            compute_image_lossless(frame, planes_u16)
-        } else {
-            compute_image(
-                &frame.components,
-                planes,
-                frame.output_size,
-                self.determine_color_transform(),
-            )
-        }
+        compute_image(
+            &frame.components,
+            planes,
+            frame.output_size,
+            self.determine_color_transform(),
+        )
     }
 
     fn determine_color_transform(&self) -> ColorTransform {
