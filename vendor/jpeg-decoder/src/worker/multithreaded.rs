@@ -94,7 +94,7 @@ fn create_worker() -> (Sender<WorkerMsg>, impl FnOnce() + 'static) {
                     // because they only ever handle one per thread and we don't want them
                     // to attempt to access nonexistent components
                     data.index = 0;
-                    worker.start_immediate(data);
+                    let _ = worker.start_immediate(data);
                 }
                 WorkerMsg::AppendRow(row) => {
                     worker.append_row_immediate((0, row));

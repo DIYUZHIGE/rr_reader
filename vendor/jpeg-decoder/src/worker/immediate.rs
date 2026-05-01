@@ -27,13 +27,22 @@ impl Default for ImmediateWorker {
 }
 
 impl ImmediateWorker {
-    pub fn start_immediate(&mut self, data: RowData) {
+    pub fn start_immediate(&mut self, data: RowData) -> Result<()> {
         assert!(self.results[data.index].is_empty());
 
+        let new_len = data.component.block_size.width as usize
+            * data.component.block_size.height as usize
+            * data.component.dct_scale
+            * data.component.dct_scale;
+
         self.offsets[data.index] = 0;
-        self.results[data.index].resize(data.component.block_size.width as usize * data.component.block_size.height as usize * data.component.dct_scale * data.component.dct_scale, 0u8);
+        self.results[data.index]
+            .try_reserve_exact(new_len)
+            .map_err(|_| crate::error::Error::Format("out of memory".to_owned()))?;
+        self.results[data.index].resize(new_len, 0u8);
         self.components[data.index] = Some(data.component);
         self.quantization_tables[data.index] = Some(data.quantization_table);
+        Ok(())
     }
 
     pub fn append_row_immediate(&mut self, (index, data): (usize, Vec<i16>)) {
@@ -70,8 +79,7 @@ impl ImmediateWorker {
 
 impl Worker for ImmediateWorker {
     fn start(&mut self, data: RowData) -> Result<()> {
-        self.start_immediate(data);
-        Ok(())
+        self.start_immediate(data)
     }
     fn append_row(&mut self, row: (usize, Vec<i16>)) -> Result<()> {
         self.append_row_immediate(row);

@@ -14,9 +14,19 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use core::cmp;
+use core::iter;
 use core::mem;
 use core::ops::Range;
 use std::io::Read;
+
+/// Allocate a zero-initialized `Vec<i16>` without aborting on OOM.
+fn try_alloc_zeroed_i16(size: usize) -> Result<Vec<i16>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(size)
+        .map_err(|_| Error::Format("out of memory".to_owned()))?;
+    v.extend(iter::repeat(0i16).take(size));
+    Ok(v)
+}
 
 pub const MAX_COMPONENTS: usize = 4;
 
@@ -338,9 +348,9 @@ impl<R: Read> Decoder<R> {
                             .map(|c| {
                                 let block_count =
                                     c.block_size.width as usize * c.block_size.height as usize;
-                                vec![0; block_count * 64]
+                                try_alloc_zeroed_i16(block_count * 64)
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
                     }
 
                     // This was previously buggy, so let's explain the log here a bit. When a
@@ -766,7 +776,7 @@ impl<R: Read> Decoder<R> {
                 let coefficients_per_mcu_row = component.block_size.width as usize
                     * component.vertical_sampling_factor as usize
                     * 64;
-                mcu_row_coefficients[i] = vec![0i16; coefficients_per_mcu_row];
+                mcu_row_coefficients[i] = try_alloc_zeroed_i16(coefficients_per_mcu_row)?;
             }
         }
 
