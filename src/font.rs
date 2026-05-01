@@ -72,6 +72,10 @@ impl Font {
         })
     }
 
+    pub fn id(&self) -> usize {
+        self.data.as_ptr() as usize
+    }
+
     /// Binary search for a glyph by Unicode codepoint. Returns None for
     /// unsupported characters (render as space or replacement glyph).
     pub fn find_glyph(&self, codepoint: u32) -> Option<GlyphInfo> {
@@ -118,10 +122,24 @@ impl Font {
     /// Decompress a glyph bitmap into `buf`. The buffer must be at least
     /// `self.glyph_bytes` bytes.
     pub fn decompress_glyph(&self, info: &GlyphInfo, buf: &mut [u8]) -> Result<()> {
-        let compressed = &self.data[info.data_offset..][..info.compressed_size];
+        let compressed_end = info.data_offset.saturating_add(info.compressed_size);
+        if compressed_end > self.data.len() || info.uncompressed_size > buf.len() {
+            return Err(anyhow!(
+                "Invalid glyph bounds: offset={}, compressed={}, uncompressed={}",
+                info.data_offset,
+                info.compressed_size,
+                info.uncompressed_size
+            ));
+        }
+
+        let compressed = &self.data[info.data_offset..compressed_end];
         let mut decoder = ZlibDecoder::new(compressed);
         decoder.read_exact(&mut buf[..info.uncompressed_size])?;
         Ok(())
+    }
+
+    pub fn glyph_uncompressed_size(info: &GlyphInfo) -> usize {
+        info.uncompressed_size
     }
 
     pub fn char_advance_width(&self, ch: char) -> usize {

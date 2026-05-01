@@ -1,5 +1,5 @@
-use crate::font::Font;
-use anyhow::Result;
+use crate::font::{Font, GlyphInfo};
+use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{Input, Output, PinDriver, Pull};
 use esp_idf_hal::peripherals::Peripherals;
@@ -61,6 +61,7 @@ const BUSY_ACTIVE_HIGH: bool = true;
 const INIT_BUSY_TIMEOUT_MS: u32 = 2_000;
 const REFRESH_BUSY_TIMEOUT_MS: u32 = 30_000;
 const SPI_WRITE_CHUNK: usize = 4096;
+const GLYPH_CACHE_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -85,6 +86,79 @@ pub struct Display {
     red_ram_synced: bool,
     /// Count of consecutive fast refreshes since last cleanup refresh
     fast_refresh_count: u32,
+    glyph_cache: GlyphCache,
+}
+
+struct GlyphCacheEntry {
+    font_id: usize,
+    codepoint: u32,
+    bitmap: Vec<u8>,
+    last_used: u32,
+}
+
+struct GlyphCache {
+    entries: Vec<GlyphCacheEntry>,
+    clock: u32,
+}
+
+impl GlyphCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(GLYPH_CACHE_CAPACITY),
+            clock: 0,
+        }
+    }
+
+    fn get_or_insert(
+        &mut self,
+        font: &Font,
+        codepoint: u32,
+        info: &GlyphInfo,
+        scratch: &mut [u8],
+    ) -> Option<&[u8]> {
+        self.clock = self.clock.wrapping_add(1).max(1);
+        let now = self.clock;
+        let font_id = font.id();
+
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.font_id == font_id && entry.codepoint == codepoint)
+        {
+            self.entries[index].last_used = now;
+            return Some(&self.entries[index].bitmap);
+        }
+
+        if font.decompress_glyph(info, scratch).is_err() {
+            return None;
+        }
+
+        let size = Font::glyph_uncompressed_size(info);
+        let bitmap = scratch[..size].to_vec();
+        let entry = GlyphCacheEntry {
+            font_id,
+            codepoint,
+            bitmap,
+            last_used: now,
+        };
+
+        let index = if self.entries.len() < GLYPH_CACHE_CAPACITY {
+            self.entries.push(entry);
+            self.entries.len() - 1
+        } else {
+            let index = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            self.entries[index] = entry;
+            index
+        };
+
+        Some(&self.entries[index].bitmap)
+    }
 }
 
 impl Display {
@@ -123,6 +197,7 @@ impl Display {
             initialized: false,
             red_ram_synced: false,
             fast_refresh_count: 0,
+            glyph_cache: GlyphCache::new(),
         })
     }
 
@@ -271,6 +346,7 @@ impl Display {
         let line_height = font.glyph_height as usize + line_spacing;
         let line_width = max_x.saturating_sub(start_x).max(1);
         let mut iter = text.chars().peekable();
+        let mut unit = String::with_capacity(32);
 
         while let Some(ch) = iter.next() {
             let cp = ch as u32;
@@ -288,7 +364,7 @@ impl Display {
                 break;
             }
 
-            let mut unit = String::new();
+            unit.clear();
             unit.push(ch);
             if is_ascii_word_char(ch) {
                 while let Some(&next) = iter.peek() {
@@ -410,7 +486,7 @@ impl Display {
         self.send_data_byte(CTRL2_FULL)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("full refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
+        self.wait_while_busy("full refresh", REFRESH_BUSY_TIMEOUT_MS, poll)?;
 
         self.red_ram_synced = true;
         self.fast_refresh_count = 0;
@@ -434,7 +510,7 @@ impl Display {
         self.send_data_byte(CTRL2_HALF)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("half refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
+        self.wait_while_busy("half refresh", REFRESH_BUSY_TIMEOUT_MS, poll)?;
 
         self.red_ram_synced = true;
         self.fast_refresh_count = 0;
@@ -458,7 +534,7 @@ impl Display {
         self.send_data_byte(CTRL2_FAST)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("fast refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
+        self.wait_while_busy("fast refresh", REFRESH_BUSY_TIMEOUT_MS, poll)?;
 
         // After display, copy new frame to RED RAM as baseline for next differential
         self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
@@ -494,7 +570,7 @@ impl Display {
         // Give a small safety margin before polling.
         FreeRtos::delay_ms(5);
         let mut no_poll = None;
-        self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
+        self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS, &mut no_poll)?;
         info!("Display init: soft reset complete");
 
         info!("Display init: temperature sensor (internal)");
@@ -529,14 +605,14 @@ impl Display {
         self.send_command(CMD_AUTO_WRITE_BW_RAM)?;
         self.send_data_byte(0xF7)?; // White pattern for all pixels
         let mut no_poll = None;
-        self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
+        self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll)?;
         info!("Display init: clear BW RAM done");
 
         info!("Display init: clear RED RAM");
         self.send_command(CMD_AUTO_WRITE_RED_RAM)?;
         self.send_data_byte(0xF7)?;
         let mut no_poll = None;
-        self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
+        self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll)?;
         info!("Display init: clear RED RAM done");
 
         Ok(())
@@ -620,7 +696,12 @@ impl Display {
 
     // ── busy polling ────────────────────────────────────────────
 
-    fn wait_while_busy(&self, label: &str, timeout_ms: u32, poll: &mut Option<&mut dyn FnMut()>) {
+    fn wait_while_busy(
+        &self,
+        label: &str,
+        timeout_ms: u32,
+        poll: &mut Option<&mut dyn FnMut()>,
+    ) -> Result<()> {
         let mut elapsed_ms = 0u32;
         let initial_busy = self.is_busy();
         info!("Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}");
@@ -645,12 +726,15 @@ impl Display {
                 "Display wait timed out: {label}; still busy={}",
                 self.is_busy()
             );
+            return Err(anyhow!("display wait timed out: {label}"));
         } else {
             info!(
                 "Display wait done: {label} ({elapsed_ms} ms); busy={}",
                 self.is_busy()
             );
         }
+
+        Ok(())
     }
 
     fn is_busy(&self) -> bool {
@@ -726,9 +810,12 @@ impl Display {
     ) {
         let cp = ch as u32;
         let rendered = if let Some(info) = font.find_glyph(cp) {
-            if font.decompress_glyph(&info, decompress_buf).is_ok() {
+            if let Some(bitmap) = self
+                .glyph_cache
+                .get_or_insert(font, cp, &info, decompress_buf)
+            {
                 font.draw_glyph(
-                    decompress_buf,
+                    bitmap,
                     x,
                     y,
                     DISPLAY_WIDTH,

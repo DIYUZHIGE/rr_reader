@@ -6,6 +6,7 @@ use crate::power::{PowerManager, POWER_BUTTON_SLEEP_MS};
 use anyhow::Result;
 use esp_idf_hal::sys;
 use log::{info, warn};
+use std::borrow::Cow;
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
@@ -24,19 +25,19 @@ const READER_REPEAT_INTERVAL_MS: u64 = 450;
 static FONT_16_DATA: &[u8] = include_bytes!("../generated/font_16.bin");
 static FONT_18_DATA: &[u8] = include_bytes!("../generated/font_18.bin");
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Activity {
     FileBrowser(FileBrowserState),
     Reader(ReaderState),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct FileBrowserState {
     selected: usize,
     first_visible: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ReaderState {
     file_index: usize,
 }
@@ -170,7 +171,7 @@ impl ReaderApp {
             return Ok(());
         }
 
-        match self.activity.clone() {
+        match self.activity {
             Activity::FileBrowser(_) => {
                 let next_buttons = [Down, Right];
                 let previous_buttons = [Up, Left];
@@ -439,7 +440,7 @@ impl ReaderApp {
             let (_, name) = Self::file_browser_parts(&self.md_files[idx]);
             let name = Self::truncate_for_width(
                 &self.ui_font,
-                &name,
+                name,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN,
             );
             self.display.draw_text_font(&self.ui_font, &name, LIST_X, y);
@@ -545,15 +546,15 @@ impl ReaderApp {
             .min(self.md_files.len().saturating_sub(row_count))
     }
 
-    fn truncate_for_width(font: &Font, text: &str, max_px: usize) -> String {
+    fn truncate_for_width<'a>(font: &Font, text: &'a str, max_px: usize) -> Cow<'a, str> {
         if font.text_width(text) <= max_px {
-            return text.to_string();
+            return Cow::Borrowed(text);
         }
 
         let ellipsis = "...";
         let ellipsis_width = font.text_width(ellipsis);
         if max_px <= ellipsis_width {
-            return ".".repeat((max_px / font.char_advance_width('.')).max(1));
+            return Cow::Owned(".".repeat((max_px / font.char_advance_width('.')).max(1)));
         }
 
         let mut out = String::new();
@@ -568,31 +569,23 @@ impl ReaderApp {
             width += advance;
         }
         out.push_str(ellipsis);
-        out
+        Cow::Owned(out)
     }
 
     fn sort_markdown_files(files: &mut [String]) {
-        files.sort_by(|a, b| {
-            let (a_folder, a_name) = Self::file_browser_parts(a);
-            let (b_folder, b_name) = Self::file_browser_parts(b);
-            a_folder
-                .to_lowercase()
-                .cmp(&b_folder.to_lowercase())
-                .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
-                .then_with(|| a.cmp(b))
+        files.sort_by_cached_key(|path| {
+            let (folder, name) = Self::file_browser_parts(path);
+            (folder.to_lowercase(), name.to_lowercase(), path.to_string())
         });
     }
 
-    fn file_browser_parts(path: &str) -> (String, String) {
+    fn file_browser_parts(path: &str) -> (&str, &str) {
         let (folder, file_name) = match path.rsplit_once('/') {
             Some((folder, file_name)) if !folder.is_empty() => (folder, file_name),
             _ => ("根目录", path),
         };
 
-        (
-            folder.to_string(),
-            Self::strip_markdown_extension(file_name).to_string(),
-        )
+        (folder, Self::strip_markdown_extension(file_name))
     }
 
     fn strip_markdown_extension(file_name: &str) -> &str {
