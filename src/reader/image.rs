@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
-use jpeg_decoder::{ColorTransform, Decoder as JpegDecoder, PixelFormat};
-use std::io::{Read, Seek};
+use std::io::{BufRead, Read, Seek};
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
 
 use crate::display::Display;
 use crate::font::Font;
@@ -11,9 +13,9 @@ use super::{RenderImage, QUOTE_BAR_WIDTH, QUOTE_INDENT, READER_X};
 const JPEG_DECODE_MAX_WIDTH: usize = 256;
 const JPEG_DECODE_MAX_HEIGHT: usize = 256;
 const MAX_JPEG_DIMENSION: u16 = 4096;
-// Limit JPEG decode buffer to 64KB. This allows ~256×256 mono output while
-// rejecting images that need more. Photos that exceed this will show a placeholder.
-const MAX_JPEG_DECODE_BUFFER_BYTES: usize = 64 * 1024;
+/// Max pixels for the grayscale decode buffer (1 byte/pixel).
+/// 64KB allows up to 256x256 full decode.
+const MAX_DECODE_PIXELS: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct DecodedImage {
@@ -29,7 +31,7 @@ pub(super) fn draw_reader_image<F, R>(
     load_image: &mut F,
 ) where
     F: FnMut(&str) -> Result<R>,
-    R: Read + Seek,
+    R: BufRead + Seek,
 {
     for depth in 0..image.quote_depth {
         let x = READER_X + depth * QUOTE_INDENT;
@@ -100,19 +102,27 @@ fn is_jpeg_path(path: &str) -> bool {
     lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
-fn decode_jpeg_to_mono<R: Read + Seek>(
+fn decode_jpeg_to_mono<R: BufRead + Seek>(
     reader: R,
     max_width: usize,
     max_height: usize,
 ) -> Result<DecodedImage> {
     FreeRtos::delay_ms(1);
-    let mut decoder = JpegDecoder::new(reader);
-    decoder.set_max_decoding_buffer_size(MAX_JPEG_DECODE_BUFFER_BYTES);
-    decoder.set_color_transform(ColorTransform::Grayscale);
+
+    // Use grayscale output (Luma) for 1 byte/pixel -- 3x less memory than RGB.
+    let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
+
+    let mut decoder = JpegDecoder::new_with_options(reader, options);
+
     decoder
-        .read_info()
-        .map_err(|e| anyhow!("read jpeg info: {}", e))?;
+        .decode_headers()
+        .map_err(|e| anyhow!("jpeg decode headers: {:?}", e))?;
+
     let info = decoder.info().ok_or_else(|| anyhow!("jpeg info missing"))?;
+
+    let src_w = info.width as usize;
+    let src_h = info.height as usize;
+
     if info.width > MAX_JPEG_DIMENSION || info.height > MAX_JPEG_DIMENSION {
         return Err(anyhow!(
             "jpeg dimensions too large: {}x{}",
@@ -121,244 +131,122 @@ fn decode_jpeg_to_mono<R: Read + Seek>(
         ));
     }
 
-    // Estimate worst-case progressive JPEG coefficients memory.
-    // Progressive JPEG may allocate block_count * 64 * sizeof(i16) per component.
-    let est_blocks_w = (usize::from(info.width) + 7) / 8;
-    let est_blocks_h = (usize::from(info.height) + 7) / 8;
-    let est_coeff_bytes = est_blocks_w * est_blocks_h * 64 * 2 * 3;
-    let est_output_bytes = usize::from(info.width)
-        .saturating_mul(usize::from(info.height))
-        .saturating_mul(3);
-    let est_total = est_coeff_bytes.saturating_add(est_output_bytes);
-    if est_total > MAX_JPEG_DECODE_BUFFER_BYTES * 4 {
+    if src_w == 0 || src_h == 0 {
+        return Err(anyhow!("jpeg has zero dimension"));
+    }
+
+    // Check that grayscale output fits in our decode buffer.
+    let decode_pixels = src_w.saturating_mul(src_h);
+    if decode_pixels > MAX_DECODE_PIXELS {
         return Err(anyhow!(
-            "image may need ~{} bytes, limit is {}",
-            est_total,
-            MAX_JPEG_DECODE_BUFFER_BYTES * 4
+            "jpeg too large for decode buffer: {}x{} = {} px (limit {})",
+            src_w,
+            src_h,
+            decode_pixels,
+            MAX_DECODE_PIXELS
+        ));
+    }
+
+    // Decode directly to grayscale.
+    FreeRtos::delay_ms(1);
+    let gray = decoder
+        .decode()
+        .map_err(|e| anyhow!("jpeg decode: {:?}", e))?;
+    FreeRtos::delay_ms(1);
+
+    if gray.len() < src_w * src_h {
+        return Err(anyhow!(
+            "jpeg output too small: {} bytes, expected {}",
+            gray.len(),
+            src_w * src_h
         ));
     }
 
     let decode_max_width = max_width.clamp(1, JPEG_DECODE_MAX_WIDTH);
     let decode_max_height = max_height.clamp(1, JPEG_DECODE_MAX_HEIGHT);
-    let source_channels = info.pixel_format.pixel_bytes().max(1);
-    let requested = jpeg_scale_request(
-        info.width,
-        info.height,
-        decode_max_width,
-        decode_max_height,
-        source_channels,
-        MAX_JPEG_DECODE_BUFFER_BYTES,
-    );
-    let (scaled_width, scaled_height) = decoder
-        .scale(requested.0, requested.1)
-        .map_err(|e| anyhow!("scale jpeg: {}", e))?;
-    if usize::from(scaled_width)
-        .saturating_mul(usize::from(scaled_height))
-        .saturating_mul(3)
-        > MAX_JPEG_DECODE_BUFFER_BYTES
-    {
-        return Err(anyhow!(
-            "scaled jpeg buffer too large: {}x{}",
-            scaled_width,
-            scaled_height
-        ));
-    }
 
-    FreeRtos::delay_ms(1);
-    let decoded = decoder
-        .decode()
-        .map_err(|e| anyhow!("decode jpeg: {}", e))?;
-    FreeRtos::delay_ms(1);
-    let info = decoder
-        .info()
-        .ok_or_else(|| anyhow!("decoded jpeg info missing"))?;
-    let source_width = usize::from(info.width);
-    let source_height = usize::from(info.height);
-    let (source_channels, pixel_format) = if decoded.len() == source_width * source_height {
-        (1, PixelFormat::L8)
-    } else {
-        (info.pixel_format.pixel_bytes(), info.pixel_format)
-    };
-    if source_width == 0 || source_height == 0 || source_channels == 0 {
-        return Err(anyhow!("invalid jpeg output"));
-    }
+    let (target_width, target_height) =
+        fit_dimensions(src_w, src_h, decode_max_width, decode_max_height);
 
-    let (target_width, target_height) = fit_dimensions(
-        source_width,
-        source_height,
-        decode_max_width,
-        decode_max_height,
-    );
-    let pixels = jpeg_to_mono_nearest(
-        decoded,
-        source_width,
-        source_height,
-        source_channels,
-        pixel_format,
-        target_width,
-        target_height,
-    )?;
+    // Convert grayscale to mono (threshold) + nearest-neighbour scale in one pass.
+    let mono = gray_to_mono_nearest(&gray, src_w, src_h, target_width, target_height)?;
 
     Ok(DecodedImage {
         width: target_width,
         height: target_height,
-        pixels,
+        pixels: mono,
     })
 }
 
-fn jpeg_scale_request(
-    source_width: u16,
-    source_height: u16,
-    max_width: usize,
-    max_height: usize,
-    source_channels: usize,
-    max_buffer_bytes: usize,
-) -> (u16, u16) {
-    let max_width = max_width.max(1);
-    let max_height = max_height.max(1);
-    let source_channels = source_channels.max(1);
-    let mut best = (1u16, 1u16);
+/// Downscale dimensions to fit within `max_w x max_h`, preserving aspect ratio.
+fn fit_dimensions(src_w: usize, src_h: usize, max_w: usize, max_h: usize) -> (usize, usize) {
+    let src_w = src_w.max(1);
+    let src_h = src_h.max(1);
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
 
-    for idct_scale in [1usize, 2, 4, 8] {
-        let width = scaled_jpeg_dimension(source_width, idct_scale);
-        let height = scaled_jpeg_dimension(source_height, idct_scale);
-        let fits_view = usize::from(width) <= max_width && usize::from(height) <= max_height;
-        let fits_memory = usize::from(width)
-            .saturating_mul(usize::from(height))
-            .saturating_mul(source_channels)
-            <= max_buffer_bytes;
-
-        if fits_view && fits_memory {
-            best = (width, height);
-        }
+    if src_w <= max_w && src_h <= max_h {
+        return (src_w, src_h);
     }
 
-    best
-}
-
-fn scaled_jpeg_dimension(length: u16, idct_scale: usize) -> u16 {
-    ((usize::from(length) * idct_scale).saturating_sub(1) / 8 + 1)
-        .min(u16::MAX as usize)
-        .max(1) as u16
-}
-
-fn fit_dimensions(
-    source_width: usize,
-    source_height: usize,
-    max_width: usize,
-    max_height: usize,
-) -> (usize, usize) {
-    if source_width <= max_width && source_height <= max_height {
-        return (source_width.max(1), source_height.max(1));
-    }
-
-    let width_limited_height = source_height.saturating_mul(max_width) / source_width.max(1);
-    if width_limited_height <= max_height {
-        (max_width.max(1), width_limited_height.max(1))
+    let h_by_w = src_h.saturating_mul(max_w) / src_w;
+    if h_by_w <= max_h {
+        (max_w, h_by_w.max(1))
     } else {
-        let width = source_width.saturating_mul(max_height) / source_height.max(1);
-        (width.max(1), max_height.max(1))
+        (src_w.saturating_mul(max_h) / src_h.max(1), max_h)
     }
 }
 
+/// Fit dimensions into `max_w x max_h`, allowing upscale for images smaller than the max.
 fn fit_dimensions_allow_upscale(
-    source_width: usize,
-    source_height: usize,
-    max_width: usize,
-    max_height: usize,
+    src_w: usize,
+    src_h: usize,
+    max_w: usize,
+    max_h: usize,
 ) -> (usize, usize) {
-    let source_width = source_width.max(1);
-    let source_height = source_height.max(1);
-    let max_width = max_width.max(1);
-    let max_height = max_height.max(1);
+    let src_w = src_w.max(1);
+    let src_h = src_h.max(1);
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
 
-    let width_limited_height = source_height.saturating_mul(max_width) / source_width;
-    if width_limited_height <= max_height {
-        (max_width, width_limited_height.max(1))
+    let h_by_w = src_h.saturating_mul(max_w) / src_w;
+    if h_by_w <= max_h {
+        (max_w, h_by_w.max(1))
     } else {
-        let width = source_width.saturating_mul(max_height) / source_height;
-        (width.max(1), max_height)
+        (src_w.saturating_mul(max_h) / src_h, max_h)
     }
 }
 
-fn jpeg_to_mono_nearest(
-    mut decoded: Vec<u8>,
-    source_width: usize,
-    source_height: usize,
-    source_channels: usize,
-    pixel_format: PixelFormat,
-    target_width: usize,
-    target_height: usize,
+/// Convert a grayscale (Luma) buffer to mono (black/white) with nearest-neighbour
+/// downscaling. Returns a fresh `Vec` so the caller can drop the large decode
+/// buffer as soon as the conversion finishes.
+fn gray_to_mono_nearest(
+    gray: &[u8],
+    src_w: usize,
+    src_h: usize,
+    target_w: usize,
+    target_h: usize,
 ) -> Result<Vec<u8>> {
-    let target_len = target_width.saturating_mul(target_height);
-    if target_len > decoded.len() {
-        return Err(anyhow!(
-            "jpeg output buffer too small for mono conversion: {} < {}",
-            decoded.len(),
-            target_len
-        ));
-    }
+    let target_len = target_w.saturating_mul(target_h);
+    let mut mono = Vec::with_capacity(target_len);
 
-    for y in 0..target_height {
-        let source_y = y * source_height / target_height;
-        for x in 0..target_width {
-            let source_x = x * source_width / target_width;
-            let source_index = (source_y * source_width + source_x) * source_channels;
-            let gray = jpeg_gray_at(&decoded, source_index, pixel_format)?;
-            decoded[y * target_width + x] = if gray < 150 { 0x00 } else { 0xFF };
+    for y in 0..target_h {
+        let src_y = y.saturating_mul(src_h) / target_h;
+        let row_start = src_y.saturating_mul(src_w);
+
+        for x in 0..target_w {
+            let src_x = x.saturating_mul(src_w) / target_w;
+            let gray_val = gray.get(row_start + src_x).copied().unwrap_or(0xFF);
+            // Threshold: < 150 -> black, >= 150 -> white.
+            // Matches the previous jpeg-decoder behaviour.
+            mono.push(if gray_val < 150 { 0x00 } else { 0xFF });
         }
+
+        // Yield to FreeRTOS every 24 rows so the watchdog doesn't fire.
         if y % 24 == 0 {
             FreeRtos::delay_ms(1);
         }
     }
 
-    decoded.truncate(target_len);
-    Ok(decoded)
-}
-
-fn jpeg_gray_at(decoded: &[u8], index: usize, pixel_format: PixelFormat) -> Result<u8> {
-    match pixel_format {
-        PixelFormat::L8 => decoded
-            .get(index)
-            .copied()
-            .ok_or_else(|| anyhow!("jpeg luma pixel out of range")),
-        PixelFormat::RGB24 => {
-            let r = *decoded
-                .get(index)
-                .ok_or_else(|| anyhow!("jpeg red pixel out of range"))? as u16;
-            let g = *decoded
-                .get(index + 1)
-                .ok_or_else(|| anyhow!("jpeg green pixel out of range"))?
-                as u16;
-            let b = *decoded
-                .get(index + 2)
-                .ok_or_else(|| anyhow!("jpeg blue pixel out of range"))? as u16;
-            Ok(((r * 77 + g * 150 + b * 29) >> 8) as u8)
-        }
-        PixelFormat::CMYK32 => {
-            let c = *decoded
-                .get(index)
-                .ok_or_else(|| anyhow!("jpeg cyan pixel out of range"))? as u16;
-            let m = *decoded
-                .get(index + 1)
-                .ok_or_else(|| anyhow!("jpeg magenta pixel out of range"))?
-                as u16;
-            let y = *decoded
-                .get(index + 2)
-                .ok_or_else(|| anyhow!("jpeg yellow pixel out of range"))?
-                as u16;
-            let k = *decoded
-                .get(index + 3)
-                .ok_or_else(|| anyhow!("jpeg black pixel out of range"))?
-                as u16;
-            let r = 255u16.saturating_sub((c + k).min(255));
-            let g = 255u16.saturating_sub((m + k).min(255));
-            let b = 255u16.saturating_sub((y + k).min(255));
-            Ok(((r * 77 + g * 150 + b * 29) >> 8) as u8)
-        }
-        PixelFormat::L16 => decoded
-            .get(index)
-            .copied()
-            .ok_or_else(|| anyhow!("jpeg l16 pixel out of range")),
-    }
+    Ok(mono)
 }

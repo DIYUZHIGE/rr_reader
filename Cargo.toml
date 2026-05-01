@@ -27,12 +27,9 @@ anyhow = { version = "1", default-features = false }
 esp-idf-hal = { version = "0.46.2", features = ["adc-oneshot-legacy"] }
 esp-idf-svc = "0.52.1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-jpeg-decoder = { version = "0.3", default-features = false }
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 log = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
-
-[patch.crates-io]
-jpeg-decoder = { path = "vendor/jpeg-decoder" }
 
 [build-dependencies]
 embuild = "0.33"

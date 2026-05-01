@@ -11,7 +11,7 @@ use self::image::draw_reader_image;
 use self::markdown::{parse_markdown_blocks, preprocess_obsidian_embeds};
 use self::math::{draw_math_layout, draw_reader_math, layout_math, parse_math};
 use self::pagination::{font_for_style, paginate_blocks};
-use std::io::{Read, Seek};
+use std::io::{BufRead, Read, Seek};
 
 pub const READER_X: usize = 24;
 pub const READER_TEXT_Y: usize = 42;
@@ -237,7 +237,7 @@ pub fn draw_reader_page<F, R>(
     mut load_image: F,
 ) where
     F: FnMut(&str) -> Result<R>,
-    R: Read + Seek,
+    R: BufRead + Seek,
 {
     for element in &page.elements {
         match element {
