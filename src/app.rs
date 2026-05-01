@@ -2,7 +2,7 @@ use crate::display::{Display, RefreshMode};
 use crate::font::Font;
 use crate::hardware::Hardware;
 use crate::input::Button;
-use crate::power::PowerManager;
+use crate::power::{PowerManager, POWER_BUTTON_SLEEP_MS};
 use anyhow::Result;
 use esp_idf_hal::sys;
 use log::{info, warn};
@@ -151,26 +151,26 @@ impl ReaderApp {
                     self.mark_browser_continuous_nav();
                 }
 
-                if self.hardware.input.any_logical_pressed(&next_buttons) {
-                    self.move_browser_selection(1);
-                    self.reset_browser_continuous_nav();
-                } else if self.hardware.input.any_logical_released(&next_buttons) {
-                    self.reset_browser_continuous_nav();
-                }
-
-                if self.hardware.input.any_logical_pressed(&previous_buttons) {
-                    self.move_browser_selection(-1);
-                    self.reset_browser_continuous_nav();
-                } else if self.hardware.input.any_logical_released(&previous_buttons) {
+                if self.hardware.input.any_logical_released(&next_buttons) {
+                    if !self.browser_continuous_nav {
+                        self.move_browser_selection(1);
+                    }
                     self.reset_browser_continuous_nav();
                 }
 
-                if self.hardware.input.logical_was_pressed(Confirm) {
+                if self.hardware.input.any_logical_released(&previous_buttons) {
+                    if !self.browser_continuous_nav {
+                        self.move_browser_selection(-1);
+                    }
+                    self.reset_browser_continuous_nav();
+                }
+
+                if self.hardware.input.logical_was_released(Confirm) {
                     self.open_selected_file();
                 }
             }
             Activity::Reader(reader) => {
-                if self.hardware.input.any_logical_pressed(&[Back, Left]) {
+                if self.hardware.input.logical_was_released(Back) {
                     self.activity = Activity::FileBrowser(FileBrowserState {
                         selected: reader.file_index,
                         first_visible: self.browser_first_visible_for(reader.file_index),
@@ -179,15 +179,19 @@ impl ReaderApp {
                     self.flush_ui_refresh();
                 }
 
-                if self.hardware.input.logical_was_pressed(PageForward) {
+                if self
+                    .hardware
+                    .input
+                    .any_logical_pressed(&[PageForward, Right])
+                {
                     self.open_adjacent_file(1);
                 }
 
-                if self.hardware.input.logical_was_pressed(PageBack) {
+                if self.hardware.input.any_logical_pressed(&[PageBack, Left]) {
                     self.open_adjacent_file(-1);
                 }
 
-                if self.hardware.input.logical_was_pressed(Confirm) {
+                if self.hardware.input.logical_was_released(Confirm) {
                     self.render_current_file();
                     self.flush_ui_refresh();
                 }
@@ -196,7 +200,7 @@ impl ReaderApp {
 
         // Power button long press → sleep
         if self.hardware.input.is_pressed(crate::input::BTN_POWER)
-            && self.hardware.input.held_ms(crate::input::BTN_POWER) >= 2000
+            && self.hardware.input.held_ms(crate::input::BTN_POWER) >= POWER_BUTTON_SLEEP_MS
         {
             info!("Power long press → sleep");
             self.power.enter_deep_sleep(None);
@@ -284,8 +288,7 @@ impl ReaderApp {
             return false;
         }
 
-        let held_long_enough =
-            self.hardware.input.held_ms(crate::input::BTN_DOWN) > BROWSER_CONTINUOUS_START_MS;
+        let held_long_enough = self.hardware.input.held_ms_any() > BROWSER_CONTINUOUS_START_MS;
         let interval_elapsed = now_ms().saturating_sub(self.browser_last_continuous_nav_ms)
             > BROWSER_CONTINUOUS_INTERVAL_MS;
 
@@ -324,9 +327,7 @@ impl ReaderApp {
         };
 
         let next = if delta.is_negative() {
-            current
-                .checked_sub(delta.unsigned_abs().min(current))
-                .unwrap_or(0)
+            current.saturating_sub(delta.unsigned_abs().min(current))
         } else {
             current
                 .saturating_add(delta as usize)

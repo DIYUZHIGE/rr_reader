@@ -41,11 +41,11 @@ fn main() -> Result<()> {
     let display = display::Display::new(peripherals)?;
 
     // Initialize hardware (combines input and storage)
-    let hardware = hardware::Hardware::new(input_manager)?;
+    let mut hardware = hardware::Hardware::new(input_manager)?;
     hardware.log_detected_model();
 
     // Handle wakeup
-    power::handle_wakeup(WakeupReason::get())?;
+    power::handle_wakeup(WakeupReason::get(), &mut hardware.input)?;
 
     // Boot the app (mounts SD, initializes display, shows boot screen)
     let mut app = ReaderApp::boot(hardware, display)?;

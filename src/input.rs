@@ -215,7 +215,7 @@ impl InputManager {
         self.current_state != 0
     }
 
-    pub fn held_ms(&self, _button_index: u8) -> u32 {
+    pub fn held_ms_any(&self) -> u32 {
         if self.current_state != 0 {
             now_ms()
                 .saturating_sub(self.button_press_start_ms)
@@ -225,6 +225,10 @@ impl InputManager {
                 .saturating_sub(self.button_press_start_ms)
                 .min(u32::MAX as u64) as u32
         }
+    }
+
+    pub fn held_ms(&self, _button_index: u8) -> u32 {
+        self.held_ms_any()
     }
 
     // ── Logical mapping ──────────────────────────────────────────
