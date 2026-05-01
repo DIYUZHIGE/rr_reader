@@ -128,56 +128,71 @@ impl Storage {
         Ok(())
     }
 
-    /// List .md files recursively under /sdcard/vault/notes.
-    /// Returns paths relative to /sdcard/vault/notes.
+    /// List markdown files recursively under /sdcard/vault.
+    ///
+    /// This covers both a copied Obsidian vault directly under /sdcard/vault
+    /// and the eventual sync cache layout under /sdcard/vault/notes.
     pub fn list_markdown_files(&self, base: &str) -> Result<Vec<String>> {
-        let dir = Path::new(SD_MOUNT_POINT).join("vault").join("notes").join(base);
+        let scan_root = Path::new(SD_MOUNT_POINT).join("vault").join(base);
         let mut files = Vec::new();
+        self.collect_markdown_files(&scan_root, &scan_root, &mut files)?;
 
-        if !dir.exists() {
-            return Ok(files);
+        if files.is_empty() {
+            info!("No markdown files found under {:?}", scan_root);
+        } else {
+            info!(
+                "Found {} markdown files under {:?}",
+                files.len(),
+                scan_root
+            );
         }
 
-        for entry in fs::read_dir(&dir).map_err(|e| anyhow!("read_dir {:?}: {}", dir, e))? {
-            let entry = entry.map_err(|e| anyhow!("dir entry: {}", e))?;
-            let path = entry.path();
-            if path.is_dir() {
-                let sub = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let sub_base = if base.is_empty() {
-                    sub
-                } else {
-                    format!("{}/{}", base, sub)
-                };
-                files.extend(self.list_markdown_files(&sub_base)?);
-            } else if path.extension().map_or(false, |e| e == "md") {
-                let rel = if base.is_empty() {
-                    path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    format!(
-                        "{}/{}",
-                        base,
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    )
-                };
-                files.push(rel);
-            }
-        }
         Ok(files)
     }
 
-    /// Read a markdown file relative to /sdcard/vault/notes.
+    fn collect_markdown_files(
+        &self,
+        root: &Path,
+        dir: &Path,
+        files: &mut Vec<String>,
+    ) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(dir).map_err(|e| anyhow!("read_dir {:?}: {}", dir, e))? {
+            let entry = entry.map_err(|e| anyhow!("dir entry: {}", e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                self.collect_markdown_files(root, &path, files)?;
+            } else if Self::is_markdown_file(&path) {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push(rel);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_markdown_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false)
+    }
+
+    /// Read a markdown file relative to /sdcard/vault.
     pub fn read_markdown_file(&self, rel_path: &str) -> Result<String> {
-        let full = Path::new(SD_MOUNT_POINT)
-            .join("vault")
-            .join("notes")
-            .join(rel_path);
+        let rel = Path::new(rel_path);
+        if rel.is_absolute() {
+            return Err(anyhow!("absolute markdown path is not allowed: {}", rel_path));
+        }
+
+        let full = Path::new(SD_MOUNT_POINT).join("vault").join(rel);
         fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
@@ -187,7 +202,7 @@ impl Storage {
     }
 
     pub fn vault_path(&self) -> String {
-        format!("{}/vault/notes", SD_MOUNT_POINT)
+        format!("{}/vault", SD_MOUNT_POINT)
     }
 }
 

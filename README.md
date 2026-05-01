@@ -91,43 +91,45 @@ USB 检测:
 
 ### 1. 显示子系统 (`display`)
 
-**当前状态**: 只实现了 full refresh，SPI 10MHz，无 partial refresh。
+**当前状态**: 已切到共享 SPI2 40MHz，并实现 Full / Half / Fast 三种刷新模式；仍需硬件实测刷新质量和残影策略。
 
 **改进计划**（参考 EInkDisplay.cpp）:
 
-- [ ] SPI 频率提升到 40MHz (SSD1677 可接受)
-- [ ] 实现 FAST_REFRESH (差分刷新):
+- [x] SPI 频率提升到 40MHz (SSD1677 可接受)
+- [x] 实现 FAST_REFRESH (差分刷新):
   - BW RAM (0x24) 写新帧，RED RAM (0x26) 保留旧帧
   - Update Ctrl1 = 0x00 (normal mode, 差分比较)
   - Update Ctrl2 = 0x1C (LUT_LOAD + MODE_SELECT + DISPLAY_START)
   - 耗时 ~400-600ms vs 全刷 ~1600ms
-- [ ] 实现 HALF_REFRESH (平衡刷新):
+- [x] 实现 HALF_REFRESH (平衡刷新):
   - 写温度寄存器 0x5A
   - Update Ctrl2 = 0xD4 (跳过温度加载)
 - [ ] FULL_REFRESH: 保留当前实现，用于开机、唤醒、每 N 次 fast 后清除残影
-- [ ] 刷新策略: 翻页用 FAST，菜单切换用 HALF，启动/唤醒用 FULL，每 20 次 FAST 插入一次 FULL
-- [ ] RED RAM 同步: single buffer 模式下，每次刷新后将当前帧回写到 RED RAM 作为下次差分的基准
+- [x] 刷新策略: 翻页用 FAST，菜单切换用 HALF，启动/唤醒用 FULL，每 20 次 FAST 插入一次 FULL
+- [x] RED RAM 同步: single buffer 模式下，每次刷新后将当前帧回写到 RED RAM 作为下次差分的基准
+- [ ] 硬件实测: 确认 BUSY 极性、Fast/Half 残影、40MHz SPI 稳定性
 
 ### 2. 输入子系统 (`input`)
 
 **参考**: InputManager (ADC 读取+去抖), HalGPIO (封装), MappedInputManager (逻辑映射)
 
-- [ ] ADC 驱动: GPIO1/GPIO2 的 ADC 读取 (11dB 衰减)
-- [ ] 按键解码: 根据 ADC 值查表确定按下的按键
-- [ ] 软件去抖: 5ms 稳定窗口
-- [ ] 按下/释放事件检测 (wasPressed/wasReleased)
-- [ ] 长按检测 (hold duration)
-- [ ] 逻辑按键映射:
+- [x] ADC 驱动: GPIO1/GPIO2 的 ADC 读取 (11dB 衰减)
+- [x] 按键解码: 根据 ADC 值查表确定按下的按键
+- [x] 软件去抖: 约 20ms 稳定窗口（主循环 10ms，2 tick）
+- [x] 按下/释放事件检测 (wasPressed/wasReleased)
+- [x] 长按检测 (hold duration)
+- [x] 逻辑按键映射:
   - PageBack/PageForward (侧键，可交换)
   - Confirm/Back/Left/Right (前按键，可重映射)
 - [ ] 按键组合检测 (如 Power+Down 截图)
+- [ ] 硬件实测: 校准 ADC 阈值和按键去抖时间
 
 ### 3. 存储子系统 (`storage`)
 
 **参考**: SDCardManager (底层), HalStorage (互斥封装), FsHelpers
 
-- [ ] SD 卡初始化: SPI CS=GPIO12, 40MHz, FAT 文件系统
-- [ ] 共享 SPI 总线管理: 显示和 SD 卡共用 SPI2，通过 CS 引脚切换
+- [x] SD 卡初始化: SPI CS=GPIO12, FAT 文件系统
+- [x] 共享 SPI 总线管理: 显示和 SD 卡共用 SPI2，通过 CS 引脚切换
 - [ ] 缓存目录结构:
   ```
   /vault/
@@ -231,8 +233,9 @@ USB 检测:
 
 ### 9. 文件浏览器 (`file_browser`)
 
+- [x] 基于本地缓存的 Markdown 文件列表
 - [ ] 基于本地缓存的目录树
-- [ ] 文件/文件夹列表（按名称或修改时间排序）
+- [x] 文件列表（按名称排序）
 - [ ] 显示同步状态: 已同步 / 有更新 / 仅本地
 - [ ] 目录层级导航（退格键返回上级）
 
@@ -240,6 +243,7 @@ USB 检测:
 
 **参考**: crosspoint 的 ActivityManager + Activity 生命周期
 
+- [x] 最小 Activity 状态机: FileBrowser / Reader
 - [ ] Activity 生命周期: `onEnter()` → `loop()` → `render()` → `onExit()`
 - [ ] ActivityManager: 当前 Activity 管理，replace/push/pop 导航
 - [ ] 渲染任务: 独立 FreeRTOS 任务处理渲染（避免阻塞主循环）
@@ -291,19 +295,19 @@ USB 检测:
 - [x] 基础 app loop 框架
 
 ### Phase 0.5: 硬件完善（对齐 crosspoint）
-- [ ] 显示 SPI 提升到 40MHz
-- [ ] 实现 FAST_REFRESH (差分刷新) 和 HALF_REFRESH
-- [ ] SD 卡驱动 (SPI CS=GPIO12, 40MHz, FAT)
-- [ ] GPIO/按键驱动 (ADC 轮询 + 去抖)
-- [ ] 逻辑按键映射
-- [ ] 深度睡眠 + 唤醒
+- [x] 显示 SPI 提升到 40MHz
+- [x] 实现 FAST_REFRESH (差分刷新) 和 HALF_REFRESH
+- [x] SD 卡驱动 (SPI CS=GPIO12, FAT)
+- [x] GPIO/按键驱动 (ADC 轮询 + 去抖)
+- [x] 逻辑按键映射
+- [x] 深度睡眠 + 唤醒
 
 ### Phase 1: 显示和交互
-- [ ] 中文字体渲染 (从 SD 加载点阵/压缩字体)
+- [x] 中文字体渲染 (内置压缩点阵字体)
 - [ ] Markdown 解析 + 分页引擎
-- [ ] 基础 UI: 文字绘制、列表、菜单
-- [ ] Activity 框架
-- [ ] 文件浏览器基础功能
+- [x] 基础 UI: 文字绘制、文件列表
+- [x] 最小 Activity 框架
+- [x] 文件浏览器基础功能
 - [ ] 阅读模式: 翻页、目录跳转
 
 ### Phase 2: 网络和同步
@@ -339,10 +343,13 @@ rr_reader/
 ├── rust-toolchain.toml
 └── src/
     ├── main.rs
-    ├── app.rs
-    ├── display.rs       # SSD1677 驱动 (需改进: 40MHz + partial refresh)
-    ├── hardware.rs      # 硬件检测 (需扩展: SD, 按键, 电源)
-    └── power.rs         # 电源管理 (需扩展: 深度睡眠)
+    ├── app.rs           # 最小 Activity 状态机: FileBrowser / Reader
+    ├── display.rs       # SSD1677 驱动: 40MHz + Full/Half/Fast refresh
+    ├── font.rs          # 压缩点阵字体加载和渲染
+    ├── hardware.rs      # 硬件封装: 输入 + 存储
+    ├── input.rs         # ADC 按键、去抖、逻辑映射
+    ├── storage.rs       # SD/FAT 挂载和 Markdown 文件读取
+    └── power.rs         # 深度睡眠和唤醒
 ```
 
 ## 关键技术决策
