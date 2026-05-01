@@ -7,7 +7,7 @@ use anyhow::Result;
 use esp_idf_hal::sys;
 use log::{info, warn};
 
-const DEFAULT_LOOP_DELAY_MS: u32 = 10;
+const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
 const LIST_TOP_Y: usize = 28;
 const LIST_BOTTOM_MARGIN: usize = 36;
@@ -128,25 +128,25 @@ impl ReaderApp {
 
         if now_ms() < self.input_ignore_until_ms {
             self.hardware.input.clear_events();
-            self.display.flush_if_dirty()?;
+            self.flush_display_if_dirty()?;
             return Ok(());
         }
 
         if self.input_locked_until_release {
             self.hardware.input.clear_events();
             if self.hardware.input.any_pressed() {
-                self.display.flush_if_dirty()?;
+                self.flush_display_if_dirty()?;
                 return Ok(());
             }
             self.input_locked_until_release = false;
-            self.display.flush_if_dirty()?;
+            self.flush_display_if_dirty()?;
             return Ok(());
         }
 
         self.handle_input()?;
 
         // Flush display if dirty
-        self.display.flush_if_dirty()?;
+        self.flush_display_if_dirty()?;
 
         // Auto-sleep
         if self.power.should_sleep() {
@@ -390,9 +390,15 @@ impl ReaderApp {
     }
 
     fn flush_ui_refresh(&mut self) {
-        if let Err(e) = self.display.flush_if_dirty() {
+        if let Err(e) = self.flush_display_if_dirty() {
             warn!("Interactive refresh failed: {}", e);
         }
+    }
+
+    fn flush_display_if_dirty(&mut self) -> Result<()> {
+        let input = &mut self.hardware.input;
+        self.display
+            .flush_if_dirty_polling(|| input.poll_during_blocking_wait())
     }
 
     fn render_file_browser(&mut self) {

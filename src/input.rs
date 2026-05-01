@@ -62,6 +62,8 @@ pub struct InputManager {
     last_state: u8,
     pressed_events: u8,
     released_events: u8,
+    deferred_pressed_events: u8,
+    deferred_released_events: u8,
     last_debounce_ms: u64,
     button_press_start_ms: [u64; BUTTON_COUNT],
     button_press_finish_ms: [u64; BUTTON_COUNT],
@@ -94,6 +96,8 @@ impl InputManager {
             last_state: 0,
             pressed_events: 0,
             released_events: 0,
+            deferred_pressed_events: 0,
+            deferred_released_events: 0,
             last_debounce_ms: 0,
             button_press_start_ms: [0; BUTTON_COUNT],
             button_press_finish_ms: [0; BUTTON_COUNT],
@@ -104,9 +108,28 @@ impl InputManager {
     }
 
     pub fn update(&mut self) {
-        self.pressed_events = 0;
-        self.released_events = 0;
+        self.pressed_events = self.deferred_pressed_events;
+        self.released_events = self.deferred_released_events;
+        self.deferred_pressed_events = 0;
+        self.deferred_released_events = 0;
 
+        let (pressed, released) = self.sample_debounced_events();
+        self.pressed_events |= pressed;
+        self.released_events |= released;
+    }
+
+    /// Poll inputs while another subsystem is blocking the main loop.
+    ///
+    /// Display refreshes can keep the firmware in a busy wait for hundreds of
+    /// milliseconds. Events detected here are deferred so the next normal app
+    /// tick can process them instead of losing quick follow-up presses.
+    pub fn poll_during_blocking_wait(&mut self) {
+        let (pressed, released) = self.sample_debounced_events();
+        self.deferred_pressed_events |= pressed;
+        self.deferred_released_events |= released;
+    }
+
+    fn sample_debounced_events(&mut self) -> (u8, u8) {
         let now_ms = now_ms();
         let state = self.read_raw_state();
 
@@ -115,20 +138,20 @@ impl InputManager {
             self.last_state = state;
         }
 
-        if now_ms.saturating_sub(self.last_debounce_ms) > DEBOUNCE_DELAY_MS
+        if now_ms.saturating_sub(self.last_debounce_ms) >= DEBOUNCE_DELAY_MS
             && state != self.current_state
         {
-            self.pressed_events = state & !self.current_state;
-            self.released_events = self.current_state & !state;
+            let pressed_events = state & !self.current_state;
+            let released_events = self.current_state & !state;
 
             for button in 0..BUTTON_COUNT {
                 let mask = 1u8 << button;
-                if self.pressed_events & mask != 0 {
+                if pressed_events & mask != 0 {
                     self.button_press_start_ms[button] = now_ms;
                     self.button_press_finish_ms[button] = 0;
                     self.long_press_consumed &= !mask;
                 }
-                if self.released_events & mask != 0 {
+                if released_events & mask != 0 {
                     self.button_press_finish_ms[button] = now_ms;
                     self.long_press_consumed &= !mask;
                 }
@@ -137,11 +160,15 @@ impl InputManager {
             self.current_state = state;
             info!(
                 "Input state: pressed={}, released={}, current=0x{:02x}",
-                Self::format_button_mask(self.pressed_events),
-                Self::format_button_mask(self.released_events),
+                Self::format_button_mask(pressed_events),
+                Self::format_button_mask(released_events),
                 self.current_state
             );
+
+            return (pressed_events, released_events);
         }
+
+        (0, 0)
     }
 
     fn read_raw_state(&self) -> u8 {
@@ -286,6 +313,8 @@ impl InputManager {
     pub fn clear_events(&mut self) {
         self.pressed_events = 0;
         self.released_events = 0;
+        self.deferred_pressed_events = 0;
+        self.deferred_released_events = 0;
     }
 
     // ── Logical mapping ──────────────────────────────────────────

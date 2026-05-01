@@ -155,6 +155,18 @@ impl Display {
     /// N refreshes to clear ghosting. Full is reserved for explicit forced
     /// cleanup and boot screens that need the highest-quality baseline.
     pub fn flush_if_dirty(&mut self) -> Result<()> {
+        self.flush_if_dirty_with_poll(None)
+    }
+
+    pub fn flush_if_dirty_polling<F>(&mut self, mut poll: F) -> Result<()>
+    where
+        F: FnMut(),
+    {
+        let mut poll = &mut poll as &mut dyn FnMut();
+        self.flush_if_dirty_with_poll(Some(&mut poll))
+    }
+
+    fn flush_if_dirty_with_poll(&mut self, mut poll: Option<&mut dyn FnMut()>) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
@@ -171,7 +183,7 @@ impl Display {
             RefreshMode::Fast
         };
 
-        self.refresh(mode)?;
+        self.refresh_with_poll(mode, &mut poll)?;
         self.dirty = false;
         Ok(())
     }
@@ -355,6 +367,15 @@ impl Display {
     // ── refresh modes ───────────────────────────────────────────
 
     fn refresh(&mut self, mode: RefreshMode) -> Result<()> {
+        let mut no_poll = None;
+        self.refresh_with_poll(mode, &mut no_poll)
+    }
+
+    fn refresh_with_poll(
+        &mut self,
+        mode: RefreshMode,
+        poll: &mut Option<&mut dyn FnMut()>,
+    ) -> Result<()> {
         if !self.initialized {
             self.begin()?;
         }
@@ -369,16 +390,16 @@ impl Display {
         };
 
         match mode {
-            RefreshMode::Full => self.refresh_full(fb)?,
-            RefreshMode::Half => self.refresh_half(fb)?,
-            RefreshMode::Fast => self.refresh_fast(fb)?,
+            RefreshMode::Full => self.refresh_full(fb, poll)?,
+            RefreshMode::Half => self.refresh_half(fb, poll)?,
+            RefreshMode::Fast => self.refresh_fast(fb, poll)?,
         }
 
         Ok(())
     }
 
     /// Full refresh: write both RAM, bypass RED, full waveform.
-    fn refresh_full(&mut self, fb: &[u8]) -> Result<()> {
+    fn refresh_full(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
         self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
         self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
 
@@ -389,7 +410,7 @@ impl Display {
         self.send_data_byte(CTRL2_FULL)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("full refresh", REFRESH_BUSY_TIMEOUT_MS);
+        self.wait_while_busy("full refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
 
         self.red_ram_synced = true;
         self.fast_refresh_count = 0;
@@ -398,7 +419,7 @@ impl Display {
     }
 
     /// Half refresh: write both RAM, inject high temperature, skip temp load.
-    fn refresh_half(&mut self, fb: &[u8]) -> Result<()> {
+    fn refresh_half(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
         self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
         self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
 
@@ -413,7 +434,7 @@ impl Display {
         self.send_data_byte(CTRL2_HALF)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("half refresh", REFRESH_BUSY_TIMEOUT_MS);
+        self.wait_while_busy("half refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
 
         self.red_ram_synced = true;
         self.fast_refresh_count = 0;
@@ -423,7 +444,7 @@ impl Display {
 
     /// Fast (differential) refresh: write only BW RAM, compare against RED RAM.
     /// Only pixels that differ from the previous frame are driven.
-    fn refresh_fast(&mut self, fb: &[u8]) -> Result<()> {
+    fn refresh_fast(&mut self, fb: &[u8], poll: &mut Option<&mut dyn FnMut()>) -> Result<()> {
         // Write new frame to BW RAM only. RED RAM keeps the previous frame
         // so the controller can compute the delta.
         self.write_ram_buffer(CMD_WRITE_RAM_BW, fb)?;
@@ -437,7 +458,7 @@ impl Display {
         self.send_data_byte(CTRL2_FAST)?;
 
         self.send_command(CMD_MASTER_ACTIVATION)?;
-        self.wait_while_busy("fast refresh", REFRESH_BUSY_TIMEOUT_MS);
+        self.wait_while_busy("fast refresh", REFRESH_BUSY_TIMEOUT_MS, poll);
 
         // After display, copy new frame to RED RAM as baseline for next differential
         self.write_ram_buffer(CMD_WRITE_RAM_RED, fb)?;
@@ -472,7 +493,8 @@ impl Display {
         // SSD1677 datasheet: BUSY rises within 100μs after reset command.
         // Give a small safety margin before polling.
         FreeRtos::delay_ms(5);
-        self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS);
+        let mut no_poll = None;
+        self.wait_while_busy("soft reset", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
         info!("Display init: soft reset complete");
 
         info!("Display init: temperature sensor (internal)");
@@ -506,13 +528,15 @@ impl Display {
         info!("Display init: clear BW RAM");
         self.send_command(CMD_AUTO_WRITE_BW_RAM)?;
         self.send_data_byte(0xF7)?; // White pattern for all pixels
-        self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS);
+        let mut no_poll = None;
+        self.wait_while_busy("auto write BW RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
         info!("Display init: clear BW RAM done");
 
         info!("Display init: clear RED RAM");
         self.send_command(CMD_AUTO_WRITE_RED_RAM)?;
         self.send_data_byte(0xF7)?;
-        self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS);
+        let mut no_poll = None;
+        self.wait_while_busy("auto write RED RAM", INIT_BUSY_TIMEOUT_MS, &mut no_poll);
         info!("Display init: clear RED RAM done");
 
         Ok(())
@@ -596,12 +620,15 @@ impl Display {
 
     // ── busy polling ────────────────────────────────────────────
 
-    fn wait_while_busy(&self, label: &str, timeout_ms: u32) {
+    fn wait_while_busy(&self, label: &str, timeout_ms: u32, poll: &mut Option<&mut dyn FnMut()>) {
         let mut elapsed_ms = 0u32;
         let initial_busy = self.is_busy();
         info!("Display wait: {label}; initial_busy={initial_busy}; active_high={BUSY_ACTIVE_HIGH}");
 
         while self.is_busy() && elapsed_ms < timeout_ms {
+            if let Some(poll) = poll.as_deref_mut() {
+                poll();
+            }
             FreeRtos::delay_ms(1);
             elapsed_ms += 1;
             // Periodically report stuck state for diagnosis
