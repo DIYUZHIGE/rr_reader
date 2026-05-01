@@ -30,8 +30,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ── Binary format constants ──────────────────────────────────────────
 
-MAGIC = b"FONT"
-INDEX_ENTRY_SIZE = 12  # codepoint:u32 + offset:u32 + compressed_size:u16 + uncompressed_size:u16
+MAGIC = b"FNT2"
+INDEX_ENTRY_SIZE = 16  # codepoint:u32 + offset:u32 + compressed_size:u16 + uncompressed_size:u16 + advance:u8 + reserved:3
 
 
 # ── Unicode block ranges ─────────────────────────────────────────────
@@ -69,7 +69,6 @@ def unicode_block_ranges():
 
 def chars_from_ranges():
     """Generate sorted unique characters from the configured Unicode ranges."""
-    chars = []
     seen = set()
     for lo, hi in unicode_block_ranges():
         for cp in range(lo, hi + 1):
@@ -79,15 +78,24 @@ def chars_from_ranges():
             ch = chr(cp)
             if ch not in seen:
                 seen.add(ch)
-                chars.append(ch)
-    return chars
+    return sorted(seen, key=ord)
 
 
 def glyph_bitmap(font: ImageFont.FreeTypeFont, ch: str, size: int) -> bytes:
     """Render a single glyph and return its row-major bitmap bytes (MSB first)."""
     img = Image.new("L", (size, size), 255)
     draw = ImageDraw.Draw(img)
-    draw.text((0, 0), ch, font=font, fill=0)
+    bbox = font.getbbox(ch)
+    if bbox is not None:
+        left, top, right, bottom = bbox
+        glyph_width = right - left
+        glyph_height = bottom - top
+        x = -left
+        y = (size - glyph_height) // 2 - top
+    else:
+        x = 0
+        y = 0
+    draw.text((x, y), ch, font=font, fill=0)
 
     bytes_per_row = (size + 7) // 8
     bitmap = bytearray(bytes_per_row * size)
@@ -99,6 +107,32 @@ def glyph_bitmap(font: ImageFont.FreeTypeFont, ch: str, size: int) -> bytes:
                 bit_idx = 7 - (x % 8)
                 bitmap[byte_idx] |= 1 << bit_idx
     return bytes(bitmap)
+
+
+def glyph_advance(font: ImageFont.FreeTypeFont, ch: str, size: int) -> int:
+    """Return the horizontal cursor advance in pixels, matching proportional font metrics."""
+    try:
+        advance = font.getlength(ch)
+    except AttributeError:
+        advance = font.getsize(ch)[0]
+
+    # Keep CJK and other full-width glyphs on a stable cell, while letting Latin
+    # text use the font's proportional advance like crosspoint's advanceX path.
+    cp = ord(ch)
+    if (
+        0x2E80 <= cp <= 0xA4CF
+        or 0xAC00 <= cp <= 0xD7AF
+        or 0xF900 <= cp <= 0xFAFF
+        or 0xFE10 <= cp <= 0xFE6F
+        or 0xFF00 <= cp <= 0xFF60
+        or 0xFFE0 <= cp <= 0xFFE6
+    ):
+        return size
+
+    if ch == " ":
+        return max(1, round(advance))
+
+    return max(1, min(size, round(advance)))
 
 
 def generate(args):
@@ -138,9 +172,10 @@ def generate(args):
     for i, ch in enumerate(chars):
         bitmap = glyph_bitmap(font, ch, args.size)
         compressed = zlib.compress(bitmap, level=9)
+        advance = glyph_advance(font, ch, args.size)
 
         index_entries.append(
-            (ord(ch), data_offset, compressed, len(bitmap))
+            (ord(ch), data_offset, compressed, len(bitmap), advance)
         )
         data_offset += len(compressed)
 
@@ -157,23 +192,25 @@ def generate(args):
         f.write(struct.pack("<B", glyph_height))
         f.write(struct.pack("<H", glyph_count))
 
-        for codepoint, offset, compressed, uncomp_size in index_entries:
+        for codepoint, offset, compressed, uncomp_size, advance in index_entries:
             f.write(struct.pack("<I", codepoint))
             f.write(struct.pack("<I", offset))
             f.write(struct.pack("<H", len(compressed)))
             f.write(struct.pack("<H", uncomp_size))
+            f.write(struct.pack("<B", advance))
+            f.write(b"\x00\x00\x00")
 
-        for _, _, compressed, _ in index_entries:
+        for _, _, compressed, _, _ in index_entries:
             f.write(compressed)
 
     total_size = 8 + glyph_count * INDEX_ENTRY_SIZE + sum(
-        len(c) for _, _, c, _ in index_entries
+        len(c) for _, _, c, _, _ in index_entries
     )
 
     # ── Summary ────────────────────────────────────────────────────
     elapsed = time.time() - t0
     index_kb = glyph_count * INDEX_ENTRY_SIZE / 1024
-    data_kb = sum(len(c) for _, _, c, _ in index_entries) / 1024
+    data_kb = sum(len(c) for _, _, c, _, _ in index_entries) / 1024
     total_kb = total_size / 1024
 
     print(f"Font generated: {args.output_bin}")

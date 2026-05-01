@@ -398,20 +398,20 @@ impl ReaderApp {
             let (folder, name) = Self::file_browser_parts(&self.md_files[idx]);
             let marker = if selected_row { ">" } else { " " };
             let prefix = format!("{} {:03} ", marker, idx + 1);
-            let prefix_width = prefix.chars().count() * self.font.glyph_width as usize;
+            let prefix_width = self.font.text_width(&prefix);
             let name = Self::truncate_for_width(
+                &self.font,
                 &name,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN - prefix_width,
-                self.font.glyph_width as usize,
             );
             let line = format!("{}{}", prefix, name);
             self.display.draw_text_font(&self.font, &line, LIST_X, y);
 
-            let folder_prefix_width = 6 * self.font.glyph_width as usize;
+            let folder_prefix_width = self.font.text_width("      ");
             let folder = Self::truncate_start_for_width(
+                &self.font,
                 &folder,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN - folder_prefix_width,
-                self.font.glyph_width as usize,
             );
             let folder_line = format!("      {}", folder);
             self.display.draw_text_font(
@@ -467,11 +467,7 @@ impl ReaderApp {
             Ok(content) => {
                 let (_, name) = Self::file_browser_parts(rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
-                let title = Self::truncate_for_width(
-                    &title,
-                    Display::width() - 40,
-                    self.font.glyph_width as usize,
-                );
+                let title = Self::truncate_for_width(&self.font, &title, Display::width() - 40);
                 self.display.draw_text_font(&self.font, &title, 20, 10);
                 self.display.draw_text_wrapped(
                     &self.font,
@@ -518,38 +514,59 @@ impl ReaderApp {
             .min(self.md_files.len().saturating_sub(row_count))
     }
 
-    fn truncate_for_width(text: &str, max_px: usize, glyph_width: usize) -> String {
-        let max_chars = (max_px / glyph_width).max(1);
-        let char_count = text.chars().count();
-        if char_count <= max_chars {
+    fn truncate_for_width(font: &Font, text: &str, max_px: usize) -> String {
+        if font.text_width(text) <= max_px {
             return text.to_string();
         }
 
-        if max_chars <= 3 {
-            return ".".repeat(max_chars);
+        let ellipsis = "...";
+        let ellipsis_width = font.text_width(ellipsis);
+        if max_px <= ellipsis_width {
+            return ".".repeat((max_px / font.char_advance_width('.')).max(1));
         }
 
-        let mut truncated = text.chars().take(max_chars - 3).collect::<String>();
-        truncated.push_str("...");
-        truncated
+        let mut out = String::new();
+        let mut width = 0;
+        let limit = max_px - ellipsis_width;
+        for ch in text.chars() {
+            let advance = font.char_advance_width(ch);
+            if width + advance > limit {
+                break;
+            }
+            out.push(ch);
+            width += advance;
+        }
+        out.push_str(ellipsis);
+        out
     }
 
-    fn truncate_start_for_width(text: &str, max_px: usize, glyph_width: usize) -> String {
-        let max_chars = (max_px / glyph_width).max(1);
-        let char_count = text.chars().count();
-        if char_count <= max_chars {
+    fn truncate_start_for_width(font: &Font, text: &str, max_px: usize) -> String {
+        if font.text_width(text) <= max_px {
             return text.to_string();
         }
 
-        if max_chars <= 3 {
-            return ".".repeat(max_chars);
+        let ellipsis = "...";
+        let ellipsis_width = font.text_width(ellipsis);
+        if max_px <= ellipsis_width {
+            return ".".repeat((max_px / font.char_advance_width('.')).max(1));
         }
 
-        let tail = text
-            .chars()
-            .skip(char_count - (max_chars - 3))
-            .collect::<String>();
-        format!("...{}", tail)
+        let mut tail = Vec::new();
+        let mut width = 0;
+        let limit = max_px - ellipsis_width;
+        for ch in text.chars().rev() {
+            let advance = font.char_advance_width(ch);
+            if width + advance > limit {
+                break;
+            }
+            tail.push(ch);
+            width += advance;
+        }
+
+        tail.reverse();
+        let mut out = String::from(ellipsis);
+        out.extend(tail);
+        out
     }
 
     fn sort_markdown_files(files: &mut [String]) {

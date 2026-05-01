@@ -229,37 +229,13 @@ impl Display {
             if cp == b'\r' as u32 {
                 continue;
             }
-            if cp == b'\t' as u32 {
-                cursor_x += font.glyph_width as usize * 2;
-                continue;
-            }
-            if cp == b' ' as u32 {
-                cursor_x += font.glyph_width as usize;
+            if cp == b'\t' as u32 || cp == b' ' as u32 {
+                cursor_x += font.char_advance_width(ch);
                 continue;
             }
 
-            let rendered = if let Some(info) = font.find_glyph(cp) {
-                if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
-                    font.draw_glyph(
-                        &decompress_buf,
-                        cursor_x,
-                        cursor_y,
-                        DISPLAY_WIDTH,
-                        DISPLAY_HEIGHT,
-                        &mut self.framebuffer,
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !rendered {
-                self.draw_missing_glyph(font, cursor_x, cursor_y);
-            }
-            cursor_x += font.glyph_width as usize;
+            self.draw_font_char(font, ch, cursor_x, cursor_y, &mut decompress_buf);
+            cursor_x += font.char_advance_width(ch);
         }
         self.dirty = true;
     }
@@ -278,62 +254,84 @@ impl Display {
         let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
         let start_x = x;
         let mut cursor_x = x;
+        let line_height = font.glyph_height as usize + line_spacing;
+        let line_width = max_x.saturating_sub(start_x).max(1);
+        let mut iter = text.chars().peekable();
 
-        for ch in text.chars() {
+        while let Some(ch) = iter.next() {
             let cp = ch as u32;
 
             if cp == b'\n' as u32 {
                 cursor_x = start_x;
-                y += font.glyph_height as usize + line_spacing;
+                y += line_height;
                 continue;
             }
             if cp == b'\r' as u32 {
                 continue;
-            }
-            if cp == b'\t' as u32 {
-                cursor_x += font.glyph_width as usize * 2;
-                continue;
-            }
-
-            if cursor_x + font.glyph_width as usize > max_x {
-                cursor_x = start_x;
-                y += font.glyph_height as usize + line_spacing;
             }
 
             if y + font.glyph_height as usize > DISPLAY_HEIGHT {
                 break;
             }
 
-            if cp == b' ' as u32 {
-                cursor_x += font.glyph_width as usize;
+            let mut unit = String::new();
+            unit.push(ch);
+            if is_ascii_word_char(ch) {
+                while let Some(&next) = iter.peek() {
+                    if is_ascii_word_char(next) {
+                        unit.push(next);
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let unit_width = font.text_width(&unit);
+
+            if unit.chars().all(|c| c == ' ' || c == '\t') {
+                if cursor_x == start_x {
+                    continue;
+                }
+                if cursor_x + unit_width > max_x {
+                    cursor_x = start_x;
+                    y += line_height;
+                } else {
+                    cursor_x += unit_width;
+                }
                 continue;
             }
 
-            let rendered = if let Some(info) = font.find_glyph(cp) {
-                if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
-                    font.draw_glyph(
-                        &decompress_buf,
-                        cursor_x,
-                        y,
-                        DISPLAY_WIDTH,
-                        DISPLAY_HEIGHT,
-                        &mut self.framebuffer,
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !rendered {
-                self.draw_missing_glyph(font, cursor_x, y);
+            if cursor_x > start_x && cursor_x + unit_width > max_x {
+                cursor_x = start_x;
+                y += line_height;
             }
-            cursor_x += font.glyph_width as usize;
+
+            if y + font.glyph_height as usize > DISPLAY_HEIGHT {
+                break;
+            }
+
+            if unit_width <= line_width {
+                self.draw_text_run(font, &unit, cursor_x, y, &mut decompress_buf);
+                cursor_x += unit_width;
+                continue;
+            }
+
+            for word_ch in unit.chars() {
+                let advance = font.char_advance_width(word_ch);
+                if cursor_x > start_x && cursor_x + advance > max_x {
+                    cursor_x = start_x;
+                    y += line_height;
+                }
+                if y + font.glyph_height as usize > DISPLAY_HEIGHT {
+                    break;
+                }
+                self.draw_font_char(font, word_ch, cursor_x, y, &mut decompress_buf);
+                cursor_x += advance;
+            }
         }
         self.dirty = true;
-        y + font.glyph_height as usize + line_spacing
+        y + line_height
     }
 
     pub fn framebuffer(&self) -> &[u8] {
@@ -670,6 +668,57 @@ impl Display {
 
     // ── basic drawing ───────────────────────────────────────────
 
+    fn draw_text_run(
+        &mut self,
+        font: &Font,
+        text: &str,
+        mut x: usize,
+        y: usize,
+        decompress_buf: &mut [u8],
+    ) {
+        for ch in text.chars() {
+            if ch == ' ' || ch == '\t' {
+                x += font.char_advance_width(ch);
+                continue;
+            }
+
+            self.draw_font_char(font, ch, x, y, decompress_buf);
+            x += font.char_advance_width(ch);
+        }
+    }
+
+    fn draw_font_char(
+        &mut self,
+        font: &Font,
+        ch: char,
+        x: usize,
+        y: usize,
+        decompress_buf: &mut [u8],
+    ) {
+        let cp = ch as u32;
+        let rendered = if let Some(info) = font.find_glyph(cp) {
+            if font.decompress_glyph(&info, decompress_buf).is_ok() {
+                font.draw_glyph(
+                    decompress_buf,
+                    x,
+                    y,
+                    DISPLAY_WIDTH,
+                    DISPLAY_HEIGHT,
+                    &mut self.framebuffer,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !rendered {
+            self.draw_missing_glyph(font, x, y);
+        }
+    }
+
     fn draw_char(&mut self, ch: char, x: usize, y: usize, scale: usize) {
         let glyph = glyph_5x7(ch);
         for (col, bits) in glyph.iter().enumerate() {
@@ -719,6 +768,10 @@ impl Display {
             self.framebuffer[index] &= !mask;
         }
     }
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '#' | ':' | '@')
 }
 
 fn glyph_5x7(ch: char) -> [u8; 5] {
