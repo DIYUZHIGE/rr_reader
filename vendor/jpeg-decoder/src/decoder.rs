@@ -314,6 +314,24 @@ impl<R: Read> Decoder<R> {
                     if frame.coding_process == CodingProcess::DctProgressive
                         && self.coefficients.is_empty()
                     {
+                        // Check total coefficients memory against decoding_buffer_size_limit.
+                        // Each coefficient is i16 (2 bytes), 64 coefficients per 8x8 block.
+                        let total_coeff_i16: usize = frame
+                            .components
+                            .iter()
+                            .map(|c| {
+                                let block_count =
+                                    c.block_size.width as usize * c.block_size.height as usize;
+                                block_count * 64
+                            })
+                            .sum();
+                        let total_coeff_bytes = total_coeff_i16 * 2;
+                        if total_coeff_bytes > self.decoding_buffer_size_limit {
+                            return Err(Error::Format(format!(
+                                "progressive coefficients exceed limit: {} > {}",
+                                total_coeff_bytes, self.decoding_buffer_size_limit
+                            )));
+                        }
                         self.coefficients = frame
                             .components
                             .iter()

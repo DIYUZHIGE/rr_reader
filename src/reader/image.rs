@@ -121,6 +121,23 @@ fn decode_jpeg_to_mono<R: Read + Seek>(
         ));
     }
 
+    // Estimate worst-case progressive JPEG coefficients memory.
+    // Progressive JPEG may allocate block_count * 64 * sizeof(i16) per component.
+    let est_blocks_w = (usize::from(info.width) + 7) / 8;
+    let est_blocks_h = (usize::from(info.height) + 7) / 8;
+    let est_coeff_bytes = est_blocks_w * est_blocks_h * 64 * 2 * 3;
+    let est_output_bytes = usize::from(info.width)
+        .saturating_mul(usize::from(info.height))
+        .saturating_mul(3);
+    let est_total = est_coeff_bytes.saturating_add(est_output_bytes);
+    if est_total > MAX_JPEG_DECODE_BUFFER_BYTES * 4 {
+        return Err(anyhow!(
+            "image may need ~{} bytes, limit is {}",
+            est_total,
+            MAX_JPEG_DECODE_BUFFER_BYTES * 4
+        ));
+    }
+
     let decode_max_width = max_width.clamp(1, JPEG_DECODE_MAX_WIDTH);
     let decode_max_height = max_height.clamp(1, JPEG_DECODE_MAX_HEIGHT);
     let source_channels = info.pixel_format.pixel_bytes().max(1);
