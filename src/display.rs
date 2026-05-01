@@ -7,8 +7,7 @@ pub use self::refresh::RefreshMode;
 
 use self::glyph_cache::GlyphCache;
 use anyhow::Result;
-use esp_idf_hal::gpio::{Input, Output, PinDriver, Pull};
-use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::gpio::{Input, Output, PinDriver, Pins, Pull};
 use esp_idf_hal::sys;
 use log::info;
 use std::ptr;
@@ -67,7 +66,7 @@ impl Display {
     /// Create display driver. The SPI bus must already be initialized
     /// (typically by sdspi_host_init for SD card sharing). This adds the
     /// display as a device on the shared SPI2 bus.
-    pub fn new(peripherals: Peripherals) -> Result<Self> {
+    pub fn new(pins: Pins) -> Result<Self> {
         // Add display as a device on the shared SPI2 bus (no CS; manual control).
         let device_config = sys::spi_device_interface_config_t {
             spics_io_num: -1,
@@ -90,10 +89,10 @@ impl Display {
 
         Ok(Self {
             spi_handle: handle,
-            cs: PinDriver::output(peripherals.pins.gpio21)?,
-            dc: PinDriver::output(peripherals.pins.gpio4)?,
-            rst: PinDriver::output(peripherals.pins.gpio5)?,
-            busy: PinDriver::input(peripherals.pins.gpio6, Pull::Floating)?,
+            cs: PinDriver::output(pins.gpio21)?,
+            dc: PinDriver::output(pins.gpio4)?,
+            rst: PinDriver::output(pins.gpio5)?,
+            busy: PinDriver::input(pins.gpio6, Pull::Floating)?,
             framebuffer: vec![0xFF; BUFFER_SIZE],
             dirty: false,
             initialized: false,
@@ -123,5 +122,10 @@ impl Display {
 
     pub fn height() -> usize {
         DISPLAY_HEIGHT
+    }
+
+    /// Free cached glyph bitmaps to reclaim heap before a large allocation.
+    pub fn clear_glyph_cache(&mut self) {
+        self.glyph_cache.clear();
     }
 }

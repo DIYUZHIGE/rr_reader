@@ -31,7 +31,6 @@ impl Display {
     /// Render UTF-8 text with the given font at (x, y). Missing glyphs are
     /// shown as an outline box so unsupported characters are visible.
     pub fn draw_text_font(&mut self, font: &Font, text: &str, x: usize, y: usize) {
-        let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
         let mut cursor_x = x;
         let mut cursor_y = y;
 
@@ -51,7 +50,7 @@ impl Display {
                 continue;
             }
 
-            self.draw_font_char(font, ch, cursor_x, cursor_y, &mut decompress_buf);
+            self.draw_font_char(font, ch, cursor_x, cursor_y);
             cursor_x += font.char_advance_width(ch);
         }
         self.dirty = true;
@@ -68,7 +67,6 @@ impl Display {
         max_x: usize,
         line_spacing: usize,
     ) -> usize {
-        let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
         let start_x = x;
         let mut cursor_x = x;
         let line_height = font.glyph_height as usize + line_spacing;
@@ -130,7 +128,7 @@ impl Display {
             }
 
             if unit_width <= line_width {
-                self.draw_text_run(font, &unit, cursor_x, y, &mut decompress_buf);
+                self.draw_text_run(font, &unit, cursor_x, y);
                 cursor_x += unit_width;
                 continue;
             }
@@ -144,7 +142,7 @@ impl Display {
                 if y + font.glyph_height as usize > DISPLAY_HEIGHT {
                     break;
                 }
-                self.draw_font_char(font, word_ch, cursor_x, y, &mut decompress_buf);
+                self.draw_font_char(font, word_ch, cursor_x, y);
                 cursor_x += advance;
             }
         }
@@ -212,7 +210,6 @@ impl Display {
         text: &str,
         mut x: usize,
         y: usize,
-        decompress_buf: &mut [u8],
     ) {
         for ch in text.chars() {
             if ch == ' ' || ch == '\t' {
@@ -220,7 +217,7 @@ impl Display {
                 continue;
             }
 
-            self.draw_font_char(font, ch, x, y, decompress_buf);
+            self.draw_font_char(font, ch, x, y);
             x += font.char_advance_width(ch);
         }
     }
@@ -231,7 +228,6 @@ impl Display {
         ch: char,
         x: usize,
         y: usize,
-        decompress_buf: &mut [u8],
     ) {
         let cp = ch as u32;
         let rendered = {
@@ -239,7 +235,7 @@ impl Display {
             let framebuffer = &mut self.framebuffer;
 
             if let Some(info) = font.find_glyph(cp) {
-                if let Some(bitmap) = glyph_cache.get_or_insert(font, cp, &info, decompress_buf) {
+                if let Some(bitmap) = glyph_cache.get_or_insert(font, cp, &info) {
                     draw_font_bitmap(framebuffer, font, bitmap, x, y);
                     true
                 } else {

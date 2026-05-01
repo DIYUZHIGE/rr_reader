@@ -11,8 +11,7 @@
 //   [...data blob...]
 
 use anyhow::{anyhow, Result};
-use flate2::read::ZlibDecoder;
-use std::io::Read;
+use flate2::{Decompress, FlushDecompress};
 
 const MAGIC: &[u8; 4] = b"FNT2";
 const INDEX_ENTRY_SIZE: usize = 16;
@@ -139,8 +138,14 @@ impl Font {
     }
 
     /// Decompress a glyph bitmap into `buf`. The buffer must be at least
-    /// `self.glyph_bytes` bytes.
-    pub fn decompress_glyph(&self, info: &GlyphInfo, buf: &mut [u8]) -> Result<()> {
+    /// `self.glyph_bytes` bytes. `decomp` is a reusable zlib decompressor
+    /// (avoids allocating a 32+ KB window per glyph).
+    pub fn decompress_glyph(
+        &self,
+        decomp: &mut Decompress,
+        info: &GlyphInfo,
+        buf: &mut [u8],
+    ) -> Result<()> {
         let compressed_end = info.data_offset.saturating_add(info.compressed_size);
         if compressed_end > self.data.len() || info.uncompressed_size > buf.len() {
             return Err(anyhow!(
@@ -152,8 +157,12 @@ impl Font {
         }
 
         let compressed = &self.data[info.data_offset..compressed_end];
-        let mut decoder = ZlibDecoder::new(compressed);
-        decoder.read_exact(&mut buf[..info.uncompressed_size])?;
+        decomp.reset(true);
+        decomp.decompress(
+            compressed,
+            &mut buf[..info.uncompressed_size],
+            FlushDecompress::Finish,
+        )?;
         Ok(())
     }
 
@@ -232,77 +241,3 @@ fn is_halfwidth_codepoint(codepoint: u32) -> bool {
     )
 }
 
-// ── UTF-8 iteration ────────────────────────────────────────────────
-
-/// Yields (codepoint, byte_offset) pairs from a UTF-8 string slice.
-pub fn utf8_codepoints(s: &str) -> impl Iterator<Item = (u32, usize)> + '_ {
-    s.char_indices().map(|(i, c)| (c as u32, i))
-}
-
-// ── Text layout ────────────────────────────────────────────────────
-
-/// Render a UTF-8 string with the given font at (x, y). Wraps lines at
-/// `max_x` (in pixels). Returns the y coordinate of the next line.
-/// `line_spacing` is extra pixels between lines (added to glyph height).
-/// Characters not found in the font are silently skipped (treated as space).
-pub struct TextWrapTarget<'a> {
-    pub x: usize,
-    pub y: usize,
-    pub max_x: usize,
-    pub fb_width: usize,
-    pub fb_height: usize,
-    pub line_spacing: usize,
-    pub fb: &'a mut [u8],
-}
-
-pub fn draw_text_wrapped(font: &Font, text: &str, target: TextWrapTarget<'_>) -> usize {
-    let mut x = target.x;
-    let mut y = target.y;
-    let start_x = x;
-    let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
-
-    for ch in text.chars() {
-        let cp = ch as u32;
-
-        // Handle newlines
-        if cp == b'\n' as u32 {
-            x = start_x;
-            y += font.glyph_height as usize + target.line_spacing;
-            continue;
-        }
-
-        // Word-wrap: if the next glyph would overflow, advance to next line
-        let advance = font.char_advance_width(ch);
-        if x + advance > target.max_x {
-            x = start_x;
-            y += font.glyph_height as usize + target.line_spacing;
-        }
-
-        if y + font.glyph_height as usize > target.fb_height {
-            break; // off screen
-        }
-
-        // Skip spaces (no glyph to draw)
-        if cp == b' ' as u32 {
-            x += advance;
-            continue;
-        }
-
-        if let Some(info) = font.find_glyph(cp) {
-            if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
-                font.draw_glyph(
-                    &decompress_buf,
-                    x,
-                    y,
-                    target.fb_width,
-                    target.fb_height,
-                    target.fb,
-                );
-            }
-        }
-        // Glyph not found → skip (advance cursor anyway)
-        x += advance;
-    }
-
-    y + font.glyph_height as usize + target.line_spacing
-}

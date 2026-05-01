@@ -6,6 +6,7 @@ mod display;
 mod font;
 mod hardware;
 mod input;
+mod network;
 mod power;
 mod reader;
 mod storage;
@@ -30,7 +31,7 @@ fn main() -> Result<()> {
         WakeupReason::get()
     );
 
-    let peripherals = Peripherals::take()?;
+    let Peripherals { pins, modem, .. } = Peripherals::take()?;
 
     // Input manager uses raw sys:: calls (doesn't own peripherals)
     let input_manager = input::InputManager::new()?;
@@ -42,10 +43,10 @@ fn main() -> Result<()> {
 
     // Display adds itself as a raw SPI device on the shared bus.
     // Takes full Peripherals (uses GPIO pins; SPI peripherals are unused here).
-    let display = display::Display::new(peripherals)?;
+    let display = display::Display::new(pins)?;
 
     // Initialize hardware (combines input and storage)
-    let mut hardware = hardware::Hardware::new(input_manager)?;
+    let mut hardware = hardware::Hardware::new(input_manager, modem)?;
     hardware.log_detected_model();
 
     // Handle wakeup

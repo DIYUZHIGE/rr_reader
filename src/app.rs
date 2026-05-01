@@ -93,9 +93,20 @@ impl ReaderApp {
         sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
+        let wifi_status = hardware.connect_wifi_from_storage();
+        info!("WiFi boot status: {:?}", wifi_status);
+
         // Show boot screen with status
         draw_boot_screen(&mut display);
         display.draw_text_font(&ui_font, &format!("文件: {}", md_files.len()), 220, 280);
+        display.draw_text_wrapped(
+            &ui_font,
+            &wifi_status.boot_line(),
+            140,
+            310,
+            Display::width() - 140,
+            4,
+        );
         display.flush_with_mode(RefreshMode::Full)?;
 
         info!("Boot complete");
@@ -467,6 +478,10 @@ impl ReaderApp {
         ) {
             return Ok(());
         }
+
+        // Free heap before heavy markdown parsing
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
 
         let rel_path = &self.md_files[file_index];
         let markdown = self.hardware.storage.read_markdown_file(rel_path)?;

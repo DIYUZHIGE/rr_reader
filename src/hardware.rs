@@ -3,8 +3,10 @@ mod spi;
 pub use self::spi::init_shared_spi_bus;
 
 use crate::input::InputManager;
+use crate::network::{NetworkManager, WifiStatus};
 use crate::storage::Storage;
 use anyhow::Result;
+use esp_idf_hal::modem::Modem;
 use log::info;
 
 pub const BOARD: &str = "esp32-c3-devkitm-1";
@@ -20,14 +22,16 @@ pub struct Hardware {
     pub model: DeviceModel,
     pub input: InputManager,
     pub storage: Storage,
+    pub network: NetworkManager,
 }
 
 impl Hardware {
-    pub fn new(input: InputManager) -> Result<Self> {
+    pub fn new(input: InputManager, modem: Modem<'static>) -> Result<Self> {
         Ok(Self {
             model: DeviceModel::X4,
             input,
             storage: Storage::new(),
+            network: NetworkManager::new(modem),
         })
     }
 
@@ -43,6 +47,10 @@ impl Hardware {
         self.storage.mount()?;
         self.storage.ensure_vault_dirs()?;
         Ok(())
+    }
+
+    pub fn connect_wifi_from_storage(&mut self) -> WifiStatus {
+        self.network.connect_from_storage(&self.storage)
     }
 
     /// Update button state. Call once per loop iteration.
