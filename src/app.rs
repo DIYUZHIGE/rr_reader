@@ -14,7 +14,10 @@ const LIST_TOP_Y: usize = 28;
 const LIST_BOTTOM_MARGIN: usize = 36;
 const LIST_X: usize = 48;
 const LIST_RIGHT_MARGIN: usize = 24;
+const READER_X: usize = 24;
 const READER_TEXT_Y: usize = 42;
+const READER_RIGHT_MARGIN: usize = 24;
+const READER_BOTTOM_MARGIN: usize = 36;
 const INPUT_STARTUP_IGNORE_MS: u64 = 300;
 const BROWSER_REPEAT_START_MS: u32 = 280;
 const BROWSER_REPEAT_INTERVAL_MS: u64 = 140;
@@ -40,6 +43,14 @@ struct FileBrowserState {
 #[derive(Clone, Copy, Debug)]
 struct ReaderState {
     file_index: usize,
+    page_index: usize,
+}
+
+#[derive(Debug)]
+struct ReaderCache {
+    file_index: usize,
+    content: String,
+    page_starts: Vec<usize>,
 }
 
 pub struct ReaderApp {
@@ -51,6 +62,7 @@ pub struct ReaderApp {
     idle_ticks: u32,
     md_files: Vec<String>,
     activity: Activity,
+    reader_cache: Option<ReaderCache>,
     input_ignore_until_ms: u64,
     input_locked_until_release: bool,
     browser_last_repeat_ms: u64,
@@ -105,6 +117,7 @@ impl ReaderApp {
                 selected: 0,
                 first_visible: 0,
             }),
+            reader_cache: None,
             input_ignore_until_ms: now_ms() + INPUT_STARTUP_IGNORE_MS,
             input_locked_until_release: true,
             browser_last_repeat_ms: 0,
@@ -219,7 +232,7 @@ impl ReaderApp {
                     READER_REPEAT_INTERVAL_MS,
                     self.reader_last_repeat_ms,
                 ) {
-                    self.open_adjacent_file(delta);
+                    self.move_reader_page(delta);
                     self.reader_last_repeat_ms = now_ms();
                     return Ok(());
                 }
@@ -321,7 +334,10 @@ impl ReaderApp {
             _ => return,
         };
 
-        self.activity = Activity::Reader(ReaderState { file_index });
+        self.activity = Activity::Reader(ReaderState {
+            file_index,
+            page_index: 0,
+        });
         self.render_current_file();
         self.flush_ui_refresh();
     }
@@ -364,28 +380,36 @@ impl ReaderApp {
         None
     }
 
-    fn open_adjacent_file(&mut self, delta: isize) {
-        if self.md_files.is_empty() {
-            return;
-        }
-
-        let current = match &self.activity {
-            Activity::Reader(reader) => reader.file_index,
+    fn move_reader_page(&mut self, delta: isize) {
+        let reader = match self.activity {
+            Activity::Reader(reader) => reader,
             _ => return,
         };
 
-        let next = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs().min(current))
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(self.md_files.len() - 1)
-        };
-        if next == current {
+        if self.ensure_reader_cache(reader.file_index).is_err() {
             return;
         }
 
-        self.activity = Activity::Reader(ReaderState { file_index: next });
+        let page_count = self.reader_page_count().max(1);
+        let next = if delta.is_negative() {
+            reader
+                .page_index
+                .saturating_sub(delta.unsigned_abs().min(reader.page_index))
+        } else {
+            reader
+                .page_index
+                .saturating_add(delta as usize)
+                .min(page_count - 1)
+        };
+
+        if next == reader.page_index {
+            return;
+        }
+
+        self.activity = Activity::Reader(ReaderState {
+            file_index: reader.file_index,
+            page_index: next,
+        });
         self.render_current_file();
         self.flush_ui_refresh();
     }
@@ -488,31 +512,73 @@ impl ReaderApp {
             return;
         }
 
-        let file_index = match &self.activity {
+        let reader = match &self.activity {
+            Activity::Reader(reader) => Some(*reader),
+            Activity::FileBrowser(_) => None,
+        };
+
+        let file_index = match self.activity {
             Activity::Reader(reader) => reader.file_index.min(self.md_files.len() - 1),
             Activity::FileBrowser(browser) => browser.selected.min(self.md_files.len() - 1),
         };
-        let rel_path = &self.md_files[file_index];
-        match self.hardware.storage.read_markdown_file(rel_path) {
-            Ok(content) => {
-                let (_, name) = Self::file_browser_parts(rel_path);
+        let rel_path = self.md_files[file_index].clone();
+        match self.ensure_reader_cache(file_index) {
+            Ok(()) => {
+                let cache = match self.reader_cache.as_ref() {
+                    Some(cache) if cache.file_index == file_index => cache,
+                    _ => return,
+                };
+                let page_count = cache.page_starts.len().max(1);
+                let page_index = reader
+                    .map(|reader| reader.page_index.min(page_count - 1))
+                    .unwrap_or(0);
+                if let Some(reader) = reader {
+                    if page_index != reader.page_index {
+                        self.activity = Activity::Reader(ReaderState {
+                            file_index,
+                            page_index,
+                        });
+                    }
+                }
+
+                let page_start = cache.page_starts.get(page_index).copied().unwrap_or(0);
+                let page_end = cache
+                    .page_starts
+                    .get(page_index + 1)
+                    .copied()
+                    .unwrap_or(cache.content.len());
+                let page_text = &cache.content[page_start..page_end];
+
+                let (_, name) = Self::file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
                 let title = Self::truncate_for_width(&self.ui_font, &title, Display::width() - 48);
-                self.display.draw_text_font(&self.ui_font, &title, 24, 10);
                 self.display
-                    .fill_rect(24, 34, Display::width() - 48, 1, 0x00);
+                    .draw_text_font(&self.ui_font, &title, READER_X, 10);
+                self.display
+                    .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
                 self.display.draw_text_wrapped(
                     &self.reader_font,
-                    &content,
-                    24,
+                    page_text,
+                    READER_X,
                     READER_TEXT_Y,
-                    Display::width() - 24,
+                    Display::width() - READER_RIGHT_MARGIN,
                     5,
                 );
+                let footer = format!("{}/{}", page_index + 1, page_count);
+                let footer_x =
+                    Display::width().saturating_sub(READER_X + self.ui_font.text_width(&footer));
+                self.display.draw_text_font(
+                    &self.ui_font,
+                    &footer,
+                    footer_x,
+                    Display::height() - self.ui_font.glyph_height as usize - 8,
+                );
                 info!(
-                    "Rendering file {}/{}: {}",
+                    "Rendering file {}/{} page {}/{}: {}",
                     file_index + 1,
                     self.md_files.len(),
+                    page_index + 1,
+                    page_count,
                     rel_path
                 );
             }
@@ -528,6 +594,174 @@ impl ReaderApp {
                 warn!("Failed to read {}: {}", rel_path, e);
             }
         }
+    }
+
+    fn ensure_reader_cache(&mut self, file_index: usize) -> Result<()> {
+        if matches!(
+            self.reader_cache,
+            Some(ReaderCache {
+                file_index: cached,
+                ..
+            }) if cached == file_index
+        ) {
+            return Ok(());
+        }
+
+        let rel_path = &self.md_files[file_index];
+        let content = self.hardware.storage.read_markdown_file(rel_path)?;
+        let page_starts = self.paginate_reader_text(&content);
+        self.reader_cache = Some(ReaderCache {
+            file_index,
+            content,
+            page_starts,
+        });
+        Ok(())
+    }
+
+    fn reader_page_count(&self) -> usize {
+        self.reader_cache
+            .as_ref()
+            .map(|cache| cache.page_starts.len())
+            .unwrap_or(0)
+    }
+
+    fn paginate_reader_text(&self, text: &str) -> Vec<usize> {
+        let mut page_starts = vec![0];
+        let mut cursor_x = READER_X;
+        let mut y = READER_TEXT_Y;
+        let max_x = Display::width() - READER_RIGHT_MARGIN;
+        let bottom_y = Display::height() - READER_BOTTOM_MARGIN;
+        let line_height = self.reader_font.glyph_height as usize + 5;
+        let line_width = max_x.saturating_sub(READER_X).max(1);
+        let mut iter = text.char_indices().peekable();
+
+        while let Some((byte_index, ch)) = iter.next() {
+            if ch == '\r' {
+                continue;
+            }
+
+            if ch == '\n' {
+                if !Self::advance_reader_line(
+                    &mut cursor_x,
+                    &mut y,
+                    line_height,
+                    self.reader_font.glyph_height as usize,
+                    bottom_y,
+                ) {
+                    page_starts.push(Self::next_char_boundary(text, byte_index + ch.len_utf8()));
+                    y = READER_TEXT_Y;
+                }
+                continue;
+            }
+
+            let unit_start = byte_index;
+            let mut unit_end = byte_index + ch.len_utf8();
+            let mut unit_width = self.reader_font.char_advance_width(ch);
+            let is_space_unit = ch == ' ' || ch == '\t';
+
+            if Self::is_ascii_word_char(ch) {
+                while let Some(&(next_index, next)) = iter.peek() {
+                    if !Self::is_ascii_word_char(next) {
+                        break;
+                    }
+                    unit_end = next_index + next.len_utf8();
+                    unit_width += self.reader_font.char_advance_width(next);
+                    iter.next();
+                }
+            }
+
+            if is_space_unit {
+                if cursor_x == READER_X {
+                    continue;
+                }
+                if cursor_x + unit_width > max_x {
+                    if !Self::advance_reader_line(
+                        &mut cursor_x,
+                        &mut y,
+                        line_height,
+                        self.reader_font.glyph_height as usize,
+                        bottom_y,
+                    ) {
+                        page_starts.push(unit_end);
+                        y = READER_TEXT_Y;
+                    }
+                } else {
+                    cursor_x += unit_width;
+                }
+                continue;
+            }
+
+            if cursor_x > READER_X
+                && cursor_x + unit_width > max_x
+                && !Self::advance_reader_line(
+                    &mut cursor_x,
+                    &mut y,
+                    line_height,
+                    self.reader_font.glyph_height as usize,
+                    bottom_y,
+                )
+            {
+                page_starts.push(unit_start);
+                y = READER_TEXT_Y;
+            }
+
+            if unit_width <= line_width {
+                cursor_x += unit_width;
+                continue;
+            }
+
+            for (char_index, word_ch) in text[unit_start..unit_end].char_indices() {
+                let absolute_index = unit_start + char_index;
+                let advance = self.reader_font.char_advance_width(word_ch);
+                if cursor_x > READER_X
+                    && cursor_x + advance > max_x
+                    && !Self::advance_reader_line(
+                        &mut cursor_x,
+                        &mut y,
+                        line_height,
+                        self.reader_font.glyph_height as usize,
+                        bottom_y,
+                    )
+                {
+                    page_starts.push(absolute_index);
+                    y = READER_TEXT_Y;
+                }
+                cursor_x += advance;
+            }
+        }
+
+        page_starts.dedup();
+        if page_starts.len() > 1 && page_starts.last().copied() == Some(text.len()) {
+            page_starts.pop();
+        }
+        page_starts
+    }
+
+    fn advance_reader_line(
+        cursor_x: &mut usize,
+        y: &mut usize,
+        line_height: usize,
+        glyph_height: usize,
+        bottom_y: usize,
+    ) -> bool {
+        *cursor_x = READER_X;
+        if y.saturating_add(line_height).saturating_add(glyph_height) > bottom_y {
+            return false;
+        }
+        *y += line_height;
+        true
+    }
+
+    fn is_ascii_word_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '#' | ':' | '@')
+    }
+
+    fn next_char_boundary(text: &str, mut index: usize) -> usize {
+        index = index.min(text.len());
+        while index < text.len() && !text.is_char_boundary(index) {
+            index += 1;
+        }
+        index
     }
 
     fn browser_row_count(&self) -> usize {
