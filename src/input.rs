@@ -1,5 +1,6 @@
 use anyhow::Result;
 use esp_idf_hal::sys;
+use log::info;
 
 // ── Hardware button indices ──────────────────────────────────────
 pub const BTN_BACK: u8 = 0;
@@ -11,12 +12,18 @@ pub const BTN_DOWN: u8 = 5;
 pub const BTN_POWER: u8 = 6;
 const BUTTON_COUNT: usize = 7;
 
+// ESP32-C3 ADC1 channel mapping:
+//   ADC_CHANNEL_1 -> GPIO1 (front button resistor ladder)
+//   ADC_CHANNEL_2 -> GPIO2 (side button resistor ladder)
+const FRONT_ADC_CHANNEL: sys::adc_channel_t = sys::adc_channel_t_ADC_CHANNEL_1;
+const SIDE_ADC_CHANNEL: sys::adc_channel_t = sys::adc_channel_t_ADC_CHANNEL_2;
+
 // ADC ranges from crosspoint measured values
 const ADC_NO_BUTTON: u16 = 3800;
 const ADC_RANGES_1: [i32; 5] = [ADC_NO_BUTTON as i32, 3100, 2090, 750, i32::MIN];
 const ADC_RANGES_2: [i32; 3] = [ADC_NO_BUTTON as i32, 1120, i32::MIN];
 
-const DEBOUNCE_TICKS: u8 = 2;
+const DEBOUNCE_DELAY_MS: u64 = 5;
 
 // ── Logical button types ────────────────────────────────────────
 
@@ -50,12 +57,13 @@ pub enum SideButtonLayout {
 // ── Input Manager ───────────────────────────────────────────────
 
 pub struct InputManager {
+    current_state: u8,
     last_state: u8,
-    debounced_state: u8,
-    debounce_counter: u8,
     pressed_events: u8,
     released_events: u8,
-    hold_ticks: [u32; BUTTON_COUNT],
+    last_debounce_ms: u64,
+    button_press_start_ms: u64,
+    button_press_finish_ms: u64,
     front_mapping: [u8; 4],
     side_layout: SideButtonLayout,
 }
@@ -68,14 +76,8 @@ impl InputManager {
         unsafe {
             // Configure ADC1 channels for button reading
             sys::adc1_config_width(sys::adc_bits_width_t_ADC_WIDTH_BIT_12);
-            sys::adc1_config_channel_atten(
-                sys::adc_channel_t_ADC_CHANNEL_0,
-                sys::adc_atten_t_ADC_ATTEN_DB_11,
-            );
-            sys::adc1_config_channel_atten(
-                sys::adc_channel_t_ADC_CHANNEL_1,
-                sys::adc_atten_t_ADC_ATTEN_DB_11,
-            );
+            sys::adc1_config_channel_atten(FRONT_ADC_CHANNEL, sys::adc_atten_t_ADC_ATTEN_DB_11);
+            sys::adc1_config_channel_atten(SIDE_ADC_CHANNEL, sys::adc_atten_t_ADC_ATTEN_DB_11);
 
             // GPIO3: power button (digital input with pull-up)
             sys::gpio_set_direction(sys::gpio_num_t_GPIO_NUM_3, sys::gpio_mode_t_GPIO_MODE_INPUT);
@@ -86,12 +88,13 @@ impl InputManager {
         }
 
         Ok(Self {
+            current_state: 0,
             last_state: 0,
-            debounced_state: 0,
-            debounce_counter: 0,
             pressed_events: 0,
             released_events: 0,
-            hold_ticks: [0; BUTTON_COUNT],
+            last_debounce_ms: 0,
+            button_press_start_ms: 0,
+            button_press_finish_ms: 0,
             front_mapping: [BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT],
             side_layout: SideButtonLayout::PrevNext,
         })
@@ -101,33 +104,35 @@ impl InputManager {
         self.pressed_events = 0;
         self.released_events = 0;
 
-        let raw_state = self.read_raw_state();
+        let now_ms = now_ms();
+        let state = self.read_raw_state();
 
-        if raw_state != self.last_state {
-            self.debounce_counter = 0;
-            self.last_state = raw_state;
-        } else if self.debounce_counter < DEBOUNCE_TICKS {
-            self.debounce_counter = self.debounce_counter.saturating_add(1);
+        if state != self.last_state {
+            self.last_debounce_ms = now_ms;
+            self.last_state = state;
         }
 
-        if self.debounce_counter >= DEBOUNCE_TICKS && raw_state != self.debounced_state {
-            self.pressed_events = raw_state & !self.debounced_state;
-            self.released_events = !raw_state & self.debounced_state;
-            self.debounced_state = raw_state;
+        if now_ms.saturating_sub(self.last_debounce_ms) > DEBOUNCE_DELAY_MS
+            && state != self.current_state
+        {
+            self.pressed_events = state & !self.current_state;
+            self.released_events = self.current_state & !state;
 
-            for i in 0..BUTTON_COUNT {
-                if self.pressed_events & (1u8 << i) != 0 {
-                    self.hold_ticks[i] = 0;
-                }
+            if self.pressed_events > 0 && self.current_state == 0 {
+                self.button_press_start_ms = now_ms;
             }
-        }
 
-        for i in 0..BUTTON_COUNT {
-            if self.debounced_state & (1u8 << i) != 0 {
-                self.hold_ticks[i] = self.hold_ticks[i].saturating_add(1);
-            } else {
-                self.hold_ticks[i] = 0;
+            if self.released_events > 0 && state == 0 {
+                self.button_press_finish_ms = now_ms;
             }
+
+            self.current_state = state;
+            info!(
+                "Input state: pressed={}, released={}, current=0x{:02x}",
+                Self::format_button_mask(self.pressed_events),
+                Self::format_button_mask(self.released_events),
+                self.current_state
+            );
         }
     }
 
@@ -135,14 +140,14 @@ impl InputManager {
         let mut state: u8 = 0;
 
         unsafe {
-            // GPIO1 (front buttons) — ADC1_CH0
-            let front_raw = sys::adc1_get_raw(sys::adc_channel_t_ADC_CHANNEL_0);
+            // GPIO1 (front buttons)
+            let front_raw = sys::adc1_get_raw(FRONT_ADC_CHANNEL);
             if let Some(idx) = Self::adc_to_button(front_raw as u16, &ADC_RANGES_1) {
                 state |= 1u8 << idx;
             }
 
-            // GPIO2 (side buttons) — ADC1_CH1
-            let side_raw = sys::adc1_get_raw(sys::adc_channel_t_ADC_CHANNEL_1);
+            // GPIO2 (side buttons)
+            let side_raw = sys::adc1_get_raw(SIDE_ADC_CHANNEL);
             if let Some(idx) = Self::adc_to_button(side_raw as u16, &ADC_RANGES_2) {
                 state |= 1u8 << (idx + 4); // BTN_UP=4, BTN_DOWN=5
             }
@@ -166,10 +171,24 @@ impl InputManager {
         None
     }
 
+    fn format_button_mask(mask: u8) -> &'static str {
+        match mask {
+            0 => "-",
+            m if m == (1u8 << BTN_BACK) => "Back",
+            m if m == (1u8 << BTN_CONFIRM) => "Confirm",
+            m if m == (1u8 << BTN_LEFT) => "Left",
+            m if m == (1u8 << BTN_RIGHT) => "Right",
+            m if m == (1u8 << BTN_UP) => "Up",
+            m if m == (1u8 << BTN_DOWN) => "Down",
+            m if m == (1u8 << BTN_POWER) => "Power",
+            _ => "Multiple",
+        }
+    }
+
     // ── Queries ──────────────────────────────────────────────────
 
     pub fn is_pressed(&self, button_index: u8) -> bool {
-        self.debounced_state & (1u8 << button_index) != 0
+        self.current_state & (1u8 << button_index) != 0
     }
 
     pub fn was_pressed(&self, button_index: u8) -> bool {
@@ -184,12 +203,28 @@ impl InputManager {
         self.pressed_events != 0 || self.released_events != 0
     }
 
-    pub fn any_pressed(&self) -> bool {
-        self.debounced_state != 0
+    pub fn was_any_pressed(&self) -> bool {
+        self.pressed_events != 0
     }
 
-    pub fn held_ms(&self, button_index: u8) -> u32 {
-        self.hold_ticks[button_index as usize] * 10
+    pub fn was_any_released(&self) -> bool {
+        self.released_events != 0
+    }
+
+    pub fn any_pressed(&self) -> bool {
+        self.current_state != 0
+    }
+
+    pub fn held_ms(&self, _button_index: u8) -> u32 {
+        if self.current_state != 0 {
+            now_ms()
+                .saturating_sub(self.button_press_start_ms)
+                .min(u32::MAX as u64) as u32
+        } else {
+            self.button_press_finish_ms
+                .saturating_sub(self.button_press_start_ms)
+                .min(u32::MAX as u64) as u32
+        }
     }
 
     // ── Logical mapping ──────────────────────────────────────────
@@ -241,4 +276,8 @@ impl InputManager {
     pub fn set_side_layout(&mut self, layout: SideButtonLayout) {
         self.side_layout = layout;
     }
+}
+
+fn now_ms() -> u64 {
+    unsafe { (sys::esp_timer_get_time() / 1000) as u64 }
 }

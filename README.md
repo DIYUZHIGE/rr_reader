@@ -27,8 +27,8 @@ SD 卡 (共享 SPI2):
   CS    GPIO12
 
 按键:
-  前按钮组  GPIO1 (ADC1_CH0, 11dB衰减)
-  侧按钮组  GPIO2 (ADC1_CH1, 11dB衰减)
+  前按钮组  GPIO1 (ADC1_CH1, 11dB衰减)
+  侧按钮组  GPIO2 (ADC1_CH2, 11dB衰减)
   电源键    GPIO3 (数字输入, 上拉, active LOW)
 
 USB 检测:
