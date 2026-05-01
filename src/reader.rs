@@ -56,6 +56,7 @@ enum BlockStyle {
     Quote,
     Code,
     Rule,
+    TableRow,
 }
 
 #[derive(Debug)]
@@ -76,6 +77,55 @@ struct CurrentBlock {
     indent_level: usize,
     quote_depth: usize,
     prefix: String,
+}
+
+#[derive(Debug)]
+struct TableState {
+    headers: Vec<String>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_head: bool,
+    in_cell: bool,
+}
+
+impl TableState {
+    fn new() -> Self {
+        Self {
+            headers: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: String::new(),
+            in_head: false,
+            in_cell: false,
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if self.in_cell {
+            self.current_cell.push_str(text);
+        }
+    }
+
+    fn push_space(&mut self) {
+        if self.in_cell && !self.current_cell.ends_with(' ') {
+            self.current_cell.push(' ');
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.current_row.clear();
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell.clear();
+        self.in_cell = true;
+    }
+
+    fn finish_cell(&mut self) {
+        self.current_row
+            .push(self.current_cell.trim().replace('\n', " "));
+        self.current_cell.clear();
+        self.in_cell = false;
+    }
 }
 
 pub fn markdown_pages(markdown: &str, reader_font: &Font, ui_font: &Font) -> Vec<ReaderPage> {
@@ -149,11 +199,13 @@ fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
     let mut blocks = Vec::new();
     let mut current: Option<CurrentBlock> = None;
     let mut code_block: Option<String> = None;
+    let mut table: Option<TableState> = None;
     let mut list_stack: Vec<ListState> = Vec::new();
     let mut item_stack: Vec<ItemState> = Vec::new();
     let mut quote_depth = 0usize;
 
     let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(markdown, options);
@@ -210,6 +262,25 @@ fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
                     }
                     code_block = Some(text);
                 }
+                Tag::Table(_) => {
+                    flush_current(&mut current, &mut blocks);
+                    table = Some(TableState::new());
+                }
+                Tag::TableHead => {
+                    if let Some(table) = table.as_mut() {
+                        table.in_head = true;
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(table) = table.as_mut() {
+                        table.start_row();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(table) = table.as_mut() {
+                        table.start_cell();
+                    }
+                }
                 Tag::List(first) => {
                     list_stack.push(ListState { next_number: first });
                 }
@@ -246,6 +317,35 @@ fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
                         push_code_blocks(&mut blocks, text, list_stack.len(), quote_depth);
                     }
                 }
+                TagEnd::Table => {
+                    table = None;
+                    push_blank(&mut blocks);
+                }
+                TagEnd::TableHead => {
+                    if let Some(table) = table.as_mut() {
+                        table.in_head = false;
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(table) = table.as_mut() {
+                        if table.in_head {
+                            table.headers = table.current_row.clone();
+                        } else {
+                            push_table_row(
+                                &mut blocks,
+                                &table.headers,
+                                &table.current_row,
+                                list_stack.len(),
+                                quote_depth,
+                            );
+                        }
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(table) = table.as_mut() {
+                        table.finish_cell();
+                    }
+                }
                 TagEnd::List(_) => {
                     list_stack.pop();
                     push_blank(&mut blocks);
@@ -257,24 +357,32 @@ fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(code) = code_block.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_text(text.as_ref());
+                } else if let Some(code) = code_block.as_mut() {
                     code.push_str(text.as_ref());
                 } else if let Some(block) = current.as_mut() {
                     block.text.push_str(text.as_ref());
                 }
             }
             Event::Code(code) => {
-                if let Some(block) = current.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_text(code.as_ref());
+                } else if let Some(block) = current.as_mut() {
                     block.text.push_str(code.as_ref());
                 }
             }
             Event::SoftBreak => {
-                if let Some(block) = current.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_space();
+                } else if let Some(block) = current.as_mut() {
                     block.text.push(' ');
                 }
             }
             Event::HardBreak => {
-                if let Some(block) = current.as_mut() {
+                if let Some(table) = table.as_mut() {
+                    table.push_space();
+                } else if let Some(block) = current.as_mut() {
                     block.text.push('\n');
                 }
             }
@@ -325,6 +433,46 @@ fn push_code_blocks(
             prefix: String::new(),
         });
     }
+}
+
+fn push_table_row(
+    blocks: &mut Vec<RenderBlock>,
+    headers: &[String],
+    row: &[String],
+    indent_level: usize,
+    quote_depth: usize,
+) {
+    if row.iter().all(|cell| cell.trim().is_empty()) {
+        return;
+    }
+
+    let mut text = String::new();
+    for (index, value) in row.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        let header = table_header(headers, index);
+        text.push_str(&header);
+        text.push_str(": ");
+        text.push_str(value.trim());
+    }
+
+    blocks.push(RenderBlock {
+        text,
+        style: BlockStyle::TableRow,
+        indent_level,
+        quote_depth,
+        prefix: String::new(),
+    });
+}
+
+fn table_header(headers: &[String], index: usize) -> String {
+    headers
+        .get(index)
+        .map(|header| header.trim())
+        .filter(|header| !header.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Column {}", index + 1))
 }
 
 fn flush_current(current: &mut Option<CurrentBlock>, blocks: &mut Vec<RenderBlock>) {
@@ -593,6 +741,7 @@ fn line_step_for_style(style: BlockStyle, font: &Font) -> usize {
         BlockStyle::Heading(_) => font.glyph_height as usize + 8,
         BlockStyle::Code => font.glyph_height as usize + 3,
         BlockStyle::Rule => 10,
+        BlockStyle::TableRow => font.glyph_height as usize + 4,
         _ => font.glyph_height as usize + 5,
     }
 }
@@ -603,6 +752,7 @@ fn top_gap_for_style(style: BlockStyle) -> usize {
         BlockStyle::Heading(_) => 6,
         BlockStyle::Code => 4,
         BlockStyle::Rule => 6,
+        BlockStyle::TableRow => 4,
         _ => 0,
     }
 }
@@ -612,6 +762,7 @@ fn bottom_gap_for_style(style: BlockStyle) -> usize {
         BlockStyle::Heading(_) => 6,
         BlockStyle::Code => 4,
         BlockStyle::Rule => 6,
+        BlockStyle::TableRow => 6,
         _ => 2,
     }
 }
