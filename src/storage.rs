@@ -14,7 +14,7 @@ use log::{info, warn};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const SD_MOUNT_POINT: &str = "/sdcard";
 const VAULT_DIR: &str = "vault";
@@ -188,6 +188,39 @@ impl Storage {
         fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
+    /// Read a binary vault asset referenced from a markdown file.
+    ///
+    /// Relative asset paths are resolved from the markdown file's folder.
+    /// Leading slash paths are treated as vault-root relative paths.
+    pub fn read_asset_relative_to(
+        &self,
+        markdown_rel_path: &str,
+        asset_path: &str,
+    ) -> Result<Vec<u8>> {
+        let candidates = Self::asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
+        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+
+        for rel in &candidates {
+            let full = vault_root.join(rel);
+            if let Ok(bytes) = fs::read(&full) {
+                return Ok(bytes);
+            }
+        }
+
+        let asset_path = Self::clean_asset_path(asset_path);
+        if let Some(file_name) = Path::new(&asset_path).file_name() {
+            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
+                return fs::read(&full).map_err(|e| anyhow!("read {:?}: {}", full, e));
+            }
+        }
+
+        Err(anyhow!(
+            "image not found: {} (tried {:?})",
+            asset_path,
+            candidates
+        ))
+    }
+
     pub fn markdown_file_len(&self, rel_path: &str) -> Result<usize> {
         let full = self.markdown_full_path(rel_path)?;
         let len = fs::metadata(&full)
@@ -285,6 +318,93 @@ impl Storage {
         Ok(Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel))
     }
 
+    fn asset_candidate_relative_paths(
+        markdown_rel_path: &str,
+        asset_path: &str,
+    ) -> Result<Vec<PathBuf>> {
+        if asset_path.contains("://") {
+            return Err(anyhow!("remote image is not supported: {}", asset_path));
+        }
+
+        let asset_path = Self::clean_asset_path(asset_path);
+        let mut candidates = Vec::new();
+
+        if asset_path.starts_with('/') {
+            candidates.push(Self::normalize_asset_path(
+                &PathBuf::new(),
+                asset_path.trim_start_matches('/'),
+            )?);
+        } else {
+            let markdown = Self::validated_relative_path(markdown_rel_path)?;
+            let note_dir = markdown
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            candidates.push(Self::normalize_asset_path(&note_dir, &asset_path)?);
+
+            if let Ok(root_relative) = Self::normalize_asset_path(&PathBuf::new(), &asset_path) {
+                if !candidates
+                    .iter()
+                    .any(|candidate| candidate == &root_relative)
+                {
+                    candidates.push(root_relative);
+                }
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    fn clean_asset_path(asset_path: &str) -> String {
+        let asset_path = asset_path.split(['?', '#']).next().unwrap_or(asset_path);
+        percent_decode_path(asset_path)
+    }
+
+    fn normalize_asset_path(base: &Path, asset_path: &str) -> Result<PathBuf> {
+        let asset = Path::new(asset_path);
+        let mut normalized = PathBuf::new();
+        for component in base.join(asset_path).components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return Err(anyhow!("path escapes vault: {:?}", asset));
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!("path escapes vault: {:?}", asset));
+                }
+            }
+        }
+
+        Ok(normalized)
+    }
+
+    fn find_vault_file_by_name(
+        &self,
+        dir: &Path,
+        file_name: &std::ffi::OsStr,
+    ) -> Result<Option<PathBuf>> {
+        if !dir.exists() {
+            return Ok(None);
+        }
+
+        for entry in fs::read_dir(dir).map_err(|e| anyhow!("read_dir {:?}: {}", dir, e))? {
+            let entry = entry.map_err(|e| anyhow!("dir entry: {}", e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = self.find_vault_file_by_name(&path, file_name)? {
+                    return Ok(Some(found));
+                }
+            } else if file_name_matches(path.file_name(), file_name) {
+                return Ok(Some(path));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn validated_relative_path(path: &str) -> Result<&Path> {
         let path = Path::new(path);
         if path.is_absolute() {
@@ -316,6 +436,49 @@ impl Storage {
         }
 
         Ok(path)
+    }
+}
+
+fn percent_decode_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_owned())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn file_name_matches(actual: Option<&std::ffi::OsStr>, expected: &std::ffi::OsStr) -> bool {
+    if actual == Some(expected) {
+        return true;
+    }
+
+    match (actual.and_then(|name| name.to_str()), expected.to_str()) {
+        (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+        _ => false,
     }
 }
 

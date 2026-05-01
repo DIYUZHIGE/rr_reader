@@ -529,7 +529,17 @@ impl ReaderApp {
                 self.display
                     .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
                 if let Some(page) = cache.pages.get(page_index) {
-                    draw_reader_page(&mut self.display, &self.reader_font, &self.ui_font, page);
+                    draw_reader_page(
+                        &mut self.display,
+                        &self.reader_font,
+                        &self.ui_font,
+                        page,
+                        |image_path| {
+                            self.hardware
+                                .storage
+                                .read_asset_relative_to(&rel_path, image_path)
+                        },
+                    );
                 }
                 let footer = format!("{}/{}", page_index + 1, page_count);
                 let footer_x =

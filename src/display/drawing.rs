@@ -157,6 +157,25 @@ impl Display {
         &mut self.framebuffer
     }
 
+    pub fn draw_mono_bitmap(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) {
+        for py in 0..height {
+            for px in 0..width {
+                let index = py * width + px;
+                if let Some(&gray) = pixels.get(index) {
+                    self.set_pixel(x + px, y + py, gray >= 128);
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     fn draw_text_run(
         &mut self,
         font: &Font,
