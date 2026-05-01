@@ -28,6 +28,25 @@ pub struct Font {
     pub glyph_bytes: u16,
 }
 
+#[derive(Clone, Copy)]
+pub struct FontSet<'a> {
+    pub ui: &'a Font,
+    pub reader: &'a Font,
+    pub math: &'a Font,
+    pub script: &'a Font,
+}
+
+impl<'a> FontSet<'a> {
+    pub fn new(ui: &'a Font, reader: &'a Font, math: &'a Font, script: &'a Font) -> Self {
+        Self {
+            ui,
+            reader,
+            math,
+            script,
+        }
+    }
+}
+
 pub struct GlyphInfo {
     data_offset: usize,
     compressed_size: usize,

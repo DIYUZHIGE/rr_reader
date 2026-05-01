@@ -2,19 +2,23 @@
 """Generate a compressed bitmap font binary for the rr_reader e-ink firmware.
 
 Usage:
-    python3 generate_font.py <ttf_path> <output_bin> [--size PX] [--chars-file CHARS.txt]
+    python3 generate_font.py <ttf_path> <output_bin> [--size PX] [--profile full|math] [--chars-file CHARS.txt]
 
 Output: a binary blob consumed by src/font.rs via include_bytes!().
 
 Character selection:
-    By default, generates glyphs for key Unicode blocks needed for Chinese text:
+    The default "full" profile generates glyphs for key Unicode blocks needed for Chinese text:
     - Basic Latin (U+0020..U+007E)
     - Latin-1 Supplement, selected (U+00A0..U+00FF)
+    - Greek and Coptic (U+0370..U+03FF)
+    - Superscripts and Subscripts (U+2070..U+209F)
+    - Letterlike Symbols (U+2100..U+214F)
     - CJK Symbols and Punctuation (U+3000..U+303F)
     - Hiragana (U+3040..U+309F)
     - Katakana (U+30A0..U+30FF)
     - CJK Unified Ideographs, subset (U+4E00..U+5FFF, first 8192)
     - Halfwidth/Fullwidth Forms (U+FF00..U+FFEF)
+    The "math" profile generates a much smaller Latin/Greek/symbol set for formulas and scripts.
     Use --chars-file to add extra characters from a UTF-8 text file.
 """
 
@@ -36,9 +40,9 @@ INDEX_ENTRY_SIZE = 16  # codepoint:u32 + offset:u32 + compressed_size:u16 + unco
 
 # ── Unicode block ranges ─────────────────────────────────────────────
 
-def unicode_block_ranges():
+def unicode_block_ranges(profile: str):
     """Return list of (start, end) inclusive codepoint ranges to include."""
-    return [
+    shared = [
         # Basic Latin (printable)
         (0x0020, 0x007E),
         # Latin-1 Supplement (selected — cover accents, punctuation)
@@ -46,6 +50,19 @@ def unicode_block_ranges():
         # General Punctuation (selected)
         (0x2010, 0x2027),
         (0x2030, 0x205E),
+        # Superscripts/Subscripts and symbols common in math notes
+        (0x0370, 0x03FF),
+        (0x2070, 0x209F),
+        (0x2100, 0x214F),
+        # Arrows
+        (0x2190, 0x21FF),
+        # Mathematical Operators
+        (0x2200, 0x22FF),
+    ]
+    if profile == "math":
+        return shared
+
+    return shared + [
         # CJK Symbols and Punctuation
         (0x3000, 0x303F),
         # Hiragana
@@ -54,10 +71,6 @@ def unicode_block_ranges():
         (0x30A0, 0x30FF),
         # Bopomofo
         (0x3100, 0x312F),
-        # Arrows
-        (0x2190, 0x21FF),
-        # Mathematical Operators
-        (0x2200, 0x22FF),
         # Box Drawing (UI borders)
         (0x2500, 0x257F),
         # CJK Unified Ideographs — full block (most common-use characters)
@@ -67,10 +80,10 @@ def unicode_block_ranges():
     ]
 
 
-def chars_from_ranges():
+def chars_from_ranges(profile: str):
     """Generate sorted unique characters from the configured Unicode ranges."""
     seen = set()
-    for lo, hi in unicode_block_ranges():
+    for lo, hi in unicode_block_ranges(profile):
         for cp in range(lo, hi + 1):
             # Skip surrogates and invalid codepoints
             if 0xD800 <= cp <= 0xDFFF:
@@ -155,7 +168,7 @@ def generate(args):
                     chars.append(ch)
         chars.sort(key=lambda c: ord(c))
     else:
-        chars = chars_from_ranges()
+        chars = chars_from_ranges(args.profile)
 
     glyph_count = len(chars)
     glyph_width = args.size
@@ -228,6 +241,12 @@ def main():
     parser.add_argument("ttf_path", help="Path to TrueType/OpenType font file")
     parser.add_argument("output_bin", help="Output binary file path")
     parser.add_argument("--size", type=int, default=16, help="Glyph size in pixels (default: 16)")
+    parser.add_argument(
+        "--profile",
+        choices=("full", "math"),
+        default="full",
+        help="Character profile to generate (default: full)",
+    )
     parser.add_argument("--chars-file", help="Optional UTF-8 file with additional characters")
     args = parser.parse_args()
 
