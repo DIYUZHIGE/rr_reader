@@ -6,9 +6,7 @@ use crate::font::Font;
 use crate::hardware::Hardware;
 use crate::input::Button;
 use crate::power::{PowerManager, POWER_BUTTON_SLEEP_MS};
-use crate::reader::{
-    ReaderCache, ReaderPaginator, ReaderState, READER_RIGHT_MARGIN, READER_TEXT_Y, READER_X,
-};
+use crate::reader::{draw_reader_page, markdown_pages, ReaderCache, ReaderState, READER_X};
 use crate::time::now_ms;
 use anyhow::Result;
 use log::{info, warn};
@@ -510,7 +508,7 @@ impl ReaderApp {
                     Some(cache) if cache.file_index == file_index => cache,
                     _ => return,
                 };
-                let page_count = cache.page_starts.len().max(1);
+                let page_count = cache.pages.len().max(1);
                 let page_index = reader
                     .map(|reader| reader.page_index.min(page_count - 1))
                     .unwrap_or(0);
@@ -523,32 +521,6 @@ impl ReaderApp {
                     }
                 }
 
-                let page_start = cache.page_starts.get(page_index).copied().unwrap_or(0);
-                let page_end = cache
-                    .page_starts
-                    .get(page_index + 1)
-                    .copied()
-                    .unwrap_or(cache.file_len);
-                let page_text = match self
-                    .hardware
-                    .storage
-                    .read_markdown_range(&rel_path, page_start, page_end)
-                {
-                    Ok(page_text) => page_text,
-                    Err(e) => {
-                        self.display.draw_text_wrapped(
-                            &self.ui_font,
-                            &format!("Error reading {}:\n{}", rel_path, e),
-                            24,
-                            20,
-                            Display::width() - 24,
-                            4,
-                        );
-                        warn!("Failed to read {} page {}: {}", rel_path, page_index + 1, e);
-                        return;
-                    }
-                };
-
                 let (_, name) = file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
                 let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
@@ -556,14 +528,9 @@ impl ReaderApp {
                     .draw_text_font(&self.ui_font, &title, READER_X, 10);
                 self.display
                     .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
-                self.display.draw_text_wrapped(
-                    &self.reader_font,
-                    &page_text,
-                    READER_X,
-                    READER_TEXT_Y,
-                    Display::width() - READER_RIGHT_MARGIN,
-                    5,
-                );
+                if let Some(page) = cache.pages.get(page_index) {
+                    draw_reader_page(&mut self.display, &self.reader_font, &self.ui_font, page);
+                }
                 let footer = format!("{}/{}", page_index + 1, page_count);
                 let footer_x =
                     Display::width().saturating_sub(READER_X + self.ui_font.text_width(&footer));
@@ -608,32 +575,17 @@ impl ReaderApp {
         }
 
         let rel_path = &self.md_files[file_index];
-        let file_len = self.hardware.storage.markdown_file_len(rel_path)?;
-        let page_starts = self.paginate_reader_file(rel_path, file_len)?;
-        self.reader_cache = Some(ReaderCache {
-            file_index,
-            file_len,
-            page_starts,
-        });
+        let markdown = self.hardware.storage.read_markdown_file(rel_path)?;
+        let pages = markdown_pages(&markdown, &self.reader_font, &self.ui_font);
+        self.reader_cache = Some(ReaderCache { file_index, pages });
         Ok(())
     }
 
     fn reader_page_count(&self) -> usize {
         self.reader_cache
             .as_ref()
-            .map(|cache| cache.page_starts.len())
+            .map(|cache| cache.pages.len())
             .unwrap_or(0)
-    }
-
-    fn paginate_reader_file(&self, rel_path: &str, file_len: usize) -> Result<Vec<usize>> {
-        let mut paginator = ReaderPaginator::new(&self.reader_font);
-        self.hardware
-            .storage
-            .scan_markdown_chars(rel_path, |byte_index, ch| {
-                paginator.push_char(byte_index, ch);
-                Ok(())
-            })?;
-        Ok(paginator.finish(file_len))
     }
 
     fn browser_row_count(&self) -> usize {
