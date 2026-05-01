@@ -193,6 +193,11 @@ impl Display {
         self.framebuffer.fill(color);
     }
 
+    pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u8) {
+        self.fill_rect_pixels(x, y, w, h, color != 0x00);
+        self.dirty = true;
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -206,8 +211,8 @@ impl Display {
         self.dirty = true;
     }
 
-    /// Render UTF-8 text with the given font at (x, y). Characters not in the
-    /// font are silently skipped. Use this for CJK-capable text rendering.
+    /// Render UTF-8 text with the given font at (x, y). Missing glyphs are
+    /// shown as an outline box so unsupported characters are visible.
     pub fn draw_text_font(&mut self, font: &Font, text: &str, x: usize, y: usize) {
         let mut decompress_buf = vec![0u8; font.glyph_bytes as usize];
         let mut cursor_x = x;
@@ -221,12 +226,19 @@ impl Display {
                 cursor_y += font.glyph_height as usize + 2;
                 continue;
             }
+            if cp == b'\r' as u32 {
+                continue;
+            }
+            if cp == b'\t' as u32 {
+                cursor_x += font.glyph_width as usize * 2;
+                continue;
+            }
             if cp == b' ' as u32 {
                 cursor_x += font.glyph_width as usize;
                 continue;
             }
 
-            if let Some(info) = font.find_glyph(cp) {
+            let rendered = if let Some(info) = font.find_glyph(cp) {
                 if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
                     font.draw_glyph(
                         &decompress_buf,
@@ -236,7 +248,16 @@ impl Display {
                         DISPLAY_HEIGHT,
                         &mut self.framebuffer,
                     );
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            if !rendered {
+                self.draw_missing_glyph(font, cursor_x, cursor_y);
             }
             cursor_x += font.glyph_width as usize;
         }
@@ -266,6 +287,13 @@ impl Display {
                 y += font.glyph_height as usize + line_spacing;
                 continue;
             }
+            if cp == b'\r' as u32 {
+                continue;
+            }
+            if cp == b'\t' as u32 {
+                cursor_x += font.glyph_width as usize * 2;
+                continue;
+            }
 
             if cursor_x + font.glyph_width as usize > max_x {
                 cursor_x = start_x;
@@ -281,7 +309,7 @@ impl Display {
                 continue;
             }
 
-            if let Some(info) = font.find_glyph(cp) {
+            let rendered = if let Some(info) = font.find_glyph(cp) {
                 if font.decompress_glyph(&info, &mut decompress_buf).is_ok() {
                     font.draw_glyph(
                         &decompress_buf,
@@ -291,7 +319,16 @@ impl Display {
                         DISPLAY_HEIGHT,
                         &mut self.framebuffer,
                     );
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            if !rendered {
+                self.draw_missing_glyph(font, cursor_x, y);
             }
             cursor_x += font.glyph_width as usize;
         }
@@ -638,17 +675,34 @@ impl Display {
         for (col, bits) in glyph.iter().enumerate() {
             for row in 0..7 {
                 if (bits >> row) & 1 == 1 {
-                    self.fill_rect(x + col * scale, y + row * scale, scale, scale, false);
+                    self.fill_rect_pixels(x + col * scale, y + row * scale, scale, scale, false);
                 }
             }
         }
     }
 
-    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, white: bool) {
+    fn fill_rect_pixels(&mut self, x: usize, y: usize, w: usize, h: usize, white: bool) {
         for py in y..(y + h).min(DISPLAY_HEIGHT) {
             for px in x..(x + w).min(DISPLAY_WIDTH) {
                 self.set_pixel(px, py, white);
             }
+        }
+    }
+
+    fn draw_missing_glyph(&mut self, font: &Font, x: usize, y: usize) {
+        let width = font.glyph_width as usize;
+        let height = font.glyph_height as usize;
+        if width < 4 || height < 4 {
+            return;
+        }
+
+        for dx in 2..width.saturating_sub(2) {
+            self.set_pixel(x + dx, y + 2, false);
+            self.set_pixel(x + dx, y + height - 3, false);
+        }
+        for dy in 2..height.saturating_sub(2) {
+            self.set_pixel(x + 2, y + dy, false);
+            self.set_pixel(x + width - 3, y + dy, false);
         }
     }
 

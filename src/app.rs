@@ -9,8 +9,8 @@ use log::{info, warn};
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 10;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
-const LIST_TOP_Y: usize = 54;
-const LIST_BOTTOM_MARGIN: usize = 22;
+const LIST_TOP_Y: usize = 78;
+const LIST_BOTTOM_MARGIN: usize = 34;
 const LIST_X: usize = 20;
 const LIST_RIGHT_MARGIN: usize = 20;
 const READER_TEXT_Y: usize = 38;
@@ -72,7 +72,7 @@ impl ReaderApp {
                 Vec::new()
             }
         };
-        md_files.sort();
+        Self::sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
         // Show boot screen with status
@@ -349,12 +349,16 @@ impl ReaderApp {
         self.display.clear(0xFF);
 
         self.display
-            .draw_text_font(&self.font, "rr_reader / vault", 20, 12);
+            .draw_text_font(&self.font, "rr_reader 文件浏览", 20, 12);
+        self.display
+            .draw_text_font(&self.font, "/sdcard/vault", 20, 34);
+        self.display
+            .fill_rect(20, 60, Display::width() - 40, 1, 0x00);
 
         if self.md_files.is_empty() {
             self.display.draw_text_wrapped(
                 &self.font,
-                "No markdown files found.\n\nPlace .md files under /sdcard/vault/",
+                "没有找到 Markdown 文件。\n\n请把 .md 或 .markdown 文件放到 /sdcard/vault/",
                 20,
                 LIST_TOP_Y,
                 Display::width() - 20,
@@ -372,46 +376,64 @@ impl ReaderApp {
             ),
         };
 
-        let row_height = self.font.glyph_height as usize + 4;
+        let row_height = self.browser_row_height();
         let row_count = self.browser_row_count();
         let end = (first_visible + row_count).min(self.md_files.len());
         let summary = format!(
-            "{} / {} files  {}-{}",
+            "第 {}/{} 个  本页 {}-{}",
             selected + 1,
             self.md_files.len(),
             first_visible + 1,
             end
         );
-        self.display.draw_text_font(&self.font, &summary, 20, 32);
+        self.display.draw_text_font(&self.font, &summary, 420, 34);
 
         for (row, idx) in (first_visible..end).enumerate() {
-            let marker = if idx == selected { ">" } else { " " };
+            let y = LIST_TOP_Y + row * row_height;
+            let selected_row = idx == selected;
+            if selected_row {
+                self.display.fill_rect(20, y - 4, 5, row_height - 4, 0x00);
+            }
+
+            let (folder, name) = Self::file_browser_parts(&self.md_files[idx]);
+            let marker = if selected_row { ">" } else { " " };
             let prefix = format!("{} {:03} ", marker, idx + 1);
             let prefix_width = prefix.chars().count() * self.font.glyph_width as usize;
-            let path = Self::truncate_for_width(
-                &self.md_files[idx],
+            let name = Self::truncate_for_width(
+                &name,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN - prefix_width,
                 self.font.glyph_width as usize,
             );
-            let line = format!("{}{}", prefix, path);
-            self.display
-                .draw_text_font(&self.font, &line, LIST_X, LIST_TOP_Y + row * row_height);
+            let line = format!("{}{}", prefix, name);
+            self.display.draw_text_font(&self.font, &line, LIST_X, y);
+
+            let folder_prefix_width = 6 * self.font.glyph_width as usize;
+            let folder = Self::truncate_start_for_width(
+                &folder,
+                Display::width() - LIST_X - LIST_RIGHT_MARGIN - folder_prefix_width,
+                self.font.glyph_width as usize,
+            );
+            let folder_line = format!("      {}", folder);
+            self.display.draw_text_font(
+                &self.font,
+                &folder_line,
+                LIST_X,
+                y + self.font.glyph_height as usize + 3,
+            );
         }
 
         let footer = match (first_visible > 0, end < self.md_files.len()) {
-            (true, true) => "^ more / v more",
-            (true, false) => "^ more",
-            (false, true) => "v more",
-            (false, false) => "",
+            (true, true) => "短按移动  长按翻页  确认打开  上下还有内容",
+            (true, false) => "短按移动  长按翻页  确认打开  已到末尾",
+            (false, true) => "短按移动  长按翻页  确认打开  下方还有内容",
+            (false, false) => "短按移动  确认打开",
         };
-        if !footer.is_empty() {
-            self.display.draw_text_font(
-                &self.font,
-                footer,
-                20,
-                Display::height() - self.font.glyph_height as usize - 4,
-            );
-        }
+        self.display.draw_text_font(
+            &self.font,
+            footer,
+            20,
+            Display::height() - self.font.glyph_height as usize - 8,
+        );
 
         info!(
             "Rendering file browser: selected {}/{}",
@@ -426,7 +448,7 @@ impl ReaderApp {
         if self.md_files.is_empty() {
             self.display.draw_text_wrapped(
                 &self.font,
-                "No markdown files found.\n\nPlace .md files under /sdcard/vault/",
+                "没有找到 Markdown 文件。\n\n请把 .md 或 .markdown 文件放到 /sdcard/vault/",
                 20,
                 20,
                 Display::width() - 20,
@@ -443,7 +465,13 @@ impl ReaderApp {
         let rel_path = &self.md_files[file_index];
         match self.hardware.storage.read_markdown_file(rel_path) {
             Ok(content) => {
-                let title = format!("[{}] {}", file_index + 1, rel_path);
+                let (_, name) = Self::file_browser_parts(rel_path);
+                let title = format!("[{}] {}", file_index + 1, name);
+                let title = Self::truncate_for_width(
+                    &title,
+                    Display::width() - 40,
+                    self.font.glyph_width as usize,
+                );
                 self.display.draw_text_font(&self.font, &title, 20, 10);
                 self.display.draw_text_wrapped(
                     &self.font,
@@ -475,13 +503,19 @@ impl ReaderApp {
     }
 
     fn browser_row_count(&self) -> usize {
-        let row_height = self.font.glyph_height as usize + 4;
+        let row_height = self.browser_row_height();
         (Display::height() - LIST_TOP_Y - LIST_BOTTOM_MARGIN) / row_height
+    }
+
+    fn browser_row_height(&self) -> usize {
+        self.font.glyph_height as usize * 2 + 8
     }
 
     fn browser_first_visible_for(&self, selected: usize) -> usize {
         let row_count = self.browser_row_count().max(1);
-        selected.saturating_sub(row_count / 2)
+        selected
+            .saturating_sub(row_count / 2)
+            .min(self.md_files.len().saturating_sub(row_count))
     }
 
     fn truncate_for_width(text: &str, max_px: usize, glyph_width: usize) -> String {
@@ -498,6 +532,59 @@ impl ReaderApp {
         let mut truncated = text.chars().take(max_chars - 3).collect::<String>();
         truncated.push_str("...");
         truncated
+    }
+
+    fn truncate_start_for_width(text: &str, max_px: usize, glyph_width: usize) -> String {
+        let max_chars = (max_px / glyph_width).max(1);
+        let char_count = text.chars().count();
+        if char_count <= max_chars {
+            return text.to_string();
+        }
+
+        if max_chars <= 3 {
+            return ".".repeat(max_chars);
+        }
+
+        let tail = text
+            .chars()
+            .skip(char_count - (max_chars - 3))
+            .collect::<String>();
+        format!("...{}", tail)
+    }
+
+    fn sort_markdown_files(files: &mut [String]) {
+        files.sort_by(|a, b| {
+            let (a_folder, a_name) = Self::file_browser_parts(a);
+            let (b_folder, b_name) = Self::file_browser_parts(b);
+            a_folder
+                .to_lowercase()
+                .cmp(&b_folder.to_lowercase())
+                .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
+                .then_with(|| a.cmp(b))
+        });
+    }
+
+    fn file_browser_parts(path: &str) -> (String, String) {
+        let (folder, file_name) = match path.rsplit_once('/') {
+            Some((folder, file_name)) if !folder.is_empty() => (folder, file_name),
+            _ => ("根目录", path),
+        };
+
+        (
+            folder.to_string(),
+            Self::strip_markdown_extension(file_name).to_string(),
+        )
+    }
+
+    fn strip_markdown_extension(file_name: &str) -> &str {
+        let lower = file_name.to_lowercase();
+        if lower.ends_with(".markdown") {
+            &file_name[..file_name.len() - ".markdown".len()]
+        } else if lower.ends_with(".md") {
+            &file_name[..file_name.len() - ".md".len()]
+        } else {
+            file_name
+        }
     }
 
     pub fn loop_delay_ms(&self) -> u32 {
