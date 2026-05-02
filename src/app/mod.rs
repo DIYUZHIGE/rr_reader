@@ -2,7 +2,7 @@ mod event;
 
 use self::event::{AppEvent, EventMode, EventPump};
 use crate::browser::{
-    file_browser_parts, sort_markdown_files, truncate_for_width, FileBrowserState,
+    file_browser_parts, sort_browser_entries, truncate_for_width, BrowserEntry, FileBrowserState,
 };
 use crate::display::{Display, RefreshMode};
 use crate::font::{Font, FontSet};
@@ -14,6 +14,7 @@ use crate::reader::{
 };
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::collections::BTreeMap;
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
@@ -30,15 +31,17 @@ static FONT_10_DATA: &[u8] = include_bytes!("../../generated/font_10.bin");
 
 #[derive(Clone, Copy, Debug)]
 enum Activity {
-    FileBrowser(FileBrowserState),
+    FileBrowser,
     Reader(ReaderState),
+    Settings,
 }
 
 impl Activity {
     fn event_mode(self) -> EventMode {
         match self {
-            Self::FileBrowser(_) => EventMode::FileBrowser,
+            Self::FileBrowser => EventMode::FileBrowser,
             Self::Reader(_) => EventMode::Reader,
+            Self::Settings => EventMode::Settings,
         }
     }
 }
@@ -53,6 +56,7 @@ pub struct ReaderApp {
     power: PowerManager,
     event_pump: EventPump,
     md_files: Vec<String>,
+    browser: FileBrowserState,
     activity: Activity,
     reader_cache: Option<ReaderCache>,
     wifi_suspended_for_reader: bool,
@@ -86,14 +90,13 @@ impl ReaderApp {
             script_font.glyph_width, script_font.glyph_height, script_font.glyph_count
         );
 
-        let mut md_files = match hardware.storage.list_markdown_files("") {
+        let md_files = match hardware.storage.list_markdown_files("") {
             Ok(files) => files,
             Err(e) => {
                 warn!("Failed to scan vault: {}", e);
                 Vec::new()
             }
         };
-        sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
         // Keep boot screen blank
@@ -112,13 +115,12 @@ impl ReaderApp {
             power: PowerManager::new(),
             event_pump: EventPump::new(),
             md_files,
-            activity: Activity::FileBrowser(FileBrowserState {
-                selected: 0,
-                first_visible: 0,
-            }),
+            browser: FileBrowserState::new_root(),
+            activity: Activity::FileBrowser,
             reader_cache: None,
             wifi_suspended_for_reader: false,
         };
+        app.reload_browser_entries(None);
         app.render_current_activity();
         app.flush_ui_refresh();
         Ok(app)
@@ -156,18 +158,24 @@ impl ReaderApp {
             }
             AppEvent::BrowserMove(delta) => self.move_browser_selection(delta),
             AppEvent::BrowserConfirm => self.open_selected_file(),
+            AppEvent::BrowserBack => self.handle_browser_back(),
             AppEvent::ReaderBack => {
                 if let Activity::Reader(reader) = self.activity {
                     self.on_exit_reader_mode();
-                    self.activity = Activity::FileBrowser(FileBrowserState {
-                        selected: reader.file_index,
-                        first_visible: self.browser_first_visible_for(reader.file_index),
-                    });
+                    self.activity = Activity::FileBrowser;
+                    let selected_path = self.md_files.get(reader.file_index).cloned();
+                    self.reload_browser_entries(selected_path.as_deref());
                     self.render_file_browser();
                 }
             }
             AppEvent::ReaderMove(delta) => self.move_reader_page(delta),
             AppEvent::ReaderRefresh => self.render_current_file(),
+            AppEvent::SettingsBack => {
+                if matches!(self.activity, Activity::Settings) {
+                    self.activity = Activity::FileBrowser;
+                    self.render_file_browser();
+                }
+            }
             AppEvent::IdleTimeout { idle_ticks } => {
                 info!("Auto-sleep after {} idle ticks", idle_ticks);
                 self.power.enter_deep_sleep(None);
@@ -179,43 +187,122 @@ impl ReaderApp {
 
     fn render_current_activity(&mut self) {
         match self.activity {
-            Activity::FileBrowser(_) => self.render_file_browser(),
+            Activity::FileBrowser => self.render_file_browser(),
             Activity::Reader(_) => self.render_current_file(),
+            Activity::Settings => self.render_settings_page(),
+        }
+    }
+
+    fn reload_browser_entries(&mut self, selected_rel_path: Option<&str>) {
+        let current_dir = self.browser.current_dir.clone();
+        let mut dirs: BTreeMap<String, String> = BTreeMap::new();
+        let mut files: Vec<BrowserEntry> = Vec::new();
+
+        for rel in &self.md_files {
+            if !current_dir.is_empty() {
+                let prefix = format!("{}/", current_dir);
+                if !rel.starts_with(&prefix) {
+                    continue;
+                }
+            }
+
+            let rel_from_dir = if current_dir.is_empty() {
+                rel.as_str()
+            } else {
+                &rel[current_dir.len() + 1..]
+            };
+
+            if let Some((child_dir, _)) = rel_from_dir.split_once('/') {
+                let child_rel_path = if current_dir.is_empty() {
+                    child_dir.to_string()
+                } else {
+                    format!("{}/{}", current_dir, child_dir)
+                };
+                dirs.entry(child_rel_path)
+                    .or_insert_with(|| child_dir.to_string());
+            } else {
+                let (_, name) = file_browser_parts(rel_from_dir);
+                files.push(BrowserEntry {
+                    rel_path: rel.clone(),
+                    name: name.to_string(),
+                    is_dir: false,
+                });
+            }
+        }
+
+        let mut entries: Vec<BrowserEntry> = dirs
+            .into_iter()
+            .map(|(rel_path, name)| BrowserEntry {
+                rel_path,
+                name,
+                is_dir: true,
+            })
+            .collect();
+        entries.extend(files);
+        sort_browser_entries(&mut entries);
+
+        self.browser.entries = entries;
+        self.browser.selected = 0;
+        self.browser.first_visible = 0;
+
+        if let Some(selected_rel_path) = selected_rel_path {
+            if let Some(idx) = self
+                .browser
+                .entries
+                .iter()
+                .position(|entry| entry.rel_path == selected_rel_path)
+            {
+                self.set_browser_selection(idx);
+            }
         }
     }
 
     fn move_browser_selection(&mut self, delta: isize) {
-        if self.md_files.is_empty() {
+        if !matches!(self.activity, Activity::FileBrowser) || self.browser.entries.is_empty() {
             return;
         }
 
-        let file_count = self.md_files.len();
-        let selected = match &self.activity {
-            Activity::FileBrowser(browser) => browser.selected,
-            _ => return,
-        };
-        let next = (selected as isize + delta).rem_euclid(file_count as isize) as usize;
+        let count = self.browser.entries.len();
+        let next = (self.browser.selected as isize + delta).rem_euclid(count as isize) as usize;
         self.set_browser_selection(next);
         self.render_file_browser();
     }
 
     fn set_browser_selection(&mut self, selected: usize) {
         let row_count = self.browser_row_count().max(1);
+        self.browser.selected = selected.min(self.browser.entries.len().saturating_sub(1));
 
-        if let Activity::FileBrowser(browser) = &mut self.activity {
-            browser.selected = selected;
-            if browser.selected < browser.first_visible {
-                browser.first_visible = browser.selected;
-            } else if browser.selected >= browser.first_visible + row_count {
-                browser.first_visible = browser.selected + 1 - row_count;
-            }
+        if self.browser.selected < self.browser.first_visible {
+            self.browser.first_visible = self.browser.selected;
+        } else if self.browser.selected >= self.browser.first_visible + row_count {
+            self.browser.first_visible = self.browser.selected + 1 - row_count;
         }
     }
 
     fn open_selected_file(&mut self) {
-        let file_index = match &self.activity {
-            Activity::FileBrowser(browser) if !self.md_files.is_empty() => browser.selected,
-            _ => return,
+        if !matches!(self.activity, Activity::FileBrowser) {
+            return;
+        }
+
+        let entry = match self.browser.entries.get(self.browser.selected).cloned() {
+            Some(entry) => entry,
+            None => return,
+        };
+
+        if entry.is_dir {
+            self.browser.current_dir = entry.rel_path;
+            self.reload_browser_entries(None);
+            self.render_file_browser();
+            return;
+        }
+
+        let file_index = match self
+            .md_files
+            .iter()
+            .position(|path| path == &entry.rel_path)
+        {
+            Some(index) => index,
+            None => return,
         };
 
         self.on_enter_reader_mode();
@@ -224,6 +311,23 @@ impl ReaderApp {
             page_index: 0,
         });
         self.render_current_file();
+    }
+
+    fn handle_browser_back(&mut self) {
+        if !matches!(self.activity, Activity::FileBrowser) {
+            return;
+        }
+
+        if self.browser.is_at_root() {
+            self.activity = Activity::Settings;
+            self.render_settings_page();
+            return;
+        }
+
+        let child_dir = self.browser.current_dir.clone();
+        self.browser.current_dir = self.browser.parent_dir();
+        self.reload_browser_entries(Some(&child_dir));
+        self.render_file_browser();
     }
 
     fn on_enter_reader_mode(&mut self) {
@@ -288,7 +392,7 @@ impl ReaderApp {
     fn render_file_browser(&mut self) {
         self.display.clear(0xFF);
 
-        if self.md_files.is_empty() {
+        if self.browser.entries.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
                 "没有笔记",
@@ -301,17 +405,12 @@ impl ReaderApp {
             return;
         }
 
-        let (selected, first_visible) = match &self.activity {
-            Activity::FileBrowser(browser) => (browser.selected, browser.first_visible),
-            Activity::Reader(reader) => (
-                reader.file_index,
-                self.browser_first_visible_for(reader.file_index),
-            ),
-        };
+        let selected = self.browser.selected;
+        let first_visible = self.browser.first_visible;
 
         let row_height = self.browser_row_height();
         let row_count = self.browser_row_count();
-        let end = (first_visible + row_count).min(self.md_files.len());
+        let end = (first_visible + row_count).min(self.browser.entries.len());
 
         for (row, idx) in (first_visible..end).enumerate() {
             let y = LIST_TOP_Y + row * row_height;
@@ -320,26 +419,58 @@ impl ReaderApp {
                 self.display.fill_rect(24, y - 3, 4, row_height - 8, 0x00);
             }
 
-            let (_, name) = file_browser_parts(&self.md_files[idx]);
+            let entry = &self.browser.entries[idx];
+            let display_name = if entry.is_dir {
+                format!("📁 {}", entry.name)
+            } else {
+                entry.name.clone()
+            };
+
             let name = truncate_for_width(
                 &self.ui_font,
-                name,
+                &display_name,
                 Display::width() - LIST_X - LIST_RIGHT_MARGIN,
             );
             self.display.draw_text_font(&self.ui_font, &name, LIST_X, y);
         }
 
-        let nav_hint = match (first_visible > 0, end < self.md_files.len()) {
+        let nav_hint = match (first_visible > 0, end < self.browser.entries.len()) {
             (true, true) => "↑↓",
             (true, false) => "↑",
             (false, true) => "↓",
             (false, false) => "",
         };
-        let footer = if nav_hint.is_empty() {
-            format!("{}/{}  OK", selected + 1, self.md_files.len())
+
+        let footer = if self.browser.is_at_root() {
+            if nav_hint.is_empty() {
+                format!(
+                    "{}/{}  OK 打开  Back 设置",
+                    selected + 1,
+                    self.browser.entries.len()
+                )
+            } else {
+                format!(
+                    "{}/{}  {}  OK 打开  Back 设置",
+                    selected + 1,
+                    self.browser.entries.len(),
+                    nav_hint
+                )
+            }
+        } else if nav_hint.is_empty() {
+            format!(
+                "{}/{}  OK 打开  Back 返回",
+                selected + 1,
+                self.browser.entries.len()
+            )
         } else {
-            format!("{}/{}  {}  OK", selected + 1, self.md_files.len(), nav_hint)
+            format!(
+                "{}/{}  {}  OK 打开  Back 返回",
+                selected + 1,
+                self.browser.entries.len(),
+                nav_hint
+            )
         };
+
         let footer_x = Display::width().saturating_sub(24 + self.ui_font.text_width(&footer));
         self.display.draw_text_font(
             &self.ui_font,
@@ -348,10 +479,35 @@ impl ReaderApp {
             Display::height() - self.ui_font.glyph_height as usize - 8,
         );
 
+        let path_title = if self.browser.is_at_root() {
+            "根目录".to_string()
+        } else {
+            format!("/{}/", self.browser.current_dir)
+        };
+        let path_title = truncate_for_width(&self.ui_font, &path_title, Display::width() - 48);
+        self.display
+            .draw_text_font(&self.ui_font, &path_title, LIST_X, 8);
+
         debug!(
-            "Rendering file browser: selected {}/{}",
+            "Rendering file browser: dir='{}' selected {}/{}",
+            self.browser.current_dir,
             selected + 1,
-            self.md_files.len()
+            self.browser.entries.len()
+        );
+    }
+
+    fn render_settings_page(&mut self) {
+        self.display.clear(0xFF);
+
+        self.display
+            .draw_text_font(&self.ui_font, "设置", LIST_X, LIST_TOP_Y);
+        self.display.draw_text_wrapped(
+            &self.ui_font,
+            "Back 返回文件列表",
+            LIST_X,
+            LIST_TOP_Y + self.ui_font.glyph_height as usize + 20,
+            Display::width() - LIST_RIGHT_MARGIN,
+            4,
         );
     }
 
@@ -373,12 +529,12 @@ impl ReaderApp {
 
         let reader = match &self.activity {
             Activity::Reader(reader) => Some(*reader),
-            Activity::FileBrowser(_) => None,
+            _ => None,
         };
 
         let file_index = match self.activity {
             Activity::Reader(reader) => reader.file_index.min(self.md_files.len() - 1),
-            Activity::FileBrowser(browser) => browser.selected.min(self.md_files.len() - 1),
+            _ => 0,
         };
         let rel_path = self.md_files[file_index].clone();
         match self.ensure_reader_cache(file_index) {
@@ -577,13 +733,6 @@ impl ReaderApp {
 
     fn browser_row_height(&self) -> usize {
         self.ui_font.glyph_height as usize + 12
-    }
-
-    fn browser_first_visible_for(&self, selected: usize) -> usize {
-        let row_count = self.browser_row_count().max(1);
-        selected
-            .saturating_sub(row_count / 2)
-            .min(self.md_files.len().saturating_sub(row_count))
     }
 
     pub fn loop_delay_ms(&self) -> u32 {

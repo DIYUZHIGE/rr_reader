@@ -1,10 +1,45 @@
 use crate::font::Font;
 use std::borrow::Cow;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+pub struct BrowserEntry {
+    pub rel_path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct FileBrowserState {
+    pub current_dir: String,
+    pub entries: Vec<BrowserEntry>,
     pub selected: usize,
     pub first_visible: usize,
+}
+
+impl FileBrowserState {
+    pub fn new_root() -> Self {
+        Self {
+            current_dir: String::new(),
+            entries: Vec::new(),
+            selected: 0,
+            first_visible: 0,
+        }
+    }
+
+    pub fn is_at_root(&self) -> bool {
+        self.current_dir.is_empty()
+    }
+
+    pub fn parent_dir(&self) -> String {
+        if self.current_dir.is_empty() {
+            return String::new();
+        }
+
+        match self.current_dir.rsplit_once('/') {
+            Some((parent, _)) => parent.to_string(),
+            None => String::new(),
+        }
+    }
 }
 
 pub fn truncate_for_width<'a>(font: &Font, text: &'a str, max_px: usize) -> Cow<'a, str> {
@@ -36,10 +71,13 @@ pub fn truncate_for_width<'a>(font: &Font, text: &'a str, max_px: usize) -> Cow<
     Cow::Owned(out)
 }
 
-pub fn sort_markdown_files(files: &mut [String]) {
-    files.sort_by_cached_key(|path| {
-        let (folder, name) = file_browser_parts(path);
-        (folder.to_lowercase(), name.to_lowercase(), path.to_string())
+pub fn sort_browser_entries(entries: &mut [BrowserEntry]) {
+    entries.sort_by_cached_key(|entry| {
+        (
+            !entry.is_dir,
+            entry.name.to_lowercase(),
+            entry.rel_path.to_lowercase(),
+        )
     });
 }
 

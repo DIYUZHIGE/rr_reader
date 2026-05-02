@@ -13,6 +13,7 @@ const READER_REPEAT_INTERVAL_MS: u64 = 450;
 pub(super) enum EventMode {
     FileBrowser,
     Reader,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,9 +21,11 @@ pub(super) enum AppEvent {
     PowerLongPress,
     BrowserMove(isize),
     BrowserConfirm,
+    BrowserBack,
     ReaderBack,
     ReaderMove(isize),
     ReaderRefresh,
+    SettingsBack,
     IdleTimeout { idle_ticks: u32 },
 }
 
@@ -77,6 +80,7 @@ impl EventPump {
         match mode {
             EventMode::FileBrowser => self.collect_browser_events(&mut hardware.input, &mut events),
             EventMode::Reader => self.collect_reader_events(&mut hardware.input, &mut events),
+            EventMode::Settings => self.collect_settings_events(&mut hardware.input, &mut events),
         }
 
         if events.is_empty() && power.should_sleep() {
@@ -112,6 +116,11 @@ impl EventPump {
 
     fn collect_browser_events(&mut self, input: &mut InputManager, events: &mut Vec<AppEvent>) {
         use Button::*;
+
+        if input.logical_was_released(Back) {
+            events.push(AppEvent::BrowserBack);
+            return;
+        }
 
         if let Some(delta) = self.browser_repeater.navigation_delta(
             input,
@@ -150,6 +159,14 @@ impl EventPump {
 
         if input.logical_was_pressed(Confirm) {
             events.push(AppEvent::ReaderRefresh);
+        }
+    }
+
+    fn collect_settings_events(&mut self, input: &mut InputManager, events: &mut Vec<AppEvent>) {
+        use Button::*;
+
+        if input.logical_was_released(Back) {
+            events.push(AppEvent::SettingsBack);
         }
     }
 }
