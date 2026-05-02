@@ -521,6 +521,15 @@ fn signing_material(
     let date_stamp = timestamp.date_stamp.clone();
     let request_date = timestamp.request_date.clone();
 
+    // OSS V4 always includes the bucket in the canonical URI path.
+    // Virtual-hosted style URLs have the bucket in the host, so we must
+    // manually prepend it to the canonical URI for signing.
+    let canonical_uri = if !config.force_path_style {
+        format!("/{}{}", config.bucket_name, url.canonical_uri)
+    } else {
+        url.canonical_uri.clone()
+    };
+
     let canonical_headers = format!(
         "host:{}\nx-oss-content-sha256:{}\nx-oss-date:{}\n",
         url.host, EMPTY_PAYLOAD_SHA256, request_date
@@ -530,7 +539,7 @@ fn signing_material(
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method,
-        url.canonical_uri,
+        canonical_uri,
         url.canonical_query,
         canonical_headers,
         signed_headers,
