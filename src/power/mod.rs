@@ -39,9 +39,7 @@ impl PowerManager {
         now_ms().saturating_sub(self.last_activity_ms) >= self.sleep_timeout_ms
     }
 
-    pub fn set_sleep_timeout_secs(&mut self, secs: u32) {
-        self.sleep_timeout_ms = secs as u64 * 1000;
-    }
+
 
     pub fn set_power_saving(&mut self, enable: bool) {
         if enable && !self.power_saving {

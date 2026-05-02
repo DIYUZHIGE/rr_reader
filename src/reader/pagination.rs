@@ -258,7 +258,6 @@ fn paginate_math_block(
             source: block.text.clone(),
             x,
             y,
-            width: layout.width,
             height,
             quote_depth: block.quote_depth,
         }));

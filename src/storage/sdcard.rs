@@ -71,9 +71,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn is_mounted(&self) -> bool {
-        self.mounted
-    }
+
 }
 
 impl Drop for Storage {

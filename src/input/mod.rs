@@ -36,7 +36,6 @@ pub enum Button {
     Right,
     Up,
     Down,
-    Power,
     PageBack,
     PageForward,
 }
@@ -47,12 +46,6 @@ pub enum FrontButtonRole {
     Confirm = 1,
     Left = 2,
     Right = 3,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SideButtonLayout {
-    PrevNext,
-    NextPrev,
 }
 
 // ── Input Manager ───────────────────────────────────────────────
@@ -69,7 +62,6 @@ pub struct InputManager {
     button_press_finish_ms: [u64; BUTTON_COUNT],
     long_press_consumed: u8,
     front_mapping: [u8; 4],
-    side_layout: SideButtonLayout,
     idle_sample_counter: u8,
 }
 
@@ -101,7 +93,6 @@ impl InputManager {
             button_press_finish_ms: [0; BUTTON_COUNT],
             long_press_consumed: 0,
             front_mapping: [BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT],
-            side_layout: SideButtonLayout::PrevNext,
             idle_sample_counter: 0,
         })
     }
@@ -272,23 +263,8 @@ impl InputManager {
         self.current_state != 0 || self.pressed_events != 0 || self.released_events != 0
     }
 
-    pub fn was_any_pressed(&self) -> bool {
-        self.pressed_events != 0
-    }
-
-    pub fn was_any_released(&self) -> bool {
-        self.released_events != 0
-    }
-
     pub fn any_pressed(&self) -> bool {
         self.current_state != 0
-    }
-
-    pub fn held_ms_any(&self) -> u32 {
-        (0..BUTTON_COUNT)
-            .map(|button| self.held_ms(button as u8))
-            .max()
-            .unwrap_or(0)
     }
 
     pub fn held_ms(&self, button_index: u8) -> u32 {
@@ -343,15 +319,9 @@ impl InputManager {
             Button::Right => self.front_mapping[FrontButtonRole::Right as usize],
             Button::Up => BTN_UP,
             Button::Down => BTN_DOWN,
-            Button::Power => BTN_POWER,
-            Button::PageBack => match self.side_layout {
-                SideButtonLayout::PrevNext => BTN_UP,
-                SideButtonLayout::NextPrev => BTN_DOWN,
-            },
-            Button::PageForward => match self.side_layout {
-                SideButtonLayout::PrevNext => BTN_DOWN,
-                SideButtonLayout::NextPrev => BTN_UP,
-            },
+
+            Button::PageBack => BTN_UP,
+            Button::PageForward => BTN_DOWN,
         }
     }
 
@@ -375,10 +345,6 @@ impl InputManager {
         buttons.iter().any(|&b| self.logical_was_pressed(b))
     }
 
-    pub fn any_logical_released(&self, buttons: &[Button]) -> bool {
-        buttons.iter().any(|&b| self.logical_was_released(b))
-    }
-
     pub fn any_logical_is_pressed(&self, buttons: &[Button]) -> bool {
         buttons.iter().any(|&b| self.logical_is_pressed(b))
     }
@@ -389,13 +355,5 @@ impl InputManager {
             .map(|&button| self.logical_held_ms(button))
             .max()
             .unwrap_or(0)
-    }
-
-    pub fn set_front_button(&mut self, role: FrontButtonRole, hw_index: u8) {
-        self.front_mapping[role as usize] = hw_index;
-    }
-
-    pub fn set_side_layout(&mut self, layout: SideButtonLayout) {
-        self.side_layout = layout;
     }
 }

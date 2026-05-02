@@ -1,6 +1,30 @@
 #pragma once
 
+#if __has_include("driver/sdspi_host.h")
 #include "driver/sdspi_host.h"
+#else
+typedef int spi_host_device_t;
+typedef struct {
+    int flags;
+    int slot;
+    int max_freq_khz;
+    float io_voltage;
+    void* command_timeout_ms;
+    int get_bus_width;
+    int set_card_clk;
+    int init;
+    int deinit;
+    int io_int_enable;
+    int io_int_wait;
+    int command;
+    int set_bus_width;
+    int get_bus_width2;
+    int set_bus_ddr_mode;
+    int set_cclk_always_on;
+    int do_transaction;
+    int __unused;
+} sdmmc_host_t;
+#endif
 #include <stddef.h>
 #include <stdint.h>
 

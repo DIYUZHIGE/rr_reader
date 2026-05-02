@@ -23,8 +23,6 @@ pub struct Font {
     pub glyph_count: u16,
     /// Bytes per glyph row (padded to byte boundary)
     pub row_bytes: u8,
-    /// Total uncompressed bytes per glyph
-    pub glyph_bytes: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +66,6 @@ impl Font {
         let glyph_height = data[5];
         let glyph_count = u16::from_le_bytes([data[6], data[7]]);
         let row_bytes = glyph_width.div_ceil(8);
-        let glyph_bytes = row_bytes as u16 * glyph_height as u16;
 
         let min_len = 8 + glyph_count as usize * INDEX_ENTRY_SIZE;
         if data.len() < min_len {
@@ -86,7 +83,6 @@ impl Font {
             glyph_height,
             glyph_count,
             row_bytes,
-            glyph_bytes,
         })
     }
 
@@ -196,38 +192,6 @@ impl Font {
     pub fn text_width(&self, text: &str) -> usize {
         text.chars().map(|ch| self.char_advance_width(ch)).sum()
     }
-
-    /// Render a decompressed glyph bitmap to the framebuffer at (x, y).
-    /// Pixels outside the display bounds are clipped.
-    pub fn draw_glyph(
-        &self,
-        bitmap: &[u8],
-        x: usize,
-        y: usize,
-        fb_width: usize,
-        fb_height: usize,
-        fb: &mut [u8],
-    ) {
-        let fb_row_bytes = fb_width.div_ceil(8);
-        for row in 0..self.glyph_height as usize {
-            let screen_y = y + row;
-            if screen_y >= fb_height {
-                break;
-            }
-            for col in 0..self.glyph_width as usize {
-                let screen_x = x + col;
-                if screen_x >= fb_width {
-                    break;
-                }
-                let byte_idx = row * self.row_bytes as usize + col / 8;
-                let bit = (bitmap[byte_idx] >> (7 - col % 8)) & 1;
-                if bit != 0 {
-                    let fb_idx = screen_y * fb_row_bytes + screen_x / 8;
-                    fb[fb_idx] &= !(0x80 >> (screen_x % 8));
-                }
-            }
-        }
-    }
 }
 
 fn is_halfwidth_codepoint(codepoint: u32) -> bool {
@@ -240,4 +204,3 @@ fn is_halfwidth_codepoint(codepoint: u32) -> bool {
             | 0xFFE8..=0xFFEE
     )
 }
-

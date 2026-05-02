@@ -176,7 +176,9 @@ impl<'a> MathParser<'a> {
 
         flush_math_text(&mut text, &mut nodes);
         if nodes.len() == 1 {
-            nodes.pop().unwrap()
+            nodes
+                .pop()
+                .expect("math parser invariant: len == 1 must have one node")
         } else {
             MathNode::Row(nodes)
         }

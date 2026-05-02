@@ -1,4 +1,3 @@
-use super::SD_MOUNT_POINT;
 use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
@@ -14,21 +13,6 @@ pub(super) fn validated_relative_path(path: &str) -> Result<&Path> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(anyhow!("path escapes vault: {:?}", path));
             }
-        }
-    }
-
-    Ok(path)
-}
-
-pub(super) fn validated_sdcard_absolute_path(path: &str) -> Result<&Path> {
-    let path = Path::new(path);
-    if !path.is_absolute() || !path.starts_with(SD_MOUNT_POINT) {
-        return Err(anyhow!("path is outside {}: {:?}", SD_MOUNT_POINT, path));
-    }
-
-    for component in path.components() {
-        if matches!(component, Component::ParentDir | Component::Prefix(_)) {
-            return Err(anyhow!("path escapes {}: {:?}", SD_MOUNT_POINT, path));
         }
     }
 

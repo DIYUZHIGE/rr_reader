@@ -96,17 +96,8 @@ impl ReaderApp {
         sort_markdown_files(&mut md_files);
         info!("Found {} markdown files in vault", md_files.len());
 
-        // Show boot screen (WiFi status will be added after connection)
-        draw_boot_screen(&mut display);
-        display.draw_text_font(&ui_font, &format!("文件: {}", md_files.len()), 220, 280);
-        display.draw_text_wrapped(
-            &ui_font,
-            "WiFi: 未连接（按需启用）",
-            140,
-            310,
-            Display::width() - 140,
-            4,
-        );
+        // Keep boot screen blank
+        draw_boot_screen(&mut display, &ui_font, md_files.len());
         display.flush_with_mode(RefreshMode::Full)?;
 
         info!("Boot phase 1 complete");
@@ -137,24 +128,9 @@ impl ReaderApp {
     /// overlap with display/font init frames, reducing peak stack usage.
     pub fn connect_wifi(&mut self) {
         let wifi_status = self.hardware.connect_wifi_from_storage();
-        info!("WiFi boot status: {:?}", wifi_status);
+        info!("{}", wifi_status.boot_line());
 
-        // Update boot screen status text area
-        self.display.fill_rect(
-            140,
-            310,
-            Display::width() - 140,
-            self.ui_font.glyph_height as usize * 4 + 4 * 4,
-            0xFF,
-        );
-        self.display.draw_text_wrapped(
-            &self.ui_font,
-            &wifi_status.boot_line(),
-            140,
-            310,
-            Display::width() - 140,
-            4,
-        );
+        // Boot screen stays blank; do not draw WiFi status here.
         let _ = self.flush_display_if_dirty();
     }
 
@@ -220,40 +196,6 @@ impl ReaderApp {
         };
         let next = (selected as isize + delta).rem_euclid(file_count as isize) as usize;
         self.set_browser_selection(next);
-        self.render_file_browser();
-    }
-
-    fn move_browser_page(&mut self, delta: isize) {
-        if self.md_files.is_empty() {
-            return;
-        }
-
-        let row_count = self.browser_row_count().max(1);
-        let file_count = self.md_files.len();
-        if file_count <= row_count {
-            self.move_browser_selection(delta.signum());
-            return;
-        }
-
-        let selected = match &self.activity {
-            Activity::FileBrowser(browser) => browser.selected,
-            _ => return,
-        };
-        let current_page = selected / row_count;
-        let last_page = (file_count - 1) / row_count;
-        let next = if delta.is_negative() {
-            if current_page > 0 {
-                (current_page - 1) * row_count
-            } else {
-                last_page * row_count
-            }
-        } else if current_page < last_page {
-            (current_page + 1) * row_count
-        } else {
-            0
-        };
-
-        self.set_browser_selection(next.min(file_count - 1));
         self.render_file_browser();
     }
 
@@ -653,8 +595,15 @@ impl ReaderApp {
     }
 }
 
-fn draw_boot_screen(display: &mut Display) {
+fn draw_boot_screen(display: &mut Display, ui_font: &Font, _md_count: usize) {
     info!("Drawing boot screen");
     display.clear(0xFF);
-    display.draw_text("rr_reader", 220, 210, 7);
+
+    let text = "你好，世界。";
+    let text_w = ui_font.text_width(text);
+    let text_h = ui_font.glyph_height as usize;
+    let x = (Display::width().saturating_sub(text_w)) / 2;
+    let y = (Display::height().saturating_sub(text_h)) / 2;
+
+    display.draw_text_font(ui_font, text, x, y);
 }

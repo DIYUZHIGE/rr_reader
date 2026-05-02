@@ -52,10 +52,6 @@ impl NetworkManager {
         }
     }
 
-    pub fn status(&self) -> &WifiStatus {
-        &self.status
-    }
-
     pub fn connect_from_storage(&mut self, storage: &Storage) -> WifiStatus {
         let credentials = match storage.read_wifi_credentials() {
             Ok(Some(credentials)) => credentials,
@@ -89,10 +85,6 @@ impl NetworkManager {
         }
 
         self.status.clone()
-    }
-
-    pub fn is_connected(&self) -> bool {
-        matches!(self.status, WifiStatus::Connected { .. })
     }
 
     pub fn suspend(&mut self) {

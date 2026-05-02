@@ -208,7 +208,6 @@ pub struct RenderMath {
     pub source: String,
     pub x: usize,
     pub y: usize,
-    pub width: usize,
     pub height: usize,
     pub quote_depth: usize,
 }
@@ -241,12 +240,6 @@ pub enum BlockStyle {
     TableRow,
     Image,
     Math,
-}
-
-pub fn markdown_pages(markdown: &str, fonts: &FontSet<'_>) -> Vec<ReaderPage> {
-    let markdown = preprocess_obsidian_embeds(markdown);
-    let blocks = parse_markdown_blocks(&markdown);
-    paginate_blocks(&blocks, fonts)
 }
 
 /// Parse markdown and return both blocks and all pages.

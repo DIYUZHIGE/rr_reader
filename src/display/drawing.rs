@@ -15,19 +15,6 @@ impl Display {
         self.dirty = true;
     }
 
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    pub fn draw_text(&mut self, text: &str, x: usize, y: usize, scale: usize) {
-        let mut cursor_x = x;
-        for ch in text.chars() {
-            self.draw_char(ch, cursor_x, y, scale);
-            cursor_x += 6 * scale;
-        }
-        self.dirty = true;
-    }
-
     /// Render UTF-8 text with the given font at (x, y). Missing glyphs are
     /// shown as an outline box so unsupported characters are visible.
     pub fn draw_text_font(&mut self, font: &Font, text: &str, x: usize, y: usize) {
@@ -150,14 +137,6 @@ impl Display {
         y + line_height
     }
 
-    pub fn framebuffer(&self) -> &[u8] {
-        &self.framebuffer
-    }
-
-    pub fn framebuffer_mut(&mut self) -> &mut [u8] {
-        &mut self.framebuffer
-    }
-
     pub fn draw_mono_bitmap(
         &mut self,
         x: usize,
@@ -177,40 +156,7 @@ impl Display {
         self.dirty = true;
     }
 
-    pub fn draw_mono_bitmap_scaled(
-        &mut self,
-        x: usize,
-        y: usize,
-        source_size: (usize, usize),
-        target_size: (usize, usize),
-        pixels: &[u8],
-    ) {
-        let (source_width, source_height) = source_size;
-        let (target_width, target_height) = target_size;
-        if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
-            return;
-        }
-
-        for py in 0..target_height {
-            let source_y = py * source_height / target_height;
-            for px in 0..target_width {
-                let source_x = px * source_width / target_width;
-                let index = source_y * source_width + source_x;
-                if let Some(&gray) = pixels.get(index) {
-                    self.set_pixel(x + px, y + py, gray >= 128);
-                }
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn draw_text_run(
-        &mut self,
-        font: &Font,
-        text: &str,
-        mut x: usize,
-        y: usize,
-    ) {
+    fn draw_text_run(&mut self, font: &Font, text: &str, mut x: usize, y: usize) {
         for ch in text.chars() {
             if ch == ' ' || ch == '\t' {
                 x += font.char_advance_width(ch);
@@ -222,13 +168,7 @@ impl Display {
         }
     }
 
-    fn draw_font_char(
-        &mut self,
-        font: &Font,
-        ch: char,
-        x: usize,
-        y: usize,
-    ) {
+    fn draw_font_char(&mut self, font: &Font, ch: char, x: usize, y: usize) {
         let cp = ch as u32;
         let rendered = {
             let glyph_cache = &mut self.glyph_cache;
@@ -248,17 +188,6 @@ impl Display {
 
         if !rendered {
             self.draw_missing_glyph(font, x, y);
-        }
-    }
-
-    fn draw_char(&mut self, ch: char, x: usize, y: usize, scale: usize) {
-        let glyph = glyph_5x7(ch);
-        for (col, bits) in glyph.iter().enumerate() {
-            for row in 0..7 {
-                if (bits >> row) & 1 == 1 {
-                    self.fill_rect_pixels(x + col * scale, y + row * scale, scale, scale, false);
-                }
-            }
         }
     }
 
@@ -342,21 +271,5 @@ fn set_framebuffer_pixel(fb: &mut [u8], x: usize, y: usize, white: bool) {
         fb[index] |= mask;
     } else {
         fb[index] &= !mask;
-    }
-}
-
-fn glyph_5x7(ch: char) -> [u8; 5] {
-    match ch {
-        'r' => [0x7C, 0x08, 0x04, 0x04, 0x08],
-        '_' => [0x00, 0x00, 0x00, 0x00, 0x00],
-        'a' => [0x38, 0x44, 0x7C, 0x44, 0x44],
-        'd' => [0x38, 0x44, 0x44, 0x48, 0x7F],
-        'e' => [0x38, 0x54, 0x54, 0x54, 0x18],
-        'H' => [0x7F, 0x08, 0x08, 0x08, 0x7F],
-        'l' => [0x00, 0x41, 0x7F, 0x40, 0x00],
-        'o' => [0x38, 0x44, 0x44, 0x44, 0x38],
-        'w' => [0x7C, 0x20, 0x18, 0x20, 0x7C],
-        ' ' => [0x00, 0x00, 0x00, 0x00, 0x00],
-        _ => [0x7F, 0x41, 0x5D, 0x41, 0x7F],
     }
 }

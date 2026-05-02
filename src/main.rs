@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod app;
 mod browser;
 mod display;
@@ -56,8 +54,8 @@ fn main() -> Result<()> {
     // Boot the app (mounts SD, initializes display, loads fonts, shows boot screen)
     let mut app = ReaderApp::boot(hardware, display)?;
 
-    // WiFi is now on-demand: keep it disconnected at boot for lower power and RAM usage.
-    // app.connect_wifi();
+    // Keep basic networking functional by connecting at boot.
+    app.connect_wifi();
 
     info!("Entering main loop");
     loop {

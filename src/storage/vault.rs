@@ -1,15 +1,11 @@
 use super::path::{
     asset_candidate_relative_paths, clean_asset_path, file_name_matches, validated_relative_path,
-    validated_sdcard_absolute_path,
 };
 use super::{Storage, SD_MOUNT_POINT, VAULT_DIR};
 use anyhow::{anyhow, Result};
 use log::info;
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::fs;
 use std::path::{Path, PathBuf};
-
-const READ_CHUNK_SIZE: usize = 1024;
 
 impl Storage {
     /// Ensure the vault directory structure exists.
@@ -47,29 +43,6 @@ impl Storage {
         fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
-    /// Read a binary vault asset referenced from a markdown file.
-    ///
-    /// Relative asset paths are resolved from the markdown file's folder.
-    /// Leading slash paths are treated as vault-root relative paths.
-    pub fn read_asset_relative_to(
-        &self,
-        markdown_rel_path: &str,
-        asset_path: &str,
-    ) -> Result<Vec<u8>> {
-        let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
-        fs::read(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
-    }
-
-    pub fn open_asset_relative_to(
-        &self,
-        markdown_rel_path: &str,
-        asset_path: &str,
-    ) -> Result<BufReader<File>> {
-        let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
-        let file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
-        Ok(BufReader::with_capacity(2048, file))
-    }
-
     pub fn resolve_asset_path_relative_to(
         &self,
         markdown_rel_path: &str,
@@ -77,98 +50,6 @@ impl Storage {
     ) -> Result<String> {
         let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
         Ok(full.to_string_lossy().to_string())
-    }
-
-    pub fn markdown_file_len(&self, rel_path: &str) -> Result<usize> {
-        let full = self.markdown_full_path(rel_path)?;
-        let len = fs::metadata(&full)
-            .map_err(|e| anyhow!("metadata {:?}: {}", full, e))?
-            .len();
-        usize::try_from(len).map_err(|_| anyhow!("file too large for platform: {:?}", full))
-    }
-
-    pub fn read_markdown_range(&self, rel_path: &str, start: usize, end: usize) -> Result<String> {
-        if start > end {
-            return Err(anyhow!("invalid read range: {}..{}", start, end));
-        }
-
-        let full = self.markdown_full_path(rel_path)?;
-        let mut file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| anyhow!("metadata {:?}: {}", full, e))?
-            .len() as usize;
-        if end > len {
-            return Err(anyhow!(
-                "read range exceeds file length: {}..{} > {}",
-                start,
-                end,
-                len
-            ));
-        }
-
-        let mut buf = vec![0u8; end - start];
-        file.seek(SeekFrom::Start(start as u64))
-            .map_err(|e| anyhow!("seek {:?}: {}", full, e))?;
-        file.read_exact(&mut buf)
-            .map_err(|e| anyhow!("read {:?}: {}", full, e))?;
-        String::from_utf8(buf).map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))
-    }
-
-    pub fn scan_markdown_chars<F>(&self, rel_path: &str, mut visit: F) -> Result<()>
-    where
-        F: FnMut(usize, char) -> Result<()>,
-    {
-        let full = self.markdown_full_path(rel_path)?;
-        let mut file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
-        let mut chunk = [0u8; READ_CHUNK_SIZE];
-        let mut pending = Vec::with_capacity(READ_CHUNK_SIZE + 4);
-        let mut pending_offset = 0usize;
-
-        loop {
-            let read = file
-                .read(&mut chunk)
-                .map_err(|e| anyhow!("read {:?}: {}", full, e))?;
-            if read == 0 {
-                break;
-            }
-
-            pending.extend_from_slice(&chunk[..read]);
-            let valid_len = match std::str::from_utf8(&pending) {
-                Ok(valid) => valid.len(),
-                Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(e) => return Err(anyhow!("read {:?}: invalid UTF-8: {}", full, e)),
-            };
-
-            let valid = std::str::from_utf8(&pending[..valid_len])
-                .map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))?;
-            for (offset, ch) in valid.char_indices() {
-                visit(pending_offset + offset, ch)?;
-            }
-
-            pending.drain(..valid_len);
-            pending_offset += valid_len;
-        }
-
-        if !pending.is_empty() {
-            let valid = std::str::from_utf8(&pending)
-                .map_err(|e| anyhow!("read {:?}: invalid UTF-8: {}", full, e))?;
-            for (offset, ch) in valid.char_indices() {
-                visit(pending_offset + offset, ch)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Read any file by absolute path under /sdcard.
-    pub fn read_file(&self, path: &str) -> Result<String> {
-        let path = validated_sdcard_absolute_path(path)?;
-        fs::read_to_string(path).map_err(|e| anyhow!("read {:?}: {}", path, e))
-    }
-
-    pub fn vault_path(&self) -> String {
-        format!("{}/{}", SD_MOUNT_POINT, VAULT_DIR)
     }
 
     fn collect_markdown_files(
@@ -204,11 +85,6 @@ impl Storage {
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
             .unwrap_or(false)
-    }
-
-    fn markdown_full_path(&self, rel_path: &str) -> Result<PathBuf> {
-        let rel = validated_relative_path(rel_path)?;
-        Ok(Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel))
     }
 
     fn resolve_asset_full_path(

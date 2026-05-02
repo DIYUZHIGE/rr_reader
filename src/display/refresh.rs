@@ -65,13 +65,7 @@ pub enum RefreshMode {
 }
 
 impl Display {
-    /// Flush the dirty framebuffer to the display. First display after init
-    /// uses Fast refresh whenever possible, with automatic Half insertion every
-    /// N refreshes to clear ghosting. Full is reserved for explicit forced
-    /// cleanup and boot screens that need the highest-quality baseline.
-    pub fn flush_if_dirty(&mut self) -> Result<()> {
-        self.flush_if_dirty_with_poll(None)
-    }
+
 
     pub fn flush_if_dirty_polling<F>(&mut self, mut poll: F) -> Result<()>
     where
@@ -112,11 +106,7 @@ impl Display {
         Ok(())
     }
 
-    /// Force a full refresh to clear ghosting artifacts.
-    pub fn force_full_refresh(&mut self) -> Result<()> {
-        info!("Forced full refresh for ghosting cleanup");
-        self.refresh(RefreshMode::Full)
-    }
+
 
     fn refresh(&mut self, mode: RefreshMode) -> Result<()> {
         let mut no_poll = None;
