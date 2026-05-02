@@ -569,7 +569,6 @@ impl ReaderApp {
             Vec::with_capacity(window_len.max(PAGE_CACHE_SIZE_MIN));
         page_window.resize_with(window_len.max(PAGE_CACHE_SIZE_MIN), || (0, None));
 
-        let window_start = 0usize;
         let window_end = window_len.min(page_count);
         for (i, page) in all_pages.iter().cloned().enumerate().take(window_end) {
             if i < window_len {
@@ -588,7 +587,7 @@ impl ReaderApp {
             },
             page_window,
             window_len,
-            window_start,
+            window_cursor: crate::reader::PaginationCursor::default(),
         });
 
         // Drop the markdown string (blocks own their text now)

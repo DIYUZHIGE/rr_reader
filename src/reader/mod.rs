@@ -10,7 +10,8 @@ mod pagination;
 use self::image::draw_reader_image;
 use self::markdown::{parse_markdown_blocks, preprocess_obsidian_embeds};
 use self::math::{draw_math_layout, draw_reader_math, layout_math, parse_math};
-use self::pagination::{font_for_style, paginate_blocks};
+pub use self::pagination::PaginationCursor;
+use self::pagination::{font_for_style, paginate_blocks, paginate_window_from_cursor};
 
 pub const READER_X: usize = 24;
 pub const READER_TEXT_Y: usize = 42;
@@ -55,8 +56,8 @@ pub struct ReaderCache {
     pub page_window: Vec<(usize, Option<ReaderPage>)>,
     /// Active number of slots in `page_window`
     pub window_len: usize,
-    /// Starting page index of the current window
-    pub window_start: usize,
+    /// Cursor used by cursor-based pagination path.
+    pub window_cursor: PaginationCursor,
 }
 
 impl ReaderCache {
@@ -107,33 +108,43 @@ impl ReaderCache {
                     self.page_window[slot] = (i, Some(all_pages[i].clone()));
                 }
             }
-            self.window_start = new_start;
             return;
         }
 
-        // Fallback: re-paginate all blocks to refresh pages, then extract only the window.
-        let all_pages = paginate_blocks(&self.blocks, fonts);
-        let actual_page_count = all_pages.len();
+        // Fallback: use cursor-based window pagination (temporary adapter currently
+        // backed by full pagination internally). This keeps the cache API window-centric
+        // as we migrate to true incremental pagination.
+        let cursor =
+            if self.window_cursor.block_index > 0 && self.window_cursor.page_index == new_start {
+                self.window_cursor
+            } else {
+                PaginationCursor {
+                    block_index: 0,
+                    page_index: new_start,
+                    y: READER_TEXT_Y,
+                }
+            };
+        let (next_cursor, window, actual_page_count) = paginate_window_from_cursor(
+            &self.blocks,
+            fonts,
+            &cursor,
+            self.window_len.max(1),
+            Some(self.page_count),
+        );
         if actual_page_count != self.page_count {
             warn!(
                 "Page count mismatch on re-pagination: {} vs {}",
                 actual_page_count, self.page_count
             );
+            self.page_count = actual_page_count;
         }
 
-        let window_end = (new_start + self.window_len).min(all_pages.len());
-        for (i, page) in all_pages
-            .into_iter()
-            .enumerate()
-            .skip(new_start)
-            .take(window_end.saturating_sub(new_start))
-        {
-            let slot = i - new_start;
+        for (slot, (idx, page)) in window.into_iter().enumerate() {
             if slot < self.window_len {
-                self.page_window[slot] = (i, Some(page));
+                self.page_window[slot] = (idx, Some(page));
             }
         }
-        self.window_start = new_start;
+        self.window_cursor = next_cursor;
     }
 }
 

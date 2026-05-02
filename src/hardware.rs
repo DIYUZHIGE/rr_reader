@@ -62,8 +62,8 @@ impl Hardware {
     }
 
     /// Update button state. Call once per loop iteration.
-    pub fn update_inputs(&mut self) {
-        self.input.update();
+    pub fn update_inputs(&mut self, idle_ticks: u32) {
+        self.input.update_with_idle_ticks(idle_ticks);
     }
 
     /// Returns true if any button was pressed or released this tick.

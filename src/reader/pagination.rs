@@ -10,6 +10,23 @@ use super::{
     QUOTE_INDENT, READER_BOTTOM_MARGIN, READER_RIGHT_MARGIN, READER_TEXT_Y, READER_X,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct PaginationCursor {
+    pub block_index: usize,
+    pub page_index: usize,
+    pub y: usize,
+}
+
+impl Default for PaginationCursor {
+    fn default() -> Self {
+        Self {
+            block_index: 0,
+            page_index: 0,
+            y: READER_TEXT_Y,
+        }
+    }
+}
+
 pub(super) fn paginate_blocks(blocks: &[RenderBlock], fonts: &FontSet<'_>) -> Vec<ReaderPage> {
     let mut pages = vec![ReaderPage {
         elements: Vec::new(),
@@ -36,6 +53,117 @@ pub(super) fn paginate_blocks(blocks: &[RenderBlock], fonts: &FontSet<'_>) -> Ve
         });
     }
     pages
+}
+
+/// Temporary adapter for the incremental pagination refactor.
+///
+/// Current behavior still derives pages from the existing full paginator,
+/// but the return shape is cursor + page window so `app`/`cache` can be
+/// migrated in small steps without breaking behavior.
+pub(super) fn paginate_window_from_cursor(
+    blocks: &[RenderBlock],
+    fonts: &FontSet<'_>,
+    cursor: &PaginationCursor,
+    window_len: usize,
+    known_total_pages: Option<usize>,
+) -> (PaginationCursor, Vec<(usize, ReaderPage)>, usize) {
+    let mut pages = vec![ReaderPage {
+        elements: Vec::new(),
+    }];
+    let mut y = READER_TEXT_Y;
+    let bottom_y = Display::height() - READER_BOTTOM_MARGIN;
+
+    let start = cursor.page_index;
+    let end = start.saturating_add(window_len.max(1));
+    let mut base_page_index = 0usize;
+    let block_iter_start = if cursor.block_index > 0 {
+        cursor.block_index.min(blocks.len())
+    } else {
+        0
+    };
+    if block_iter_start > 0 {
+        y = cursor.y;
+        base_page_index = cursor.page_index;
+    }
+    let mut window: Vec<(usize, ReaderPage)> = Vec::with_capacity(window_len.max(1));
+    let mut window_captured = false;
+
+    for (block_index, block) in blocks.iter().enumerate().skip(block_iter_start) {
+        if let Some(image) = block.image.as_ref() {
+            y = paginate_image_block(&mut pages, y, bottom_y, block, image);
+        } else if block.style == BlockStyle::Math {
+            y = paginate_math_block(&mut pages, y, bottom_y, block, fonts);
+        } else {
+            y = paginate_text_block(&mut pages, y, bottom_y, block, fonts);
+        }
+
+        let global_last = base_page_index + pages.len().saturating_sub(1);
+
+        if !window_captured && global_last >= end {
+            for (local_idx, page) in pages.iter().enumerate() {
+                let global_idx = base_page_index + local_idx;
+                if global_idx >= start && global_idx < end {
+                    window.push((global_idx, page.clone()));
+                }
+            }
+            window_captured = true;
+
+            if let Some(total_pages) = known_total_pages {
+                let next_cursor = PaginationCursor {
+                    block_index: block_index.saturating_add(1),
+                    page_index: window
+                        .last()
+                        .map(|(idx, _)| *idx)
+                        .unwrap_or_else(|| start.min(total_pages.saturating_sub(1))),
+                    y,
+                };
+                return (next_cursor, window, total_pages.max(1));
+            }
+
+            if let Some(last_page) = pages.last().cloned() {
+                pages.clear();
+                pages.push(last_page);
+                base_page_index = global_last;
+            }
+        } else if window_captured && pages.len() > 1 {
+            if let Some(last_page) = pages.last().cloned() {
+                pages.clear();
+                pages.push(last_page);
+                base_page_index = global_last;
+            }
+        }
+    }
+
+    if pages.len() > 1 && pages.last().is_some_and(|page| page.elements.is_empty()) {
+        pages.pop();
+    }
+    if pages.is_empty() {
+        pages.push(ReaderPage {
+            elements: Vec::new(),
+        });
+    }
+
+    let total_pages = base_page_index + pages.len();
+
+    if !window_captured {
+        for (local_idx, page) in pages.iter().enumerate() {
+            let global_idx = base_page_index + local_idx;
+            if global_idx >= start && global_idx < end {
+                window.push((global_idx, page.clone()));
+            }
+        }
+    }
+
+    let next_cursor = PaginationCursor {
+        block_index: blocks.len(),
+        page_index: window
+            .last()
+            .map(|(idx, _)| *idx)
+            .unwrap_or_else(|| start.min(total_pages.saturating_sub(1))),
+        y,
+    };
+
+    (next_cursor, window, total_pages.max(1))
 }
 
 fn paginate_text_block(

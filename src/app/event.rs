@@ -51,7 +51,7 @@ impl EventPump {
         power: &mut PowerManager,
         mode: EventMode,
     ) -> Vec<AppEvent> {
-        hardware.update_inputs();
+        hardware.update_inputs(self.idle_ticks);
 
         if hardware.has_user_activity() {
             self.idle_ticks = 0;

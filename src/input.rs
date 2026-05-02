@@ -26,6 +26,8 @@ const ADC_RANGES_2: [i32; 3] = [ADC_NO_BUTTON as i32, 1120, i32::MIN];
 
 const DEBOUNCE_DELAY_MS: u64 = 5;
 const ADC_SAMPLE_COUNT: usize = 3;
+const IDLE_SAMPLING_ENTER_TICKS: u32 = 120;
+const IDLE_SAMPLING_STRIDE: u8 = 4;
 
 // ── Logical button types ────────────────────────────────────────
 
@@ -71,6 +73,7 @@ pub struct InputManager {
     long_press_consumed: u8,
     front_mapping: [u8; 4],
     side_layout: SideButtonLayout,
+    idle_sample_counter: u8,
 }
 
 impl InputManager {
@@ -105,18 +108,35 @@ impl InputManager {
             long_press_consumed: 0,
             front_mapping: [BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT],
             side_layout: SideButtonLayout::PrevNext,
+            idle_sample_counter: 0,
         })
     }
 
-    pub fn update(&mut self) {
+    pub fn update_with_idle_ticks(&mut self, idle_ticks: u32) {
         self.pressed_events = self.deferred_pressed_events;
         self.released_events = self.deferred_released_events;
         self.deferred_pressed_events = 0;
         self.deferred_released_events = 0;
 
+        let should_force_sample = self.current_state != 0;
+        let should_throttle = !should_force_sample && idle_ticks >= IDLE_SAMPLING_ENTER_TICKS;
+        if should_throttle {
+            if self.idle_sample_counter + 1 < IDLE_SAMPLING_STRIDE {
+                self.idle_sample_counter = self.idle_sample_counter.saturating_add(1);
+                return;
+            }
+            self.idle_sample_counter = 0;
+        } else {
+            self.idle_sample_counter = 0;
+        }
+
         let (pressed, released) = self.sample_debounced_events();
         self.pressed_events |= pressed;
         self.released_events |= released;
+    }
+
+    pub fn update(&mut self) {
+        self.update_with_idle_ticks(0);
     }
 
     /// Poll inputs while another subsystem is blocking the main loop.
@@ -125,6 +145,7 @@ impl InputManager {
     /// milliseconds. Events detected here are deferred so the next normal app
     /// tick can process them instead of losing quick follow-up presses.
     pub fn poll_during_blocking_wait(&mut self) {
+        self.idle_sample_counter = 0;
         let (pressed, released) = self.sample_debounced_events();
         self.deferred_pressed_events |= pressed;
         self.deferred_released_events |= released;
