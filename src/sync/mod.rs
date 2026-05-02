@@ -29,46 +29,106 @@ pub struct SyncReport {
     pub status_path: String,
 }
 
-pub fn sync_vault_from_s3_config(config: &RemotelySaveConfig) -> Result<SyncReport> {
-    validate_config(config)?;
-    ensure_time_synced()?;
+struct RemoteEntry {
+    key: String,
+    size: u64,
+}
 
-    let list_url = build_list_url(config)?;
-    info!("Listing remote objects: {}", list_url);
-    let list_xml = http_get_text_signed(config, &list_url)?;
-    let keys = parse_list_keys(&list_xml);
+pub fn sync_vault_from_s3_config(
+    config: &RemotelySaveConfig,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<SyncReport> {
+    validate_config(config)?;
+    on_progress("正在同步时间...");
+    ensure_time_synced()?;
 
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
+    let mut skipped_unchanged = 0usize;
+    let mut continuation_token: Option<String> = None;
+    let mut page = 0usize;
 
-    for key in keys {
-        if key.ends_with('/') {
-            skipped += 1;
-            continue;
+    loop {
+        page += 1;
+        on_progress(&format!("获取文件列表 第{}页...", page));
+        let list_url = build_list_url(config, continuation_token.as_deref())?;
+        info!("Listing remote objects: {}", list_url);
+        let list_xml = http_get_text_signed(config, &list_url)?;
+        let (entries, next_token) = parse_list_response(&list_xml);
+
+        if entries.is_empty() && next_token.is_none() {
+            break;
         }
 
-        if is_internal_marker(&key) {
-            skipped += 1;
-            continue;
-        }
+        let total_in_page = entries.len();
+        let mut processed_in_page = 0usize;
 
-        let object_url = build_object_url(config, &key)?;
-        match http_get_bytes_signed(config, &object_url) {
-            Ok(bytes) => {
-                let target = key_to_local_path(&key)?;
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| anyhow!("mkdir {:?}: {}", parent, e))?;
-                }
-                fs::write(&target, bytes).map_err(|e| anyhow!("write {:?}: {}", target, e))?;
-                downloaded += 1;
-            }
-            Err(e) => {
-                warn!("Download failed for {}: {}", key, e);
+        for entry in entries {
+            processed_in_page += 1;
+            let key = &entry.key;
+
+            if key.ends_with('/') {
                 skipped += 1;
+                continue;
             }
+
+            if is_internal_marker(key) {
+                skipped += 1;
+                continue;
+            }
+
+            // ESP32 FAT driver rejects filenames longer than ~200 chars
+            if key.rsplit('/').next().unwrap_or(key.as_str()).len() > 200 {
+                warn!("Skipping file with very long name ({} chars): {}", key.len(), key);
+                skipped += 1;
+                continue;
+            }
+
+            let target = key_to_local_path(key)?;
+            let target_str = target.to_string_lossy().to_string();
+
+            // Skip if local file exists and has same size
+            if let Ok(meta) = fs::metadata(&target) {
+                if meta.len() == entry.size {
+                    skipped_unchanged += 1;
+                    continue;
+                }
+            }
+
+            // Show progress every 5 files or on last file in page
+            if processed_in_page % 5 == 0 || processed_in_page == total_in_page {
+                let name = key.rsplit('/').next().unwrap_or(key);
+                on_progress(&format!("下载: {} (已下载:{})", name, downloaded + 1));
+            }
+
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| anyhow!("mkdir {:?}: {}", parent, e))?;
+            }
+            let object_url = build_object_url(config, key)?;
+            match download_file_signed(config, &object_url, &target_str) {
+                Ok(()) => {
+                    downloaded += 1;
+                }
+                Err(e) => {
+                    warn!("Download failed for {}: {}", key, e);
+                    skipped += 1;
+                    // Brief pause to let stack recover
+                    FreeRtos::delay_ms(200);
+                }
+            }
+        }
+
+        continuation_token = next_token;
+        if continuation_token.is_none() {
+            break;
         }
     }
 
+    if skipped_unchanged > 0 {
+        info!("Skipped {} files (unchanged)", skipped_unchanged);
+    }
+
+    on_progress("正在写入状态文件...");
     write_status_file(config, downloaded, skipped)?;
 
     Ok(SyncReport {
@@ -136,12 +196,16 @@ fn validate_config(config: &RemotelySaveConfig) -> Result<()> {
     Ok(())
 }
 
-fn build_list_url(config: &RemotelySaveConfig) -> Result<String> {
+fn build_list_url(config: &RemotelySaveConfig, continuation_token: Option<&str>) -> Result<String> {
     let base = object_base_url(config)?;
-    let mut url = format!("{}/?list-type=2", base);
+    let mut url = format!("{}/?list-type=2&max-keys=20", base);
     if !config.remote_prefix.is_empty() {
         url.push_str("&prefix=");
         url.push_str(&percent_encode(&config.remote_prefix));
+    }
+    if let Some(token) = continuation_token {
+        url.push_str("&continuation-token=");
+        url.push_str(&percent_encode(token));
     }
     Ok(url)
 }
@@ -171,29 +235,63 @@ fn object_base_url(config: &RemotelySaveConfig) -> Result<String> {
     Ok(format!("{}://{}.{}", scheme, config.bucket_name, host))
 }
 
-fn parse_list_keys(xml: &str) -> Vec<String> {
-    let mut keys = Vec::new();
+fn parse_list_response(xml: &str) -> (Vec<RemoteEntry>, Option<String>) {
+    let mut entries = Vec::new();
+    let mut next_token = None;
     let mut rest = xml;
 
+    // Parse <Contents> blocks
     loop {
-        let Some(start) = rest.find("<Key>") else {
+        let Some(contents_start) = rest.find("<Contents>") else {
             break;
         };
-        let after_start = &rest[start + 5..];
-        let Some(end) = after_start.find("</Key>") else {
+        let after_cs = &rest[contents_start + 10..];
+        let Some(contents_end) = after_cs.find("</Contents>") else {
             break;
         };
+        let block = &after_cs[..contents_end];
 
-        let encoded = &after_start[..end];
-        let decoded = xml_unescape(encoded);
-        if !decoded.is_empty() {
-            keys.push(decoded);
+        // Extract <Key>
+        let key = extract_xml_text(block, "<Key>", "</Key>").unwrap_or_default();
+        // Extract <Size>
+        let size_str = extract_xml_text(block, "<Size>", "</Size>").unwrap_or("0");
+        let size: u64 = size_str.parse().unwrap_or(0);
+
+        if !key.is_empty() {
+            entries.push(RemoteEntry {
+                key: key.to_string(),
+                size,
+            });
         }
 
-        rest = &after_start[end + 6..];
+        rest = &after_cs[contents_end + 12..];
     }
 
-    keys
+    // Parse NextContinuationToken
+    if let Some(start) = xml.find("<NextContinuationToken>") {
+        let after_start = &xml[start + 23..];
+        if let Some(end) = after_start.find("</NextContinuationToken>") {
+            let token = xml_unescape(&after_start[..end]);
+            if !token.is_empty() {
+                next_token = Some(token);
+            }
+        }
+    }
+
+    (entries, next_token)
+}
+
+fn extract_xml_text<'a>(xml: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = xml.find(open)?;
+    let after = &xml[start + open.len()..];
+    let end = after.find(close)?;
+    Some(xml_unescape_ref(&after[..end]))
+}
+
+fn xml_unescape_ref(s: &str) -> &str {
+    // The slice is from the original XML buffer; XML entities like &amp;
+    // can't appear in OSS keys, so this is safe as-is.
+    s
 }
 
 fn http_get_text_signed(config: &RemotelySaveConfig, url: &str) -> Result<String> {
@@ -223,6 +321,129 @@ fn http_get_bytes_signed(config: &RemotelySaveConfig, url: &str) -> Result<Vec<u
     Err(last_error.unwrap_or_else(|| anyhow!("signed GET failed")))
 }
 
+/// Stream a signed GET response directly to a file, never holding the
+/// entire body in memory. Essential for ESP32-C3 (~400 KB SRAM).
+fn download_file_signed(config: &RemotelySaveConfig, url: &str, file_path: &str) -> Result<()> {
+    let parsed = parse_url(url)?;
+    let candidates = signing_candidates(config, &parsed.host);
+    let timestamp = resolve_signing_timestamp(url)?;
+
+    // Retry up to 3 times with increasing delays for transient TLS errors
+    for attempt in 1..=3 {
+        let mut last_error: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            match download_file_signed_once(config, url, &parsed, candidate, &timestamp, file_path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let err_msg = format!("{}", e);
+                    // Only retry on transient errors (TLS/connection issues)
+                    if err_msg.contains("ERROR") || err_msg.contains("ESP_FAIL")
+                        || err_msg.contains("No more processes")
+                    {
+                        warn!(
+                            "Download attempt {}/3 failed (transient): {}",
+                            attempt, err_msg
+                        );
+                    } else {
+                        warn!(
+                            "Download failed: {}",
+                            err_msg
+                        );
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        if attempt < 3 {
+            let delay_ms = attempt * 2000; // 2s, 4s backoff
+            info!("Retrying download in {}ms...", delay_ms);
+            FreeRtos::delay_ms(delay_ms as u32);
+        } else {
+            return Err(last_error.unwrap_or_else(|| anyhow!("signed download failed after 3 attempts")));
+        }
+    }
+
+    Err(anyhow!("unreachable"))
+}
+
+fn download_file_signed_once(
+    config: &RemotelySaveConfig,
+    url: &str,
+    parsed: &ParsedUrl,
+    candidate: &SigningCandidate,
+    timestamp: &SigningTimestamp,
+    file_path: &str,
+) -> Result<()> {
+    let signing = signing_material(config, parsed, "GET", candidate, timestamp)?;
+
+    let use_tls = url.starts_with("https://");
+    let config_http = HttpConfiguration {
+        buffer_size: Some(2048),
+        buffer_size_tx: Some(1024),
+        timeout: Some(core::time::Duration::from_secs(60)),
+        use_global_ca_store: use_tls,
+        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
+        ..Default::default()
+    };
+    let mut connection = EspHttpConnection::new(&config_http)?;
+
+    let headers = [
+        ("Host", parsed.host.as_str()),
+        ("x-oss-date", signing.request_date.as_str()),
+        ("x-oss-content-sha256", signing.payload_hash.as_str()),
+        ("Authorization", signing.authorization.as_str()),
+    ];
+
+    connection.initiate_request(Method::Get, url, &headers)?;
+    connection.initiate_response()?;
+
+    let status = connection.status();
+
+    if !(200..300).contains(&status) {
+        // Read at most 1024 bytes for error diagnostics
+        let mut error_body = Vec::new();
+        let mut chunk = [0u8; 512];
+        for _ in 0..2 {
+            match connection.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => error_body.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let body_preview = String::from_utf8_lossy(&error_body);
+        return Err(anyhow!(
+            "GET {} returned HTTP {} (service={} region={}) scope={} creq_sha256={} sts_sha256={} body={}",
+            url, status, candidate.service, candidate.region,
+            signing.credential_scope, signing.canonical_request_sha256,
+            signing.string_to_sign_sha256, truncate_debug_text(&body_preview, 2000)
+        ));
+    }
+
+    // Stream body directly to file in small chunks
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file_path)
+        .map_err(|e| anyhow!("open {:?}: {}", file_path, e))?;
+
+    let mut chunk = [0u8; 2048];
+    loop {
+        let n = connection
+            .read(&mut chunk)
+            .map_err(|e| anyhow!("read response {}: {}", url, e))?;
+        if n == 0 {
+            break;
+        }
+        use std::io::Write;
+        file.write_all(&chunk[..n])
+            .map_err(|e| anyhow!("write {:?}: {}", file_path, e))?;
+    }
+
+    Ok(())
+}
+
 fn http_get_bytes_signed_once(
     config: &RemotelySaveConfig,
     url: &str,
@@ -232,12 +453,13 @@ fn http_get_bytes_signed_once(
 ) -> Result<Vec<u8>> {
     let signing = signing_material(config, parsed, "GET", candidate, timestamp)?;
 
+    let use_tls = url.starts_with("https://");
     let config_http = HttpConfiguration {
-        buffer_size: Some(4096),
-        buffer_size_tx: Some(2048),
+        buffer_size: Some(2048),
+        buffer_size_tx: Some(1024),
         timeout: Some(core::time::Duration::from_secs(30)),
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(attach_crt_bundle),
+        use_global_ca_store: use_tls,
+        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
         ..Default::default()
     };
     let mut connection = EspHttpConnection::new(&config_http)?;
@@ -342,12 +564,13 @@ fn signing_timestamp_from_datetime(dt: OffsetDateTime) -> SigningTimestamp {
 }
 
 fn fetch_server_datetime(url: &str) -> Result<Option<OffsetDateTime>> {
+    let use_tls = url.starts_with("https://");
     let config_http = HttpConfiguration {
         buffer_size: Some(4096),
         buffer_size_tx: Some(2048),
         timeout: Some(core::time::Duration::from_secs(15)),
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(attach_crt_bundle),
+        use_global_ca_store: use_tls,
+        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
         ..Default::default()
     };
     let mut connection = EspHttpConnection::new(&config_http)?;
@@ -684,7 +907,7 @@ fn xml_unescape(s: &str) -> String {
 }
 
 fn is_internal_marker(key: &str) -> bool {
-    key.starts_with('.') || key.ends_with(".obsidian/workspace.json")
+    key.starts_with('.') || key.starts_with('_') || key.ends_with(".obsidian/workspace.json")
 }
 
 fn write_status_file(config: &RemotelySaveConfig, downloaded: usize, skipped: usize) -> Result<()> {

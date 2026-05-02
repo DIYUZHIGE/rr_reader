@@ -560,7 +560,7 @@ impl ReaderApp {
         info!("{}", wifi_status.boot_line());
 
         let cfg = self.hardware.storage.read_remotely_save_config();
-        self.settings_status = match cfg {
+        let final_status = match cfg {
             Ok(Some(cfg)) => {
                 info!(
                     "Sync config loaded: endpoint={} region={} bucket={} prefix={} force_path_style={} source={}",
@@ -571,7 +571,17 @@ impl ReaderApp {
                     cfg.force_path_style,
                     cfg.source_path
                 );
-                match sync::sync_vault_from_s3_config(&cfg) {
+
+                // Initial status
+                self.settings_status = "正在连接...".to_string();
+                self.render_settings_page();
+                self.flush_ui_refresh();
+
+                match sync::sync_vault_from_s3_config(&cfg, &mut |msg: &str| {
+                    self.settings_status = msg.to_string();
+                    self.render_settings_page();
+                    self.flush_ui_refresh();
+                }) {
                     Ok(report) => {
                         self.md_files = match self.hardware.storage.list_markdown_files("") {
                             Ok(files) => files,
@@ -582,8 +592,8 @@ impl ReaderApp {
                         };
                         self.reload_browser_entries(None);
                         format!(
-                            "同步完成：下载 {}，跳过 {}，状态文件 {}",
-                            report.downloaded_files, report.skipped_files, report.status_path
+                            "同步完成：下载 {}，跳过 {}",
+                            report.downloaded_files, report.skipped_files
                         )
                     }
                     Err(e) => {
@@ -599,6 +609,7 @@ impl ReaderApp {
             }
         };
 
+        self.settings_status = final_status;
         self.render_settings_page();
     }
 
