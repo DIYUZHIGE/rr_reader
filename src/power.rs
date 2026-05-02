@@ -82,7 +82,7 @@ pub fn handle_wakeup(reason: WakeupReason, input: &mut InputManager) -> Result<b
 
 fn verify_power_button_wakeup(input: &mut InputManager) {
     let start_ms = now_ms();
-    let calibrated_duration_ms = POWER_BUTTON_SLEEP_MS.saturating_sub(start_ms as u32).max(1);
+    let hold_threshold_ms = POWER_BUTTON_SLEEP_MS;
 
     input.update();
     while !input.is_pressed(BTN_POWER) && now_ms().saturating_sub(start_ms) < 1000 {
@@ -94,12 +94,12 @@ fn verify_power_button_wakeup(input: &mut InputManager) {
         enter_deep_sleep_now(None);
     }
 
-    while input.is_pressed(BTN_POWER) && input.held_ms(BTN_POWER) < calibrated_duration_ms {
+    while input.is_pressed(BTN_POWER) && input.held_ms(BTN_POWER) < hold_threshold_ms {
         FreeRtos::delay_ms(10);
         input.update();
     }
 
-    if input.held_ms(BTN_POWER) < calibrated_duration_ms {
+    if input.held_ms(BTN_POWER) < hold_threshold_ms {
         enter_deep_sleep_now(None);
     }
 }

@@ -55,8 +55,8 @@ fn main() -> Result<()> {
     // Boot the app (mounts SD, initializes display, loads fonts, shows boot screen)
     let mut app = ReaderApp::boot(hardware, display)?;
 
-    // Connect WiFi after boot to avoid stack frame overlap with display/font init
-    app.connect_wifi();
+    // WiFi is now on-demand: keep it disconnected at boot for lower power and RAM usage.
+    // app.connect_wifi();
 
     info!("Entering main loop");
     loop {

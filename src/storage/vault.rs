@@ -56,28 +56,8 @@ impl Storage {
         markdown_rel_path: &str,
         asset_path: &str,
     ) -> Result<Vec<u8>> {
-        let candidates = asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
-        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-
-        for rel in &candidates {
-            let full = vault_root.join(rel);
-            if let Ok(bytes) = fs::read(&full) {
-                return Ok(bytes);
-            }
-        }
-
-        let asset_path = clean_asset_path(asset_path);
-        if let Some(file_name) = Path::new(&asset_path).file_name() {
-            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
-                return fs::read(&full).map_err(|e| anyhow!("read {:?}: {}", full, e));
-            }
-        }
-
-        Err(anyhow!(
-            "image not found: {} (tried {:?})",
-            asset_path,
-            candidates
-        ))
+        let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
+        fs::read(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
     pub fn open_asset_relative_to(
@@ -85,29 +65,9 @@ impl Storage {
         markdown_rel_path: &str,
         asset_path: &str,
     ) -> Result<BufReader<File>> {
-        let candidates = asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
-        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-
-        for rel in &candidates {
-            let full = vault_root.join(rel);
-            if let Ok(file) = File::open(&full) {
-                return Ok(BufReader::with_capacity(2048, file));
-            }
-        }
-
-        let asset_path = clean_asset_path(asset_path);
-        if let Some(file_name) = Path::new(&asset_path).file_name() {
-            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
-                let file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
-                return Ok(BufReader::with_capacity(2048, file));
-            }
-        }
-
-        Err(anyhow!(
-            "image not found: {} (tried {:?})",
-            asset_path,
-            candidates
-        ))
+        let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
+        let file = File::open(&full).map_err(|e| anyhow!("open {:?}: {}", full, e))?;
+        Ok(BufReader::with_capacity(2048, file))
     }
 
     pub fn resolve_asset_path_relative_to(
@@ -115,30 +75,8 @@ impl Storage {
         markdown_rel_path: &str,
         asset_path: &str,
     ) -> Result<String> {
-        let candidates = asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
-        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-
-        for rel in &candidates {
-            let full = vault_root.join(rel);
-            if full.is_file() {
-                return Ok(full.to_string_lossy().to_string());
-            }
-        }
-
-        let asset_path = clean_asset_path(asset_path);
-        if let Some(file_name) = Path::new(&asset_path).file_name() {
-            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
-                if full.is_file() {
-                    return Ok(full.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        Err(anyhow!(
-            "image not found: {} (tried {:?})",
-            asset_path,
-            candidates
-        ))
+        let full = self.resolve_asset_full_path(markdown_rel_path, asset_path)?;
+        Ok(full.to_string_lossy().to_string())
     }
 
     pub fn markdown_file_len(&self, rel_path: &str) -> Result<usize> {
@@ -271,6 +209,37 @@ impl Storage {
     fn markdown_full_path(&self, rel_path: &str) -> Result<PathBuf> {
         let rel = validated_relative_path(rel_path)?;
         Ok(Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel))
+    }
+
+    fn resolve_asset_full_path(
+        &self,
+        markdown_rel_path: &str,
+        asset_path: &str,
+    ) -> Result<PathBuf> {
+        let candidates = asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
+        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+
+        for rel in &candidates {
+            let full = vault_root.join(rel);
+            if full.is_file() {
+                return Ok(full);
+            }
+        }
+
+        let cleaned_asset_path = clean_asset_path(asset_path);
+        if let Some(file_name) = Path::new(&cleaned_asset_path).file_name() {
+            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
+                if full.is_file() {
+                    return Ok(full);
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "image not found: {} (tried {:?})",
+            cleaned_asset_path,
+            candidates
+        ))
     }
 
     fn find_vault_file_by_name(

@@ -13,7 +13,7 @@ use crate::reader::{
     PAGE_CACHE_SIZE_MAX, PAGE_CACHE_SIZE_MIN, READER_X,
 };
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
@@ -101,7 +101,7 @@ impl ReaderApp {
         display.draw_text_font(&ui_font, &format!("文件: {}", md_files.len()), 220, 280);
         display.draw_text_wrapped(
             &ui_font,
-            "WiFi: 正在连接...",
+            "WiFi: 未连接（按需启用）",
             140,
             310,
             Display::width() - 140,
@@ -355,7 +355,7 @@ impl ReaderApp {
                 Display::width() - LIST_RIGHT_MARGIN,
                 4,
             );
-            info!("Rendering empty file browser");
+            debug!("Rendering empty file browser");
             return;
         }
 
@@ -406,7 +406,7 @@ impl ReaderApp {
             Display::height() - self.ui_font.glyph_height as usize - 8,
         );
 
-        info!(
+        debug!(
             "Rendering file browser: selected {}/{}",
             selected + 1,
             self.md_files.len()
@@ -425,7 +425,7 @@ impl ReaderApp {
                 Display::width() - 24,
                 4,
             );
-            info!("No files to render");
+            debug!("No files to render");
             return;
         }
 
@@ -492,7 +492,7 @@ impl ReaderApp {
                     footer_x,
                     Display::height() - self.ui_font.glyph_height as usize - 8,
                 );
-                info!(
+                debug!(
                     "Rendering file {}/{} page {}/{}: {}",
                     file_index + 1,
                     self.md_files.len(),
@@ -562,6 +562,7 @@ impl ReaderApp {
 
         let page_count = all_pages.len().max(1);
         let window_len = self.select_reader_window_len();
+        let keep_all_pages = self.should_keep_all_pages(page_count);
 
         // Build cache with first window of pages
         let mut page_window: Vec<(usize, Option<ReaderPage>)> =
@@ -570,7 +571,7 @@ impl ReaderApp {
 
         let window_start = 0usize;
         let window_end = window_len.min(page_count);
-        for (i, page) in all_pages.into_iter().enumerate().take(window_end) {
+        for (i, page) in all_pages.iter().cloned().enumerate().take(window_end) {
             if i < window_len {
                 page_window[i] = (i, Some(page));
             }
@@ -580,6 +581,11 @@ impl ReaderApp {
             file_index,
             blocks,
             page_count,
+            all_pages: if keep_all_pages {
+                Some(all_pages)
+            } else {
+                None
+            },
             page_window,
             window_len,
             window_start,
@@ -608,6 +614,12 @@ impl ReaderApp {
         } else {
             PAGE_CACHE_SIZE_MIN
         }
+    }
+
+    fn should_keep_all_pages(&self, page_count: usize) -> bool {
+        let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
+        // Conservative rule: keep full pages only for small/medium files when heap is healthy.
+        free_heap >= 150 * 1024 && page_count <= 120
     }
 
     fn reader_page_count(&self) -> usize {

@@ -48,6 +48,9 @@ pub struct ReaderCache {
     pub blocks: Vec<RenderBlock>,
     /// Total number of pages in this file
     pub page_count: usize,
+    /// Optional full rendered pages cache (enabled when heap budget allows).
+    /// If present, window slides reuse these pages instead of re-paginating.
+    pub all_pages: Option<Vec<ReaderPage>>,
     /// Sliding window of cached pages: [(page_index, page), ...]
     pub page_window: Vec<(usize, Option<ReaderPage>)>,
     /// Active number of slots in `page_window`
@@ -92,7 +95,23 @@ impl ReaderCache {
             .saturating_sub(window_radius)
             .min(self.page_count.saturating_sub(self.window_len));
 
-        // Re-paginate all blocks to get fresh pages, then extract only the window
+        self.page_window.clear();
+        self.page_window
+            .resize_with(self.window_len.max(1), || (0, None));
+
+        if let Some(all_pages) = self.all_pages.as_ref() {
+            let window_end = (new_start + self.window_len).min(all_pages.len());
+            for i in new_start..window_end {
+                let slot = i - new_start;
+                if slot < self.window_len {
+                    self.page_window[slot] = (i, Some(all_pages[i].clone()));
+                }
+            }
+            self.window_start = new_start;
+            return;
+        }
+
+        // Fallback: re-paginate all blocks to refresh pages, then extract only the window.
         let all_pages = paginate_blocks(&self.blocks, fonts);
         let actual_page_count = all_pages.len();
         if actual_page_count != self.page_count {
@@ -102,9 +121,6 @@ impl ReaderCache {
             );
         }
 
-        self.page_window.clear();
-        self.page_window
-            .resize_with(self.window_len.max(1), || (0, None));
         let window_end = (new_start + self.window_len).min(all_pages.len());
         for (i, page) in all_pages
             .into_iter()
@@ -121,12 +137,12 @@ impl ReaderCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReaderPage {
     pub elements: Vec<PageElement>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PageElement {
     Line(RenderLine),
     InlineLine(RenderInlineLine),
@@ -153,7 +169,7 @@ pub struct RenderLine {
     pub quote_depth: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderInlineLine {
     pub style: BlockStyle,
     pub runs: Vec<RenderInlineRun>,
@@ -163,7 +179,7 @@ pub struct RenderInlineLine {
     pub quote_depth: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderInlineRun {
     pub x: usize,
     pub y: usize,
@@ -176,7 +192,7 @@ pub enum RenderInlineRunKind {
     Math(String),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderMath {
     pub source: String,
     pub x: usize,
@@ -186,7 +202,7 @@ pub struct RenderMath {
     pub quote_depth: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderImage {
     pub x: usize,
     pub y: usize,
