@@ -1,4 +1,5 @@
 use crate::input::{InputManager, BTN_POWER};
+use crate::platform::POWER_BUTTON_GPIO;
 use crate::time::now_ms;
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
@@ -6,7 +7,7 @@ use esp_idf_hal::reset::WakeupReason;
 use esp_idf_hal::sys;
 use log::{debug, info};
 
-const POWER_BUTTON_PIN: u64 = 3;
+const POWER_BUTTON_PIN: u64 = POWER_BUTTON_GPIO as u64;
 const DEFAULT_SLEEP_TIMEOUT_SECS: u32 = 5 * 60; // 5 minutes
 pub const POWER_BUTTON_SLEEP_MS: u32 = 2000;
 
@@ -128,7 +129,7 @@ fn enter_deep_sleep_now(timer_secs: Option<u64>) {
 }
 
 fn wait_for_power_button_release() {
-    while unsafe { sys::gpio_get_level(sys::gpio_num_t_GPIO_NUM_3) } == 0 {
+    while unsafe { sys::gpio_get_level(POWER_BUTTON_GPIO) } == 0 {
         FreeRtos::delay_ms(50);
     }
 }

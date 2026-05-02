@@ -1,3 +1,6 @@
+use crate::platform::{
+    FRONT_ADC_CHANNEL, INPUT_ADC_ATTEN, INPUT_ADC_WIDTH, POWER_BUTTON_GPIO, SIDE_ADC_CHANNEL,
+};
 use crate::time::now_ms;
 use anyhow::Result;
 use esp_idf_hal::sys;
@@ -12,12 +15,6 @@ pub const BTN_UP: u8 = 4;
 pub const BTN_DOWN: u8 = 5;
 pub const BTN_POWER: u8 = 6;
 const BUTTON_COUNT: usize = 7;
-
-// ESP32-C3 ADC1 channel mapping:
-//   ADC_CHANNEL_1 -> GPIO1 (front button resistor ladder)
-//   ADC_CHANNEL_2 -> GPIO2 (side button resistor ladder)
-const FRONT_ADC_CHANNEL: sys::adc_channel_t = sys::adc_channel_t_ADC_CHANNEL_1;
-const SIDE_ADC_CHANNEL: sys::adc_channel_t = sys::adc_channel_t_ADC_CHANNEL_2;
 
 // ADC ranges from crosspoint measured values
 const ADC_NO_BUTTON: u16 = 3800;
@@ -83,16 +80,13 @@ impl InputManager {
     pub fn new() -> Result<Self> {
         unsafe {
             // Configure ADC1 channels for button reading
-            sys::adc1_config_width(sys::adc_bits_width_t_ADC_WIDTH_BIT_12);
-            sys::adc1_config_channel_atten(FRONT_ADC_CHANNEL, sys::adc_atten_t_ADC_ATTEN_DB_11);
-            sys::adc1_config_channel_atten(SIDE_ADC_CHANNEL, sys::adc_atten_t_ADC_ATTEN_DB_11);
+            sys::adc1_config_width(INPUT_ADC_WIDTH);
+            sys::adc1_config_channel_atten(FRONT_ADC_CHANNEL, INPUT_ADC_ATTEN);
+            sys::adc1_config_channel_atten(SIDE_ADC_CHANNEL, INPUT_ADC_ATTEN);
 
             // GPIO3: power button (digital input with pull-up)
-            sys::gpio_set_direction(sys::gpio_num_t_GPIO_NUM_3, sys::gpio_mode_t_GPIO_MODE_INPUT);
-            sys::gpio_set_pull_mode(
-                sys::gpio_num_t_GPIO_NUM_3,
-                sys::gpio_pull_mode_t_GPIO_PULLUP_ONLY,
-            );
+            sys::gpio_set_direction(POWER_BUTTON_GPIO, sys::gpio_mode_t_GPIO_MODE_INPUT);
+            sys::gpio_set_pull_mode(POWER_BUTTON_GPIO, sys::gpio_pull_mode_t_GPIO_PULLUP_ONLY);
         }
 
         Ok(Self {
@@ -210,7 +204,7 @@ impl InputManager {
             }
 
             // GPIO3 (power button, active LOW)
-            if sys::gpio_get_level(sys::gpio_num_t_GPIO_NUM_3) == 0 {
+            if sys::gpio_get_level(POWER_BUTTON_GPIO) == 0 {
                 state |= 1u8 << BTN_POWER;
             }
         }

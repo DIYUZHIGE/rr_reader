@@ -1,22 +1,10 @@
-mod spi;
-
-pub use self::spi::init_shared_spi_bus;
-
 use crate::input::InputManager;
 use crate::network::{NetworkManager, WifiStatus};
+use crate::platform::{DeviceModel, BOARD, FLASH_SIZE, SERIAL_BAUD};
 use crate::storage::Storage;
 use anyhow::Result;
 use esp_idf_hal::modem::Modem;
 use log::info;
-
-pub const BOARD: &str = "esp32-c3-devkitm-1";
-pub const FLASH_SIZE: &str = "16MB";
-pub const SERIAL_BAUD: u32 = 115_200;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeviceModel {
-    X4,
-}
 
 pub struct Hardware {
     pub model: DeviceModel,

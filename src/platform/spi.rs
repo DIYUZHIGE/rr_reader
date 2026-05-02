@@ -1,3 +1,4 @@
+use crate::platform::esp_idf::{SPI_MISO_GPIO, SPI_MOSI_GPIO, SPI_SCLK_GPIO};
 use anyhow::Result;
 use esp_idf_hal::sys;
 use log::info;
@@ -12,9 +13,13 @@ const SPI2_HOST: sys::spi_host_device_t = sys::spi_host_device_t_SPI2_HOST;
 pub fn init_shared_spi_bus() -> Result<()> {
     info!("Initializing SPI2 bus (shared: SD card + display)");
     let bus_config = sys::spi_bus_config_t {
-        __bindgen_anon_1: sys::spi_bus_config_t__bindgen_ty_1 { mosi_io_num: 10 },
-        __bindgen_anon_2: sys::spi_bus_config_t__bindgen_ty_2 { miso_io_num: 7 },
-        sclk_io_num: 8,
+        __bindgen_anon_1: sys::spi_bus_config_t__bindgen_ty_1 {
+            mosi_io_num: SPI_MOSI_GPIO,
+        },
+        __bindgen_anon_2: sys::spi_bus_config_t__bindgen_ty_2 {
+            miso_io_num: SPI_MISO_GPIO,
+        },
+        sclk_io_num: SPI_SCLK_GPIO,
         __bindgen_anon_3: sys::spi_bus_config_t__bindgen_ty_3 { quadwp_io_num: -1 },
         __bindgen_anon_4: sys::spi_bus_config_t__bindgen_ty_4 { quadhd_io_num: -1 },
         max_transfer_sz: 16384,
