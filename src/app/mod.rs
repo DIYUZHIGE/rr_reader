@@ -12,6 +12,7 @@ use crate::reader::{
     draw_reader_page, markdown_blocks_and_pages, ReaderCache, ReaderPage, ReaderState,
     PAGE_CACHE_SIZE_MAX, PAGE_CACHE_SIZE_MIN, READER_X,
 };
+use crate::sync;
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::collections::BTreeMap;
@@ -60,6 +61,7 @@ pub struct ReaderApp {
     browser_root_dir: String,
     browser: FileBrowserState,
     settings_selected: usize,
+    settings_status: String,
     activity: Activity,
     reader_cache: Option<ReaderCache>,
     wifi_suspended_for_reader: bool,
@@ -129,6 +131,7 @@ impl ReaderApp {
             browser_root_dir,
             browser: FileBrowserState::new_root(),
             settings_selected: 0,
+            settings_status: String::new(),
             activity: Activity::FileBrowser,
             reader_cache: None,
             wifi_suspended_for_reader: false,
@@ -517,12 +520,16 @@ impl ReaderApp {
         );
     }
 
+    fn settings_option_count(&self) -> usize {
+        3
+    }
+
     fn move_settings_selection(&mut self, delta: isize) {
         if !matches!(self.activity, Activity::Settings) {
             return;
         }
 
-        let count = 2usize;
+        let count = self.settings_option_count();
         self.settings_selected =
             (self.settings_selected as isize + delta).rem_euclid(count as isize) as usize;
         self.render_settings_page();
@@ -539,11 +546,60 @@ impl ReaderApp {
                 self.browser_root_dir.clear();
                 self.browser.current_dir.clear();
                 let _ = self.hardware.storage.write_browser_root_dir("");
+                self.settings_status = "已重置文件根目录".to_string();
                 self.reload_browser_entries(None);
                 self.render_settings_page();
             }
+            2 => self.trigger_manual_sync(),
             _ => {}
         }
+    }
+
+    fn trigger_manual_sync(&mut self) {
+        let wifi_status = self.hardware.connect_wifi_from_storage();
+        info!("{}", wifi_status.boot_line());
+
+        let cfg = self.hardware.storage.read_remotely_save_config();
+        self.settings_status = match cfg {
+            Ok(Some(cfg)) => {
+                info!(
+                    "Sync config loaded: endpoint={} region={} bucket={} prefix={} force_path_style={} source={}",
+                    cfg.endpoint,
+                    cfg.region,
+                    cfg.bucket_name,
+                    cfg.remote_prefix,
+                    cfg.force_path_style,
+                    cfg.source_path
+                );
+                match sync::sync_vault_from_s3_config(&cfg) {
+                    Ok(report) => {
+                        self.md_files = match self.hardware.storage.list_markdown_files("") {
+                            Ok(files) => files,
+                            Err(e) => {
+                                warn!("Failed to rescan vault after sync: {}", e);
+                                self.md_files.clone()
+                            }
+                        };
+                        self.reload_browser_entries(None);
+                        format!(
+                            "同步完成：下载 {}，跳过 {}，状态文件 {}",
+                            report.downloaded_files, report.skipped_files, report.status_path
+                        )
+                    }
+                    Err(e) => {
+                        warn!("Sync failed: {}", e);
+                        format!("同步失败: {}", e)
+                    }
+                }
+            }
+            Ok(None) => "未找到 remotely-save 配置文件".to_string(),
+            Err(e) => {
+                warn!("Failed to load remotely-save config: {}", e);
+                format!("读取同步配置失败: {}", e)
+            }
+        };
+
+        self.render_settings_page();
     }
 
     fn apply_selected_dir_as_browser_root(&mut self) {
@@ -574,7 +630,11 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = ["将当前目录设为文件根目录", "重置文件根目录为 vault 根"];
+        let options = [
+            "将当前目录设为文件根目录",
+            "重置文件根目录为 vault 根",
+            "手动同步 vault（S3）",
+        ];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);
@@ -592,8 +652,20 @@ impl ReaderApp {
             &self.ui_font,
             &root_line,
             LIST_X,
-            Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET,
+            Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET - 20,
         );
+
+        if !self.settings_status.is_empty() {
+            let status_text = format!("状态: {}", self.settings_status);
+            let status_line =
+                truncate_for_width(&self.ui_font, &status_text, Display::width() - 48);
+            self.display.draw_text_font(
+                &self.ui_font,
+                &status_line,
+                LIST_X,
+                Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET,
+            );
+        }
     }
 
     fn render_current_file(&mut self) {

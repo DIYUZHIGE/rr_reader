@@ -9,6 +9,7 @@ mod platform;
 mod power;
 mod reader;
 mod storage;
+mod sync;
 mod text;
 mod time;
 
