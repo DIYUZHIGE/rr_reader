@@ -8,6 +8,9 @@ const BROWSER_REPEAT_START_MS: u32 = 280;
 const BROWSER_REPEAT_INTERVAL_MS: u64 = 140;
 const READER_REPEAT_START_MS: u32 = 500;
 const READER_REPEAT_INTERVAL_MS: u64 = 450;
+const SETTINGS_REPEAT_START_MS: u32 = 280;
+const SETTINGS_REPEAT_INTERVAL_MS: u64 = 140;
+const BROWSER_SETTINGS_LONG_PRESS_MS: u32 = 700;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum EventMode {
@@ -22,9 +25,12 @@ pub(super) enum AppEvent {
     BrowserMove(isize),
     BrowserConfirm,
     BrowserBack,
+    BrowserOpenSettings,
     ReaderBack,
     ReaderMove(isize),
     ReaderRefresh,
+    SettingsMove(isize),
+    SettingsConfirm,
     SettingsBack,
     IdleTimeout { idle_ticks: u32 },
 }
@@ -35,6 +41,9 @@ pub(super) struct EventPump {
     idle_ticks: u32,
     browser_repeater: NavigationRepeater,
     reader_repeater: NavigationRepeater,
+    settings_repeater: NavigationRepeater,
+    browser_back_long_handled: bool,
+    suppress_settings_back_release: bool,
 }
 
 impl EventPump {
@@ -45,6 +54,9 @@ impl EventPump {
             idle_ticks: 0,
             browser_repeater: NavigationRepeater::new(),
             reader_repeater: NavigationRepeater::new(),
+            settings_repeater: NavigationRepeater::new(),
+            browser_back_long_handled: false,
+            suppress_settings_back_release: false,
         }
     }
 
@@ -117,7 +129,19 @@ impl EventPump {
     fn collect_browser_events(&mut self, input: &mut InputManager, events: &mut Vec<AppEvent>) {
         use Button::*;
 
+        let back_button = input.logical_to_physical(Back);
+        if input.long_pressed_once(back_button, BROWSER_SETTINGS_LONG_PRESS_MS) {
+            events.push(AppEvent::BrowserOpenSettings);
+            self.browser_back_long_handled = true;
+            self.suppress_settings_back_release = true;
+            return;
+        }
+
         if input.logical_was_released(Back) {
+            if self.browser_back_long_handled {
+                self.browser_back_long_handled = false;
+                return;
+            }
             events.push(AppEvent::BrowserBack);
             return;
         }
@@ -166,7 +190,27 @@ impl EventPump {
         use Button::*;
 
         if input.logical_was_released(Back) {
+            if self.suppress_settings_back_release {
+                self.suppress_settings_back_release = false;
+                return;
+            }
             events.push(AppEvent::SettingsBack);
+            return;
+        }
+
+        if let Some(delta) = self.settings_repeater.navigation_delta(
+            input,
+            &[Down, Right],
+            &[Up, Left],
+            SETTINGS_REPEAT_START_MS,
+            SETTINGS_REPEAT_INTERVAL_MS,
+        ) {
+            events.push(AppEvent::SettingsMove(delta));
+            return;
+        }
+
+        if input.logical_was_pressed(Confirm) {
+            events.push(AppEvent::SettingsConfirm);
         }
     }
 }

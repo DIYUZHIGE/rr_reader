@@ -7,6 +7,9 @@ use log::info;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const READER_CONFIG_FILE: &str = ".rr_reader.conf";
+const BROWSER_ROOT_KEY: &str = "browser_root";
+
 impl Storage {
     /// Ensure the vault directory structure exists.
     pub fn ensure_vault_dirs(&self) -> Result<()> {
@@ -34,6 +37,45 @@ impl Storage {
         }
 
         Ok(files)
+    }
+
+    pub fn read_browser_root_dir(&self) -> Result<String> {
+        let config_path = Path::new(SD_MOUNT_POINT)
+            .join(VAULT_DIR)
+            .join(READER_CONFIG_FILE);
+        if !config_path.exists() {
+            return Ok(String::new());
+        }
+
+        let contents = fs::read_to_string(&config_path)
+            .map_err(|e| anyhow!("read {:?}: {}", config_path, e))?;
+
+        for raw_line in contents.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == BROWSER_ROOT_KEY {
+                    let value = value.trim();
+                    validated_relative_path(value)?;
+                    return Ok(value.to_string());
+                }
+            }
+        }
+
+        Ok(String::new())
+    }
+
+    pub fn write_browser_root_dir(&self, root: &str) -> Result<()> {
+        validated_relative_path(root)?;
+
+        let config_path = Path::new(SD_MOUNT_POINT)
+            .join(VAULT_DIR)
+            .join(READER_CONFIG_FILE);
+        let contents = format!("{}={}\n", BROWSER_ROOT_KEY, root);
+        fs::write(&config_path, contents).map_err(|e| anyhow!("write {:?}: {}", config_path, e))
     }
 
     /// Read a markdown file relative to /sdcard/vault.

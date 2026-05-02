@@ -56,7 +56,9 @@ pub struct ReaderApp {
     power: PowerManager,
     event_pump: EventPump,
     md_files: Vec<String>,
+    browser_root_dir: String,
     browser: FileBrowserState,
+    settings_selected: usize,
     activity: Activity,
     reader_cache: Option<ReaderCache>,
     wifi_suspended_for_reader: bool,
@@ -105,6 +107,14 @@ impl ReaderApp {
 
         info!("Boot phase 1 complete");
 
+        let browser_root_dir = match hardware.storage.read_browser_root_dir() {
+            Ok(root) => root,
+            Err(e) => {
+                warn!("Failed to load browser root config: {}", e);
+                String::new()
+            }
+        };
+
         let mut app = Self {
             hardware,
             display,
@@ -115,11 +125,14 @@ impl ReaderApp {
             power: PowerManager::new(),
             event_pump: EventPump::new(),
             md_files,
+            browser_root_dir,
             browser: FileBrowserState::new_root(),
+            settings_selected: 0,
             activity: Activity::FileBrowser,
             reader_cache: None,
             wifi_suspended_for_reader: false,
         };
+        app.browser.current_dir = app.browser_root_dir.clone();
         app.reload_browser_entries(None);
         app.render_current_activity();
         app.flush_ui_refresh();
@@ -159,6 +172,7 @@ impl ReaderApp {
             AppEvent::BrowserMove(delta) => self.move_browser_selection(delta),
             AppEvent::BrowserConfirm => self.open_selected_file(),
             AppEvent::BrowserBack => self.handle_browser_back(),
+            AppEvent::BrowserOpenSettings => self.open_settings_page(),
             AppEvent::ReaderBack => {
                 if let Activity::Reader(reader) = self.activity {
                     self.on_exit_reader_mode();
@@ -170,6 +184,8 @@ impl ReaderApp {
             }
             AppEvent::ReaderMove(delta) => self.move_reader_page(delta),
             AppEvent::ReaderRefresh => self.render_current_file(),
+            AppEvent::SettingsMove(delta) => self.move_settings_selection(delta),
+            AppEvent::SettingsConfirm => self.confirm_settings_selection(),
             AppEvent::SettingsBack => {
                 if matches!(self.activity, Activity::Settings) {
                     self.activity = Activity::FileBrowser;
@@ -193,17 +209,38 @@ impl ReaderApp {
         }
     }
 
+    fn browser_is_at_root(&self) -> bool {
+        self.browser.current_dir == self.browser_root_dir
+    }
+
+    fn absolute_prefix_for_current_dir(&self) -> String {
+        if self.browser.current_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.browser.current_dir)
+        }
+    }
+
     fn reload_browser_entries(&mut self, selected_rel_path: Option<&str>) {
         let current_dir = self.browser.current_dir.clone();
+        let root_prefix = if self.browser_root_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.browser_root_dir)
+        };
+        let current_prefix = self.absolute_prefix_for_current_dir();
         let mut dirs: BTreeMap<String, String> = BTreeMap::new();
         let mut files: Vec<BrowserEntry> = Vec::new();
 
         for rel in &self.md_files {
-            if !current_dir.is_empty() {
-                let prefix = format!("{}/", current_dir);
-                if !rel.starts_with(&prefix) {
-                    continue;
-                }
+            if !root_prefix.is_empty()
+                && !(rel == &self.browser_root_dir || rel.starts_with(&root_prefix))
+            {
+                continue;
+            }
+
+            if !current_prefix.is_empty() && !rel.starts_with(&current_prefix) {
+                continue;
             }
 
             let rel_from_dir = if current_dir.is_empty() {
@@ -318,16 +355,28 @@ impl ReaderApp {
             return;
         }
 
-        if self.browser.is_at_root() {
-            self.activity = Activity::Settings;
-            self.render_settings_page();
+        if self.browser_is_at_root() {
             return;
         }
 
         let child_dir = self.browser.current_dir.clone();
-        self.browser.current_dir = self.browser.parent_dir();
+        let parent = self.browser.parent_dir();
+        self.browser.current_dir = if parent.len() < self.browser_root_dir.len() {
+            self.browser_root_dir.clone()
+        } else {
+            parent
+        };
         self.reload_browser_entries(Some(&child_dir));
         self.render_file_browser();
+    }
+
+    fn open_settings_page(&mut self) {
+        if !matches!(self.activity, Activity::FileBrowser) {
+            return;
+        }
+        self.settings_selected = 0;
+        self.activity = Activity::Settings;
+        self.render_settings_page();
     }
 
     fn on_enter_reader_mode(&mut self) {
@@ -392,16 +441,22 @@ impl ReaderApp {
     fn render_file_browser(&mut self) {
         self.display.clear(0xFF);
 
+        let title = if self.browser_is_at_root() {
+            "文件"
+        } else {
+            "文件 / 子目录"
+        };
+        self.display.draw_text_font(&self.ui_font, title, LIST_X, 8);
+
         if self.browser.entries.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
-                "没有笔记",
+                "此目录为空",
                 LIST_X,
                 LIST_TOP_Y,
                 Display::width() - LIST_RIGHT_MARGIN,
                 4,
             );
-            debug!("Rendering empty file browser");
             return;
         }
 
@@ -416,12 +471,12 @@ impl ReaderApp {
             let y = LIST_TOP_Y + row * row_height;
             let selected_row = idx == selected;
             if selected_row {
-                self.display.fill_rect(24, y - 3, 4, row_height - 8, 0x00);
+                self.display.fill_rect(30, y - 2, 2, row_height - 10, 0x00);
             }
 
             let entry = &self.browser.entries[idx];
             let display_name = if entry.is_dir {
-                format!("📁 {}", entry.name)
+                format!("{} /", entry.name)
             } else {
                 entry.name.clone()
             };
@@ -441,33 +496,25 @@ impl ReaderApp {
             (false, false) => "",
         };
 
-        let footer = if self.browser.is_at_root() {
-            if nav_hint.is_empty() {
-                format!(
-                    "{}/{}  OK 打开  Back 设置",
-                    selected + 1,
-                    self.browser.entries.len()
-                )
-            } else {
-                format!(
-                    "{}/{}  {}  OK 打开  Back 设置",
-                    selected + 1,
-                    self.browser.entries.len(),
-                    nav_hint
-                )
-            }
-        } else if nav_hint.is_empty() {
+        let footer_action = if self.browser_is_at_root() {
+            "OK 打开  Back(长按) 设置"
+        } else {
+            "OK 打开  Back 上级  Back(长按) 设置"
+        };
+        let footer = if nav_hint.is_empty() {
             format!(
-                "{}/{}  OK 打开  Back 返回",
+                "{}/{}  {}",
                 selected + 1,
-                self.browser.entries.len()
+                self.browser.entries.len(),
+                footer_action
             )
         } else {
             format!(
-                "{}/{}  {}  OK 打开  Back 返回",
+                "{}/{}  {}  {}",
                 selected + 1,
                 self.browser.entries.len(),
-                nav_hint
+                nav_hint,
+                footer_action
             )
         };
 
@@ -479,14 +526,18 @@ impl ReaderApp {
             Display::height() - self.ui_font.glyph_height as usize - 8,
         );
 
-        let path_title = if self.browser.is_at_root() {
-            "根目录".to_string()
+        let path_title = if self.browser.current_dir.is_empty() {
+            "/".to_string()
         } else {
-            format!("/{}/", self.browser.current_dir)
+            format!("/{}", self.browser.current_dir)
         };
         let path_title = truncate_for_width(&self.ui_font, &path_title, Display::width() - 48);
-        self.display
-            .draw_text_font(&self.ui_font, &path_title, LIST_X, 8);
+        self.display.draw_text_font(
+            &self.ui_font,
+            &path_title,
+            LIST_X,
+            Display::height() - self.ui_font.glyph_height as usize - 34,
+        );
 
         debug!(
             "Rendering file browser: dir='{}' selected {}/{}",
@@ -496,18 +547,96 @@ impl ReaderApp {
         );
     }
 
+    fn move_settings_selection(&mut self, delta: isize) {
+        if !matches!(self.activity, Activity::Settings) {
+            return;
+        }
+
+        let count = 2usize;
+        self.settings_selected =
+            (self.settings_selected as isize + delta).rem_euclid(count as isize) as usize;
+        self.render_settings_page();
+    }
+
+    fn confirm_settings_selection(&mut self) {
+        if !matches!(self.activity, Activity::Settings) {
+            return;
+        }
+
+        match self.settings_selected {
+            0 => self.apply_selected_dir_as_browser_root(),
+            1 => {
+                self.browser_root_dir.clear();
+                self.browser.current_dir.clear();
+                let _ = self.hardware.storage.write_browser_root_dir("");
+                self.reload_browser_entries(None);
+                self.render_settings_page();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_selected_dir_as_browser_root(&mut self) {
+        let selected = match self.browser.entries.get(self.browser.selected) {
+            Some(entry) if entry.is_dir => entry.rel_path.clone(),
+            _ => self.browser.current_dir.clone(),
+        };
+
+        self.browser_root_dir = selected.clone();
+        self.browser.current_dir = selected;
+        if let Err(e) = self
+            .hardware
+            .storage
+            .write_browser_root_dir(&self.browser_root_dir)
+        {
+            warn!("Failed to persist browser root dir: {}", e);
+        }
+        self.reload_browser_entries(None);
+        self.render_settings_page();
+    }
+
     fn render_settings_page(&mut self) {
         self.display.clear(0xFF);
 
         self.display
-            .draw_text_font(&self.ui_font, "设置", LIST_X, LIST_TOP_Y);
-        self.display.draw_text_wrapped(
+            .draw_text_font(&self.ui_font, "设置", LIST_X, 10);
+        self.display
+            .fill_rect(LIST_X, 34, Display::width() - 72, 1, 0x00);
+
+        let current_root = if self.browser_root_dir.is_empty() {
+            "/ (vault 根)".to_string()
+        } else {
+            format!("/{}", self.browser_root_dir)
+        };
+
+        let options = ["将当前目录设为文件根目录", "重置文件根目录为 vault 根"];
+
+        for (i, option) in options.iter().enumerate() {
+            let y = LIST_TOP_Y + 18 + i * (self.ui_font.glyph_height as usize + 20);
+            if i == self.settings_selected {
+                self.display
+                    .fill_rect(30, y - 2, 2, self.ui_font.glyph_height as usize + 4, 0x00);
+            }
+            self.display
+                .draw_text_font(&self.ui_font, option, LIST_X, y);
+        }
+
+        let root_line = format!("当前根目录: {}", current_root);
+        let root_line = truncate_for_width(&self.ui_font, &root_line, Display::width() - 48);
+        self.display.draw_text_font(
             &self.ui_font,
-            "Back 返回文件列表",
+            &root_line,
             LIST_X,
-            LIST_TOP_Y + self.ui_font.glyph_height as usize + 20,
-            Display::width() - LIST_RIGHT_MARGIN,
-            4,
+            Display::height() - self.ui_font.glyph_height as usize - 34,
+        );
+
+        let footer = "↑↓ 选择  OK 应用  Back 返回";
+        let footer_x = Display::width().saturating_sub(24 + self.ui_font.text_width(footer));
+        self.display.draw_text_font(
+            &self.ui_font,
+            footer,
+            footer_x,
+            Display::height() - self.ui_font.glyph_height as usize - 8,
         );
     }
 
