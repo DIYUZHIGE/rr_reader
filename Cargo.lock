@@ -1212,6 +1212,7 @@ dependencies = [
  "jpeg-decoder",
  "log",
  "pulldown-cmark",
+ "serde_json",
 ]
 
 [[package]]
