@@ -4,16 +4,20 @@ use core::convert::TryInto;
 use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
-};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{info, warn};
 
 #[derive(Clone, Debug)]
 pub enum WifiStatus {
     NotConfigured,
-    Connected { ssid: String, ip: String },
-    Failed { ssid: Option<String>, reason: String },
+    Connected {
+        ssid: String,
+        ip: String,
+    },
+    Failed {
+        ssid: Option<String>,
+        reason: String,
+    },
 }
 
 impl WifiStatus {
@@ -33,6 +37,8 @@ pub struct NetworkManager {
     modem: Option<Modem<'static>>,
     wifi: Option<BlockingWifi<EspWifi<'static>>>,
     status: WifiStatus,
+    last_credentials: Option<WifiCredentials>,
+    suspended: bool,
 }
 
 impl NetworkManager {
@@ -41,6 +47,8 @@ impl NetworkManager {
             modem: Some(modem),
             wifi: None,
             status: WifiStatus::NotConfigured,
+            last_credentials: None,
+            suspended: false,
         }
     }
 
@@ -65,8 +73,10 @@ impl NetworkManager {
             }
         };
 
-        match self.connect(credentials) {
+        match self.connect(credentials.clone()) {
             Ok(status) => {
+                self.last_credentials = Some(credentials);
+                self.suspended = false;
                 self.status = status;
             }
             Err(e) => {
@@ -79,6 +89,46 @@ impl NetworkManager {
         }
 
         self.status.clone()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        matches!(self.status, WifiStatus::Connected { .. })
+    }
+
+    pub fn suspend(&mut self) {
+        if let Some(wifi) = self.wifi.as_mut() {
+            if let Err(e) = wifi.disconnect() {
+                warn!("WiFi disconnect failed: {}", e);
+            }
+            if let Err(e) = wifi.stop() {
+                warn!("WiFi stop failed: {}", e);
+            }
+            self.suspended = true;
+            info!("WiFi suspended for reader mode");
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if !self.suspended {
+            return;
+        }
+        let Some(credentials) = self.last_credentials.clone() else {
+            return;
+        };
+        match self.connect(credentials) {
+            Ok(status) => {
+                self.suspended = false;
+                self.status = status;
+                info!("WiFi resumed after reader mode");
+            }
+            Err(e) => {
+                warn!("WiFi resume failed: {}", e);
+                self.status = WifiStatus::Failed {
+                    ssid: None,
+                    reason: e.to_string(),
+                };
+            }
+        }
     }
 
     fn connect(&mut self, credentials: WifiCredentials) -> Result<WifiStatus> {
@@ -128,7 +178,8 @@ impl NetworkManager {
 
         wifi.set_configuration(&configuration)?;
         wifi.start()?;
-        wifi.connect().map_err(|e| anyhow!("connect {}: {}", ssid, e))?;
+        wifi.connect()
+            .map_err(|e| anyhow!("connect {}: {}", ssid, e))?;
         wifi.wait_netif_up()
             .map_err(|e| anyhow!("wait DHCP {}: {}", ssid, e))?;
 
@@ -139,4 +190,3 @@ impl NetworkManager {
         Ok(WifiStatus::Connected { ssid, ip })
     }
 }
-

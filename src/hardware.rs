@@ -53,6 +53,14 @@ impl Hardware {
         self.network.connect_from_storage(&self.storage)
     }
 
+    pub fn suspend_wifi_for_reader(&mut self) {
+        self.network.suspend();
+    }
+
+    pub fn resume_wifi_after_reader(&mut self) {
+        self.network.resume();
+    }
+
     /// Update button state. Call once per loop iteration.
     pub fn update_inputs(&mut self) {
         self.input.update();

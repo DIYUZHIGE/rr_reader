@@ -110,6 +110,37 @@ impl Storage {
         ))
     }
 
+    pub fn resolve_asset_path_relative_to(
+        &self,
+        markdown_rel_path: &str,
+        asset_path: &str,
+    ) -> Result<String> {
+        let candidates = asset_candidate_relative_paths(markdown_rel_path, asset_path)?;
+        let vault_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+
+        for rel in &candidates {
+            let full = vault_root.join(rel);
+            if full.is_file() {
+                return Ok(full.to_string_lossy().to_string());
+            }
+        }
+
+        let asset_path = clean_asset_path(asset_path);
+        if let Some(file_name) = Path::new(&asset_path).file_name() {
+            if let Some(full) = self.find_vault_file_by_name(&vault_root, file_name)? {
+                if full.is_file() {
+                    return Ok(full.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "image not found: {} (tried {:?})",
+            asset_path,
+            candidates
+        ))
+    }
+
     pub fn markdown_file_len(&self, rel_path: &str) -> Result<usize> {
         let full = self.markdown_full_path(rel_path)?;
         let len = fs::metadata(&full)

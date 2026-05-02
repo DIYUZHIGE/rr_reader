@@ -11,7 +11,6 @@ use self::image::draw_reader_image;
 use self::markdown::{parse_markdown_blocks, preprocess_obsidian_embeds};
 use self::math::{draw_math_layout, draw_reader_math, layout_math, parse_math};
 use self::pagination::{font_for_style, paginate_blocks};
-use std::io::{BufRead, Read, Seek};
 
 pub const READER_X: usize = 24;
 pub const READER_TEXT_Y: usize = 42;
@@ -28,10 +27,10 @@ const IMAGE_PLACEHOLDER_HEIGHT: usize = 402;
 const INLINE_MATH_START: char = '\u{E000}';
 const INLINE_MATH_END: char = '\u{E001}';
 
-/// Number of rendered pages to keep in the sliding window cache.
-/// Window covers current_page ± WINDOW_RADIUS pages.
-pub const PAGE_CACHE_SIZE: usize = 5;
-const WINDOW_RADIUS: usize = PAGE_CACHE_SIZE / 2;
+/// Max number of rendered pages to keep in the sliding window cache.
+/// Actual window size is selected dynamically based on free heap.
+pub const PAGE_CACHE_SIZE_MAX: usize = 5;
+pub const PAGE_CACHE_SIZE_MIN: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderState {
@@ -50,8 +49,9 @@ pub struct ReaderCache {
     /// Total number of pages in this file
     pub page_count: usize,
     /// Sliding window of cached pages: [(page_index, page), ...]
-    /// Unused slots contain (0, None).
-    pub page_window: [(usize, Option<ReaderPage>); PAGE_CACHE_SIZE],
+    pub page_window: Vec<(usize, Option<ReaderPage>)>,
+    /// Active number of slots in `page_window`
+    pub window_len: usize,
     /// Starting page index of the current window
     pub window_start: usize,
 }
@@ -68,6 +68,7 @@ impl ReaderCache {
         if self
             .page_window
             .iter()
+            .take(self.window_len)
             .any(|(idx, page)| *idx == page_index && page.is_some())
         {
             return;
@@ -86,9 +87,10 @@ impl ReaderCache {
     }
 
     fn slide_window(&mut self, target_page: usize, fonts: &FontSet<'_>) {
+        let window_radius = self.window_len / 2;
         let new_start = target_page
-            .saturating_sub(WINDOW_RADIUS)
-            .min(self.page_count.saturating_sub(PAGE_CACHE_SIZE));
+            .saturating_sub(window_radius)
+            .min(self.page_count.saturating_sub(self.window_len));
 
         // Re-paginate all blocks to get fresh pages, then extract only the window
         let all_pages = paginate_blocks(&self.blocks, fonts);
@@ -100,8 +102,10 @@ impl ReaderCache {
             );
         }
 
-        self.page_window = core::array::from_fn(|_| (0, None));
-        let window_end = (new_start + PAGE_CACHE_SIZE).min(all_pages.len());
+        self.page_window.clear();
+        self.page_window
+            .resize_with(self.window_len.max(1), || (0, None));
+        let window_end = (new_start + self.window_len).min(all_pages.len());
         for (i, page) in all_pages
             .into_iter()
             .enumerate()
@@ -109,7 +113,7 @@ impl ReaderCache {
             .take(window_end.saturating_sub(new_start))
         {
             let slot = i - new_start;
-            if slot < PAGE_CACHE_SIZE {
+            if slot < self.window_len {
                 self.page_window[slot] = (i, Some(page));
             }
         }
@@ -230,14 +234,13 @@ pub fn markdown_blocks_and_pages(
     (blocks, pages)
 }
 
-pub fn draw_reader_page<F, R>(
+pub fn draw_reader_page<F>(
     display: &mut Display,
     fonts: &FontSet<'_>,
     page: &ReaderPage,
-    mut load_image: F,
+    mut resolve_image_path: F,
 ) where
-    F: FnMut(&str) -> Result<R>,
-    R: BufRead + Seek,
+    F: FnMut(&str) -> Result<String>,
 {
     for element in &page.elements {
         match element {
@@ -245,7 +248,7 @@ pub fn draw_reader_page<F, R>(
             PageElement::InlineLine(line) => draw_reader_inline_line(display, fonts, line),
             PageElement::Math(math) => draw_reader_math(display, fonts, math),
             PageElement::Image(image) => {
-                draw_reader_image(display, fonts.ui, image, &mut load_image)
+                draw_reader_image(display, fonts.ui, image, &mut resolve_image_path)
             }
         }
     }

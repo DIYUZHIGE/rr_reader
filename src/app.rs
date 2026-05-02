@@ -10,7 +10,7 @@ use crate::hardware::Hardware;
 use crate::power::PowerManager;
 use crate::reader::{
     draw_reader_page, markdown_blocks_and_pages, ReaderCache, ReaderPage, ReaderState,
-    PAGE_CACHE_SIZE, READER_X,
+    PAGE_CACHE_SIZE_MAX, PAGE_CACHE_SIZE_MIN, READER_X,
 };
 use anyhow::Result;
 use log::{info, warn};
@@ -55,6 +55,7 @@ pub struct ReaderApp {
     md_files: Vec<String>,
     activity: Activity,
     reader_cache: Option<ReaderCache>,
+    wifi_suspended_for_reader: bool,
 }
 
 impl ReaderApp {
@@ -125,6 +126,7 @@ impl ReaderApp {
                 first_visible: 0,
             }),
             reader_cache: None,
+            wifi_suspended_for_reader: false,
         };
         app.render_current_activity();
         app.flush_ui_refresh();
@@ -180,6 +182,7 @@ impl ReaderApp {
             AppEvent::BrowserConfirm => self.open_selected_file(),
             AppEvent::ReaderBack => {
                 if let Activity::Reader(reader) = self.activity {
+                    self.on_exit_reader_mode();
                     self.activity = Activity::FileBrowser(FileBrowserState {
                         selected: reader.file_index,
                         first_visible: self.browser_first_visible_for(reader.file_index),
@@ -273,11 +276,26 @@ impl ReaderApp {
             _ => return,
         };
 
+        self.on_enter_reader_mode();
         self.activity = Activity::Reader(ReaderState {
             file_index,
             page_index: 0,
         });
         self.render_current_file();
+    }
+
+    fn on_enter_reader_mode(&mut self) {
+        if !self.wifi_suspended_for_reader {
+            self.hardware.suspend_wifi_for_reader();
+            self.wifi_suspended_for_reader = true;
+        }
+    }
+
+    fn on_exit_reader_mode(&mut self) {
+        if self.wifi_suspended_for_reader {
+            self.hardware.resume_wifi_after_reader();
+            self.wifi_suspended_for_reader = false;
+        }
     }
 
     fn move_reader_page(&mut self, delta: isize) {
@@ -462,7 +480,7 @@ impl ReaderApp {
                     draw_reader_page(&mut self.display, &fonts, page, |image_path| {
                         self.hardware
                             .storage
-                            .open_asset_relative_to(&rel_path, image_path)
+                            .resolve_asset_path_relative_to(&rel_path, image_path)
                     });
                 }
                 let footer = format!("{}/{}", page_index + 1, page_count);
@@ -529,16 +547,31 @@ impl ReaderApp {
 
         // Parse blocks and paginate. We keep blocks for re-pagination and
         // only cache a sliding window of rendered pages to save RAM.
-        let (blocks, all_pages) = markdown_blocks_and_pages(&markdown, &fonts);
+        let (mut blocks, all_pages) = markdown_blocks_and_pages(&markdown, &fonts);
+
+        // Compact parsed markdown structures to reduce long-lived heap.
+        for block in &mut blocks {
+            block.text.shrink_to_fit();
+            block.prefix.shrink_to_fit();
+            if let Some(image) = block.image.as_mut() {
+                image.path.shrink_to_fit();
+                image.alt.shrink_to_fit();
+            }
+        }
+        blocks.shrink_to_fit();
+
         let page_count = all_pages.len().max(1);
+        let window_len = self.select_reader_window_len();
 
         // Build cache with first window of pages
-        let mut page_window: [(usize, Option<ReaderPage>); PAGE_CACHE_SIZE] =
-            core::array::from_fn(|_| (0, None));
+        let mut page_window: Vec<(usize, Option<ReaderPage>)> =
+            Vec::with_capacity(window_len.max(PAGE_CACHE_SIZE_MIN));
+        page_window.resize_with(window_len.max(PAGE_CACHE_SIZE_MIN), || (0, None));
+
         let window_start = 0usize;
-        let window_end = PAGE_CACHE_SIZE.min(page_count);
+        let window_end = window_len.min(page_count);
         for (i, page) in all_pages.into_iter().enumerate().take(window_end) {
-            if i < PAGE_CACHE_SIZE {
+            if i < window_len {
                 page_window[i] = (i, Some(page));
             }
         }
@@ -548,6 +581,7 @@ impl ReaderApp {
             blocks,
             page_count,
             page_window,
+            window_len,
             window_start,
         });
 
@@ -565,6 +599,15 @@ impl ReaderApp {
         }
 
         Ok(())
+    }
+
+    fn select_reader_window_len(&self) -> usize {
+        let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
+        if free_heap >= 120 * 1024 {
+            PAGE_CACHE_SIZE_MAX
+        } else {
+            PAGE_CACHE_SIZE_MIN
+        }
     }
 
     fn reader_page_count(&self) -> usize {

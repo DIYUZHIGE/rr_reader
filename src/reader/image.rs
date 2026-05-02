@@ -1,37 +1,26 @@
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
-use std::io::{BufRead, Read, Seek};
-use zune_jpeg::zune_core::colorspace::ColorSpace;
-use zune_jpeg::zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
+use esp_idf_hal::sys;
+use jpeg_decoder::Decoder as HeaderDecoder;
+use std::ffi::CString;
+use std::fs::File;
+use std::io::BufReader;
+use std::os::raw::c_void;
 
 use crate::display::Display;
 use crate::font::Font;
 
 use super::{RenderImage, QUOTE_BAR_WIDTH, QUOTE_INDENT, READER_X};
 
-const JPEG_DECODE_MAX_WIDTH: usize = 256;
-const JPEG_DECODE_MAX_HEIGHT: usize = 256;
-const MAX_JPEG_DIMENSION: u16 = 4096;
-/// Max pixels for the grayscale decode buffer (1 byte/pixel).
-/// 64KB allows up to 256x256 full decode.
-const MAX_DECODE_PIXELS: usize = 64 * 1024;
+const MAX_JPEG_DIMENSION: usize = 4096;
 
-#[derive(Debug)]
-struct DecodedImage {
-    width: usize,
-    height: usize,
-    pixels: Vec<u8>,
-}
-
-pub(super) fn draw_reader_image<F, R>(
+pub(super) fn draw_reader_image<F>(
     display: &mut Display,
     ui_font: &Font,
     image: &RenderImage,
-    load_image: &mut F,
+    resolve_image_path: &mut F,
 ) where
-    F: FnMut(&str) -> Result<R>,
-    R: BufRead + Seek,
+    F: FnMut(&str) -> Result<String>,
 {
     for depth in 0..image.quote_depth {
         let x = READER_X + depth * QUOTE_INDENT;
@@ -39,24 +28,10 @@ pub(super) fn draw_reader_image<F, R>(
     }
 
     if is_jpeg_path(&image.path) {
-        if let Ok(decoded) = load_image(&image.path)
-            .and_then(|reader| decode_jpeg_to_mono(reader, image.width, image.height))
-        {
-            let (target_width, target_height) = fit_dimensions_allow_upscale(
-                decoded.width,
-                decoded.height,
-                image.width,
-                image.height,
-            );
-            let x = image.x + image.width.saturating_sub(target_width) / 2;
-            display.draw_mono_bitmap_scaled(
-                x,
-                image.y,
-                (decoded.width, decoded.height),
-                (target_width, target_height),
-                &decoded.pixels,
-            );
-            return;
+        if let Ok(full_path) = resolve_image_path(&image.path) {
+            if draw_jpeg_streaming(display, &full_path, image).is_ok() {
+                return;
+            }
         }
     }
 
@@ -102,151 +77,130 @@ fn is_jpeg_path(path: &str) -> bool {
     lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
-fn decode_jpeg_to_mono<R: BufRead + Seek>(
-    reader: R,
-    max_width: usize,
-    max_height: usize,
-) -> Result<DecodedImage> {
-    FreeRtos::delay_ms(1);
-
-    // Use grayscale output (Luma) for 1 byte/pixel -- 3x less memory than RGB.
-    let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
-
-    let mut decoder = JpegDecoder::new_with_options(reader, options);
-
-    decoder
-        .decode_headers()
-        .map_err(|e| anyhow!("jpeg decode headers: {:?}", e))?;
-
-    let info = decoder.info().ok_or_else(|| anyhow!("jpeg info missing"))?;
-
-    let src_w = info.width as usize;
-    let src_h = info.height as usize;
-
-    if info.width > MAX_JPEG_DIMENSION || info.height > MAX_JPEG_DIMENSION {
-        return Err(anyhow!(
-            "jpeg dimensions too large: {}x{}",
-            info.width,
-            info.height
-        ));
-    }
-
-    if src_w == 0 || src_h == 0 {
-        return Err(anyhow!("jpeg has zero dimension"));
-    }
-
-    // Check that grayscale output fits in our decode buffer.
-    let decode_pixels = src_w.saturating_mul(src_h);
-    if decode_pixels > MAX_DECODE_PIXELS {
-        return Err(anyhow!(
-            "jpeg too large for decode buffer: {}x{} = {} px (limit {})",
-            src_w,
-            src_h,
-            decode_pixels,
-            MAX_DECODE_PIXELS
-        ));
-    }
-
-    // Decode directly to grayscale.
-    FreeRtos::delay_ms(1);
-    let gray = decoder
-        .decode()
-        .map_err(|e| anyhow!("jpeg decode: {:?}", e))?;
-    FreeRtos::delay_ms(1);
-
-    if gray.len() < src_w * src_h {
-        return Err(anyhow!(
-            "jpeg output too small: {} bytes, expected {}",
-            gray.len(),
-            src_w * src_h
-        ));
-    }
-
-    let decode_max_width = max_width.clamp(1, JPEG_DECODE_MAX_WIDTH);
-    let decode_max_height = max_height.clamp(1, JPEG_DECODE_MAX_HEIGHT);
-
-    let (target_width, target_height) =
-        fit_dimensions(src_w, src_h, decode_max_width, decode_max_height);
-
-    // Convert grayscale to mono (threshold) + nearest-neighbour scale in one pass.
-    let mono = gray_to_mono_nearest(&gray, src_w, src_h, target_width, target_height)?;
-
-    Ok(DecodedImage {
-        width: target_width,
-        height: target_height,
-        pixels: mono,
-    })
-}
-
-/// Downscale dimensions to fit within `max_w x max_h`, preserving aspect ratio.
-fn fit_dimensions(src_w: usize, src_h: usize, max_w: usize, max_h: usize) -> (usize, usize) {
-    let src_w = src_w.max(1);
-    let src_h = src_h.max(1);
-    let max_w = max_w.max(1);
-    let max_h = max_h.max(1);
-
-    if src_w <= max_w && src_h <= max_h {
-        return (src_w, src_h);
-    }
-
-    let h_by_w = src_h.saturating_mul(max_w) / src_w;
-    if h_by_w <= max_h {
-        (max_w, h_by_w.max(1))
-    } else {
-        (src_w.saturating_mul(max_h) / src_h.max(1), max_h)
-    }
-}
-
-/// Fit dimensions into `max_w x max_h`, allowing upscale for images smaller than the max.
-fn fit_dimensions_allow_upscale(
-    src_w: usize,
-    src_h: usize,
+struct DrawCtx<'a> {
+    display: &'a mut Display,
+    draw_x: usize,
+    draw_y: usize,
     max_w: usize,
     max_h: usize,
-) -> (usize, usize) {
-    let src_w = src_w.max(1);
-    let src_h = src_h.max(1);
-    let max_w = max_w.max(1);
-    let max_h = max_h.max(1);
-
-    let h_by_w = src_h.saturating_mul(max_w) / src_w;
-    if h_by_w <= max_h {
-        (max_w, h_by_w.max(1))
-    } else {
-        (src_w.saturating_mul(max_h) / src_h, max_h)
-    }
 }
 
-/// Convert a grayscale (Luma) buffer to mono (black/white) with nearest-neighbour
-/// downscaling. Returns a fresh `Vec` so the caller can drop the large decode
-/// buffer as soon as the conversion finishes.
-fn gray_to_mono_nearest(
-    gray: &[u8],
-    src_w: usize,
-    src_h: usize,
-    target_w: usize,
-    target_h: usize,
-) -> Result<Vec<u8>> {
-    let target_len = target_w.saturating_mul(target_h);
-    let mut mono = Vec::with_capacity(target_len);
-
-    for y in 0..target_h {
-        let src_y = y.saturating_mul(src_h) / target_h;
-        let row_start = src_y.saturating_mul(src_w);
-
-        for x in 0..target_w {
-            let src_x = x.saturating_mul(src_w) / target_w;
-            let gray_val = gray.get(row_start + src_x).copied().unwrap_or(0xFF);
-            // Threshold: < 150 -> black, >= 150 -> white.
-            // Matches the previous jpeg-decoder behaviour.
-            mono.push(if gray_val < 150 { 0x00 } else { 0xFF });
-        }
-
-        // Yield to FreeRTOS every 24 rows so the watchdog doesn't fire.
-        if y % 24 == 0 {
-            FreeRtos::delay_ms(1);
-        }
+unsafe extern "C" fn jpeg_gray_block_cb(
+    ctx: *mut c_void,
+    gray: *const u8,
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+) -> i32 {
+    if ctx.is_null() || gray.is_null() {
+        return 0;
     }
 
-    Ok(mono)
+    let ctx = &mut *(ctx as *mut DrawCtx<'_>);
+    let bw = (right as usize)
+        .saturating_sub(left as usize)
+        .saturating_add(1);
+    let bh = (bottom as usize)
+        .saturating_sub(top as usize)
+        .saturating_add(1);
+    if bw == 0 || bh == 0 {
+        return 1;
+    }
+
+    let dx = ctx.draw_x + left as usize;
+    let dy = ctx.draw_y + top as usize;
+
+    if left as usize >= ctx.max_w || top as usize >= ctx.max_h {
+        return 1;
+    }
+
+    let draw_w = bw.min(ctx.max_w.saturating_sub(left as usize));
+    let draw_h = bh.min(ctx.max_h.saturating_sub(top as usize));
+    let src = std::slice::from_raw_parts(gray, bw.saturating_mul(bh));
+
+    if draw_w == bw && draw_h == bh {
+        ctx.display.draw_mono_bitmap(dx, dy, bw, bh, src);
+        return 1;
+    }
+
+    let mut clipped = Vec::with_capacity(draw_w.saturating_mul(draw_h));
+    for row in 0..draw_h {
+        let start = row.saturating_mul(bw);
+        let end = start.saturating_add(draw_w).min(src.len());
+        clipped.extend_from_slice(&src[start..end]);
+    }
+    ctx.display
+        .draw_mono_bitmap(dx, dy, draw_w, draw_h, &clipped);
+    1
+}
+
+fn draw_jpeg_streaming(display: &mut Display, full_path: &str, image: &RenderImage) -> Result<()> {
+    let (src_w, src_h) = read_jpeg_size(full_path)?;
+
+    if src_w == 0 || src_h == 0 || src_w > MAX_JPEG_DIMENSION || src_h > MAX_JPEG_DIMENSION {
+        return Err(anyhow!("jpeg dimension unsupported: {}x{}", src_w, src_h));
+    }
+
+    let scale = choose_tjpgd_scale(src_w, src_h, image.width, image.height);
+    let dec_w = scaled_dim(src_w, scale);
+
+    let draw_x = image.x + image.width.saturating_sub(dec_w) / 2;
+    let draw_y = image.y;
+
+    let c_path = CString::new(full_path).map_err(|_| anyhow!("invalid image path"))?;
+    let mut out_w: u16 = 0;
+    let mut out_h: u16 = 0;
+
+    let mut ctx = DrawCtx {
+        display,
+        draw_x,
+        draw_y,
+        max_w: image.width,
+        max_h: image.height,
+    };
+
+    let rc = unsafe {
+        sys::rr_decode_jpeg_streaming(
+            c_path.as_ptr(),
+            scale,
+            Some(jpeg_gray_block_cb),
+            (&mut ctx as *mut DrawCtx<'_>).cast::<c_void>(),
+            &mut out_w,
+            &mut out_h,
+        )
+    };
+
+    if rc != 0 {
+        return Err(anyhow!("tjpgd decode failed: {}", rc));
+    }
+
+    FreeRtos::delay_ms(1);
+    Ok(())
+}
+
+fn read_jpeg_size(path: &str) -> Result<(usize, usize)> {
+    let file = File::open(path).map_err(|e| anyhow!("open {}: {}", path, e))?;
+    let mut decoder = HeaderDecoder::new(BufReader::new(file));
+    decoder
+        .read_info()
+        .map_err(|e| anyhow!("jpeg read header {}: {:?}", path, e))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| anyhow!("jpeg header missing"))?;
+    Ok((info.width as usize, info.height as usize))
+}
+
+fn choose_tjpgd_scale(src_w: usize, src_h: usize, max_w: usize, max_h: usize) -> u8 {
+    for scale in 0..=3u8 {
+        if scaled_dim(src_w, scale) <= max_w.max(1) && scaled_dim(src_h, scale) <= max_h.max(1) {
+            return scale;
+        }
+    }
+    3
+}
+
+fn scaled_dim(dim: usize, scale: u8) -> usize {
+    let div = 1usize << scale;
+    dim.saturating_add(div - 1) / div
 }
