@@ -26,10 +26,6 @@ impl FileBrowserState {
         }
     }
 
-    pub fn is_at_root(&self) -> bool {
-        self.current_dir.is_empty()
-    }
-
     pub fn parent_dir(&self) -> String {
         if self.current_dir.is_empty() {
             return String::new();

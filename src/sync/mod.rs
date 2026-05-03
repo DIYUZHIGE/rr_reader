@@ -1,5 +1,8 @@
+mod manifest;
+mod path_codec;
+mod xml_stream;
+
 use crate::storage::RemotelySaveConfig;
-use crate::time;
 use ::time::OffsetDateTime;
 use anyhow::{anyhow, Result};
 use esp_idf_hal::delay::FreeRtos;
@@ -12,7 +15,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use manifest::{delete_stale_manifest_files, read_sync_manifest, write_status_file};
+use path_codec::{encode_path_segments, is_internal_marker, key_to_local_path, percent_encode};
+use xml_stream::{ListXmlStreamParser, RemoteEntry};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -20,7 +27,6 @@ const VAULT_ROOT: &str = "/sdcard/vault";
 const SYNC_STATUS_PATH: &str = "/sdcard/vault/.rr_sync_status";
 const EMPTY_PAYLOAD_SHA256: &str = "UNSIGNED-PAYLOAD";
 const LIST_MAX_KEYS: usize = 6;
-const LIST_BODY_LIMIT: usize = 20 * 1024;
 const ERROR_BODY_LIMIT: usize = 2 * 1024;
 const OBJECT_KEY_MAX_BYTES: usize = 768;
 const LOCAL_PATH_MAX_BYTES: usize = 1024;
@@ -63,17 +69,165 @@ pub struct SyncReport {
     pub status_path: String,
 }
 
-struct RemoteEntry {
-    key: String,
-    size: u64,
-    etag: String,
-}
-
 #[derive(Clone, Debug)]
 struct SyncManifestEntry {
     size: u64,
     etag: String,
     local_path: String,
+}
+
+#[derive(Default)]
+struct SyncCounters {
+    downloaded: usize,
+    skipped: usize,
+    skipped_unchanged: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SyncPageProgress {
+    total_in_page: usize,
+    processed_in_page: usize,
+}
+
+#[derive(Clone, Debug)]
+struct EntryContext {
+    target_path: PathBuf,
+    target_path_str: String,
+}
+
+fn classify_skip_reason(key: &str) -> Option<&'static str> {
+    if key.ends_with('/') {
+        return Some("directory marker");
+    }
+    if is_internal_marker(key) {
+        return Some("internal marker");
+    }
+    if key.len() > OBJECT_KEY_MAX_BYTES {
+        return Some("object key too long");
+    }
+    if key.rsplit('/').next().unwrap_or(key).len() > 200 {
+        return Some("file name too long");
+    }
+    None
+}
+
+fn build_entry_context(config: &RemotelySaveConfig, key: &str) -> Result<EntryContext> {
+    let target_path = key_to_local_path(config, key)?;
+    let target_path_str = target_path.to_string_lossy().to_string();
+
+    if target_path_str.len() > LOCAL_PATH_MAX_BYTES {
+        return Err(anyhow!(
+            "local path too long ({} bytes): {}",
+            target_path_str.len(),
+            target_path_str
+        ));
+    }
+
+    Ok(EntryContext {
+        target_path,
+        target_path_str,
+    })
+}
+
+fn should_skip_unchanged(
+    entry: &RemoteEntry,
+    target_path: &Path,
+    previous_manifest: &HashMap<String, SyncManifestEntry>,
+) -> bool {
+    let Ok(meta) = fs::metadata(target_path) else {
+        return false;
+    };
+
+    let manifest_matches = previous_manifest
+        .get(&entry.key)
+        .map(|old| old.size == entry.size && !old.etag.is_empty() && old.etag == entry.etag)
+        .unwrap_or(false);
+
+    let legacy_size_only_match = entry.etag.is_empty() && meta.len() == entry.size;
+
+    meta.len() == entry.size && (manifest_matches || legacy_size_only_match)
+}
+
+fn track_manifest_entry(
+    manifest: &mut HashMap<String, SyncManifestEntry>,
+    entry: &RemoteEntry,
+    local_path: &str,
+) {
+    manifest.insert(
+        entry.key.clone(),
+        SyncManifestEntry {
+            size: entry.size,
+            etag: entry.etag.clone(),
+            local_path: local_path.to_string(),
+        },
+    );
+}
+
+fn process_remote_entry(
+    config: &RemotelySaveConfig,
+    entry: &RemoteEntry,
+    page_progress: &SyncPageProgress,
+    counters: &mut SyncCounters,
+    previous_manifest: &HashMap<String, SyncManifestEntry>,
+    new_manifest: &mut HashMap<String, SyncManifestEntry>,
+    seen_keys: &mut HashSet<String>,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let key = entry.key.as_str();
+
+    if let Some(reason) = classify_skip_reason(key) {
+        info!("Skip {}: {}", key, reason);
+        counters.skipped += 1;
+        return Ok(());
+    }
+
+    let ctx = match build_entry_context(config, key) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Skip {}: {}", key, e);
+            counters.skipped += 1;
+            return Ok(());
+        }
+    };
+
+    seen_keys.insert(entry.key.clone());
+
+    if should_skip_unchanged(entry, &ctx.target_path, previous_manifest) {
+        counters.skipped_unchanged += 1;
+        track_manifest_entry(new_manifest, entry, &ctx.target_path_str);
+        return Ok(());
+    }
+
+    if page_progress.processed_in_page % 10 == 0
+        || page_progress.processed_in_page == page_progress.total_in_page
+    {
+        let name = key.rsplit('/').next().unwrap_or(key);
+        on_progress(&format!(
+            "下载: {} ({}/{})",
+            name,
+            counters.downloaded + 1,
+            page_progress.processed_in_page
+        ));
+    }
+
+    if let Some(parent) = ctx.target_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| anyhow!("mkdir {:?}: {}", parent, e))?;
+    }
+
+    let object_url = build_object_url(config, key)?;
+    match download_file_signed(config, &object_url, &ctx.target_path_str, entry.size) {
+        Ok(()) => {
+            counters.downloaded += 1;
+            track_manifest_entry(new_manifest, entry, &ctx.target_path_str);
+        }
+        Err(e) => {
+            warn!("Download failed for {}: {}", key, e);
+            counters.skipped += 1;
+            FreeRtos::delay_ms(200);
+        }
+    }
+
+    Ok(())
 }
 
 pub fn sync_vault_from_s3_config(
@@ -84,10 +238,7 @@ pub fn sync_vault_from_s3_config(
     on_progress("正在同步时间...");
     ensure_time_synced()?;
 
-    let mut downloaded = 0usize;
-    let mut skipped = 0usize;
-    let mut skipped_unchanged = 0usize;
-
+    let mut counters = SyncCounters::default();
     let mut continuation_token: Option<String> = None;
     let mut page = 0usize;
     let previous_manifest = read_sync_manifest();
@@ -99,121 +250,28 @@ pub fn sync_vault_from_s3_config(
         on_progress(&format!("获取文件列表 第{}页...", page));
         let list_url = build_list_url(config, continuation_token.as_deref())?;
         info!("Listing remote objects: {}", list_url);
-        let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
 
+        let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
         if entries.is_empty() && next_token.is_none() {
             break;
         }
 
         let total_in_page = entries.len();
-        let mut processed_in_page = 0usize;
-
-        for entry in entries {
-            processed_in_page += 1;
-            let key = &entry.key;
-
-            if key.ends_with('/') {
-                skipped += 1;
-                continue;
-            }
-
-            if is_internal_marker(key) {
-                skipped += 1;
-                continue;
-            }
-
-            if key.len() > OBJECT_KEY_MAX_BYTES {
-                warn!(
-                    "Skipping file with very long object key ({} bytes): {}",
-                    key.len(),
-                    key
-                );
-                skipped += 1;
-                continue;
-            }
-
-            // ESP32 FAT driver rejects filenames longer than ~200 chars
-            if key.rsplit('/').next().unwrap_or(key.as_str()).len() > 200 {
-                warn!(
-                    "Skipping file with very long name ({} chars): {}",
-                    key.len(),
-                    key
-                );
-                skipped += 1;
-                continue;
-            }
-
-            let target = key_to_local_path(config, key)?;
-            let target_str = target.to_string_lossy().to_string();
-            if target_str.len() > LOCAL_PATH_MAX_BYTES {
-                warn!(
-                    "Skipping file with very long local path ({} bytes): {}",
-                    target_str.len(),
-                    target_str
-                );
-                skipped += 1;
-                continue;
-            }
-            seen_keys.insert(key.to_string());
-
-            // Skip only when both local size and the previous ETag match the remote entry.
-            // Size-only comparisons can miss changed files with identical byte length.
-            if let Ok(meta) = fs::metadata(&target) {
-                let manifest_matches = previous_manifest
-                    .get(key)
-                    .map(|old| {
-                        old.size == entry.size && !old.etag.is_empty() && old.etag == entry.etag
-                    })
-                    .unwrap_or(false);
-                let legacy_size_only_match = entry.etag.is_empty() && meta.len() == entry.size;
-                if meta.len() == entry.size && (manifest_matches || legacy_size_only_match) {
-                    skipped_unchanged += 1;
-                    new_manifest.insert(
-                        key.to_string(),
-                        SyncManifestEntry {
-                            size: entry.size,
-                            etag: entry.etag.clone(),
-                            local_path: target_str.clone(),
-                        },
-                    );
-                    continue;
-                }
-            }
-
-            // Show progress every 10 files or on last file in page
-            if processed_in_page % 10 == 0 || processed_in_page == total_in_page {
-                let name = key.rsplit('/').next().unwrap_or(key);
-                on_progress(&format!(
-                    "下载: {} ({}/{})",
-                    name,
-                    downloaded + 1,
-                    processed_in_page
-                ));
-            }
-
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| anyhow!("mkdir {:?}: {}", parent, e))?;
-            }
-            let object_url = build_object_url(config, key)?;
-            match download_file_signed(config, &object_url, &target_str, entry.size) {
-                Ok(()) => {
-                    downloaded += 1;
-                    new_manifest.insert(
-                        key.to_string(),
-                        SyncManifestEntry {
-                            size: entry.size,
-                            etag: entry.etag.clone(),
-                            local_path: target_str.clone(),
-                        },
-                    );
-                }
-                Err(e) => {
-                    warn!("Download failed for {}: {}", key, e);
-                    skipped += 1;
-                    // Brief pause to let stack recover
-                    FreeRtos::delay_ms(200);
-                }
-            }
+        for (idx, entry) in entries.iter().enumerate() {
+            let page_progress = SyncPageProgress {
+                total_in_page,
+                processed_in_page: idx + 1,
+            };
+            process_remote_entry(
+                config,
+                entry,
+                &page_progress,
+                &mut counters,
+                &previous_manifest,
+                &mut new_manifest,
+                &mut seen_keys,
+                on_progress,
+            )?;
         }
 
         continuation_token = next_token;
@@ -222,8 +280,8 @@ pub fn sync_vault_from_s3_config(
         }
     }
 
-    if skipped_unchanged > 0 {
-        info!("Skipped {} files (unchanged)", skipped_unchanged);
+    if counters.skipped_unchanged > 0 {
+        info!("Skipped {} files (unchanged)", counters.skipped_unchanged);
     }
 
     let deleted_stale = delete_stale_manifest_files(&previous_manifest, &seen_keys)?;
@@ -232,11 +290,17 @@ pub fn sync_vault_from_s3_config(
     }
 
     on_progress("正在写入状态文件...");
-    write_status_file(config, downloaded, skipped, deleted_stale, &new_manifest)?;
+    write_status_file(
+        config,
+        counters.downloaded,
+        counters.skipped,
+        deleted_stale,
+        &new_manifest,
+    )?;
 
     Ok(SyncReport {
-        downloaded_files: downloaded,
-        skipped_files: skipped,
+        downloaded_files: counters.downloaded,
+        skipped_files: counters.skipped,
         deleted_files: deleted_stale,
         status_path: SYNC_STATUS_PATH.to_string(),
     })
@@ -343,210 +407,6 @@ fn object_base_url(config: &RemotelySaveConfig) -> Result<String> {
     Ok(format!("{}://{}.{}", scheme, config.bucket_name, host))
 }
 
-fn parse_list_response(xml: &str) -> (Vec<RemoteEntry>, Option<String>) {
-    let mut entries = Vec::new();
-    let mut next_token = None;
-    let mut rest = xml;
-
-    // Parse <Contents> blocks
-    loop {
-        let Some(contents_start) = rest.find("<Contents>") else {
-            break;
-        };
-        let after_cs = &rest[contents_start + 10..];
-        let Some(contents_end) = after_cs.find("</Contents>") else {
-            break;
-        };
-        let block = &after_cs[..contents_end];
-
-        // Extract <Key>
-        let key = extract_xml_text_owned(block, "<Key>", "</Key>").unwrap_or_default();
-        // Extract <Size>
-        let size_str = extract_xml_text_ref(block, "<Size>", "</Size>").unwrap_or("0");
-        let size: u64 = size_str.parse().unwrap_or(0);
-        let etag = extract_xml_text_owned(block, "<ETag>", "</ETag>")
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-
-        if !key.is_empty() {
-            entries.push(RemoteEntry { key, size, etag });
-        }
-
-        rest = &after_cs[contents_end + 12..];
-    }
-
-    // Parse NextContinuationToken
-    if let Some(start) = xml.find("<NextContinuationToken>") {
-        let after_start = &xml[start + 23..];
-        if let Some(end) = after_start.find("</NextContinuationToken>") {
-            let token = xml_unescape(&after_start[..end]);
-            if !token.is_empty() {
-                next_token = Some(token);
-            }
-        }
-    }
-
-    (entries, next_token)
-}
-
-fn extract_xml_text_ref<'a>(xml: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = xml.find(open)?;
-    let after = &xml[start + open.len()..];
-    let end = after.find(close)?;
-    Some(&after[..end])
-}
-
-fn extract_xml_text_owned(xml: &str, open: &str, close: &str) -> Option<String> {
-    extract_xml_text_ref(xml, open, close).map(xml_unescape)
-}
-
-const XML_CONTENTS_OPEN: &[u8] = b"<Contents>";
-const XML_CONTENTS_CLOSE: &[u8] = b"</Contents>";
-const XML_KEY_OPEN: &[u8] = b"<Key>";
-const XML_KEY_CLOSE: &[u8] = b"</Key>";
-const XML_SIZE_OPEN: &[u8] = b"<Size>";
-const XML_SIZE_CLOSE: &[u8] = b"</Size>";
-const XML_ETAG_OPEN: &[u8] = b"<ETag>";
-const XML_ETAG_CLOSE: &[u8] = b"</ETag>";
-const XML_NEXT_TOKEN_OPEN: &[u8] = b"<NextContinuationToken>";
-const XML_NEXT_TOKEN_CLOSE: &[u8] = b"</NextContinuationToken>";
-const XML_STREAM_BUFFER_LIMIT: usize = 8 * 1024;
-
-struct ListXmlStreamParser {
-    buf: Vec<u8>,
-    entries: Vec<RemoteEntry>,
-    next_token: Option<String>,
-}
-
-impl ListXmlStreamParser {
-    fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(2048),
-            entries: Vec::new(),
-            next_token: None,
-        }
-    }
-
-    fn push(&mut self, incoming: &[u8]) -> Result<()> {
-        self.buf.extend_from_slice(incoming);
-        self.consume_complete_blocks();
-        self.capture_next_token_if_present();
-        self.trim_prefix();
-
-        if self.buf.len() > XML_STREAM_BUFFER_LIMIT {
-            return Err(anyhow!(
-                "list XML parser buffer exceeded {} bytes",
-                XML_STREAM_BUFFER_LIMIT
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<(Vec<RemoteEntry>, Option<String>)> {
-        self.consume_complete_blocks();
-        self.capture_next_token_if_present();
-        Ok((self.entries, self.next_token))
-    }
-
-    fn consume_complete_blocks(&mut self) {
-        loop {
-            let Some(start) = find_subslice(&self.buf, XML_CONTENTS_OPEN) else {
-                break;
-            };
-            let after_start = start + XML_CONTENTS_OPEN.len();
-            let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_CONTENTS_CLOSE) else {
-                break;
-            };
-            let end = after_start + rel_end;
-
-            let block = &self.buf[after_start..end];
-            let key = extract_xml_text_bytes(block, XML_KEY_OPEN, XML_KEY_CLOSE)
-                .map(|s| xml_unescape(&s))
-                .unwrap_or_default();
-            let size = extract_xml_text_bytes(block, XML_SIZE_OPEN, XML_SIZE_CLOSE)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            let etag = extract_xml_text_bytes(block, XML_ETAG_OPEN, XML_ETAG_CLOSE)
-                .map(|s| xml_unescape(&s).trim_matches('"').to_string())
-                .unwrap_or_default();
-
-            if !key.is_empty() {
-                self.entries.push(RemoteEntry { key, size, etag });
-            }
-
-            let consume_end = end + XML_CONTENTS_CLOSE.len();
-            self.buf.drain(..consume_end);
-        }
-    }
-
-    fn capture_next_token_if_present(&mut self) {
-        if self.next_token.is_some() {
-            return;
-        }
-
-        let Some(start) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) else {
-            return;
-        };
-        let after_start = start + XML_NEXT_TOKEN_OPEN.len();
-        let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_NEXT_TOKEN_CLOSE) else {
-            return;
-        };
-        let end = after_start + rel_end;
-        let token_raw = String::from_utf8_lossy(&self.buf[after_start..end]).to_string();
-        let token = xml_unescape(&token_raw);
-        if !token.is_empty() {
-            self.next_token = Some(token);
-        }
-    }
-
-    fn trim_prefix(&mut self) {
-        if self.buf.len() <= XML_STREAM_BUFFER_LIMIT / 2 {
-            return;
-        }
-
-        if let Some(pos) = find_subslice(&self.buf, XML_CONTENTS_OPEN) {
-            if pos > 0 {
-                self.buf.drain(..pos);
-            }
-            return;
-        }
-
-        if let Some(pos) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) {
-            if pos > 0 {
-                self.buf.drain(..pos);
-            }
-            return;
-        }
-
-        let keep = XML_STREAM_BUFFER_LIMIT / 4;
-        if self.buf.len() > keep {
-            let drop_len = self.buf.len() - keep;
-            self.buf.drain(..drop_len);
-        }
-    }
-}
-
-fn extract_xml_text_bytes(haystack: &[u8], open: &[u8], close: &[u8]) -> Option<String> {
-    let start = find_subslice(haystack, open)? + open.len();
-    let rel_end = find_subslice(&haystack[start..], close)?;
-    let end = start + rel_end;
-    Some(String::from_utf8_lossy(&haystack[start..end]).to_string())
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn http_get_text_signed(config: &RemotelySaveConfig, url: &str) -> Result<String> {
-    let bytes = http_get_bytes_signed_limited(config, url, LIST_BODY_LIMIT)?;
-    String::from_utf8(bytes).map_err(|e| anyhow!("utf8 decode {}: {}", url, e))
-}
-
 fn http_list_objects_signed(
     config: &RemotelySaveConfig,
     url: &str,
@@ -628,39 +488,6 @@ fn http_list_objects_signed_once(
     }
 
     parser.finish()
-}
-
-fn http_get_bytes_signed_limited(
-    config: &RemotelySaveConfig,
-    url: &str,
-    max_body_bytes: usize,
-) -> Result<Vec<u8>> {
-    let parsed = parse_url(url)?;
-    let candidates = signing_candidates(config, &parsed.host);
-    let timestamp = resolve_signing_timestamp(url)?;
-
-    let mut last_error: Option<anyhow::Error> = None;
-    for candidate in candidates {
-        match http_get_bytes_signed_once(
-            config,
-            url,
-            &parsed,
-            &candidate,
-            &timestamp,
-            max_body_bytes,
-        ) {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                warn!(
-                    "Signed GET failed with service={} region={}: {}",
-                    candidate.service, candidate.region, e
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("signed GET failed")))
 }
 
 /// Stream a signed GET response directly to a file in small signed Range
@@ -1172,63 +999,6 @@ fn wait_for_download_heap(tag: &str) {
     }
 }
 
-fn http_get_bytes_signed_once(
-    config: &RemotelySaveConfig,
-    url: &str,
-    parsed: &ParsedUrl,
-    candidate: &SigningCandidate,
-    timestamp: &SigningTimestamp,
-    max_body_bytes: usize,
-) -> Result<Vec<u8>> {
-    let signing = signing_material(config, parsed, "GET", candidate, timestamp, &[])?;
-
-    let config_http = HttpConfiguration {
-        buffer_size: Some(2048),
-        buffer_size_tx: Some(1024),
-        timeout: Some(core::time::Duration::from_secs(30)),
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(attach_crt_bundle),
-        ..Default::default()
-    };
-    wait_for_download_heap("signed GET request init");
-    let mut connection = EspHttpConnection::new(&config_http)?;
-
-    let auth_header = signing.authorization;
-    let request_date = signing.request_date;
-    let payload_hash = signing.payload_hash;
-
-    let headers = [
-        ("Host", parsed.host.as_str()),
-        ("x-oss-date", request_date.as_str()),
-        ("x-oss-content-sha256", payload_hash.as_str()),
-        ("Authorization", auth_header.as_str()),
-        ("Accept-Encoding", "identity"),
-    ];
-
-    connection.initiate_request(Method::Get, url, &headers)?;
-    connection.initiate_response()?;
-
-    let status = connection.status();
-    let body = read_http_body_limited(&mut connection, url, max_body_bytes)?;
-
-    if !(200..300).contains(&status) {
-        let body_preview = String::from_utf8_lossy(&body);
-        return Err(anyhow!(
-            "GET {} returned HTTP {} (service={} region={}) scope={} creq_sha256={} sts_sha256={} body={} ",
-            url,
-            status,
-            candidate.service,
-            candidate.region,
-            signing.credential_scope,
-            signing.canonical_request_sha256,
-            signing.string_to_sign_sha256,
-            truncate_debug_text(&body_preview, 2000)
-        ));
-    }
-
-    Ok(body)
-}
-
 fn read_http_body_limited(
     connection: &mut EspHttpConnection,
     url: &str,
@@ -1489,9 +1259,6 @@ struct SigningMaterial {
     request_date: String,
     payload_hash: String,
     authorization: String,
-    credential_scope: String,
-    canonical_request_sha256: String,
-    string_to_sign_sha256: String,
 }
 
 fn signing_material(
@@ -1575,9 +1342,6 @@ fn signing_material(
         request_date,
         payload_hash: EMPTY_PAYLOAD_SHA256.to_string(),
         authorization,
-        credential_scope,
-        canonical_request_sha256: canonical_request_hash,
-        string_to_sign_sha256: sha256_hex(string_to_sign.as_bytes()),
     })
 }
 
@@ -1614,268 +1378,4 @@ fn hex_lower(nibble: u8) -> char {
         0..=9 => char::from(b'0' + nibble),
         _ => char::from(b'a' + (nibble - 10)),
     }
-}
-
-fn key_to_local_path(config: &RemotelySaveConfig, key: &str) -> Result<PathBuf> {
-    let key = strip_remote_prefix(key.trim_start_matches('/'), &config.remote_prefix);
-    let mut rel = PathBuf::new();
-
-    for part in key.split('/') {
-        if part.is_empty() {
-            continue;
-        }
-        rel.push(part);
-    }
-
-    if rel.as_os_str().is_empty() {
-        return Err(anyhow!("empty object key"));
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in rel.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!("object key escapes vault: {}", key));
-            }
-        }
-    }
-
-    Ok(Path::new(VAULT_ROOT).join(normalized))
-}
-
-fn strip_remote_prefix<'a>(key: &'a str, prefix: &str) -> &'a str {
-    let prefix = prefix.trim_start_matches('/');
-    if prefix.is_empty() {
-        return key;
-    }
-    let prefix = prefix.trim_end_matches('/');
-    if key == prefix {
-        ""
-    } else if key.starts_with(prefix) && key.as_bytes().get(prefix.len()) == Some(&b'/') {
-        &key[prefix.len() + 1..]
-    } else {
-        key
-    }
-}
-
-fn encode_path_segments(path: &str) -> String {
-    path.split('/')
-        .map(percent_encode)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn percent_encode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for &b in raw.as_bytes() {
-        if is_unreserved(b) {
-            out.push(char::from(b));
-        } else {
-            out.push('%');
-            out.push(hex_upper((b >> 4) & 0x0f));
-            out.push(hex_upper(b & 0x0f));
-        }
-    }
-    out
-}
-
-fn is_unreserved(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~')
-}
-
-fn hex_upper(nibble: u8) -> char {
-    match nibble {
-        0..=9 => char::from(b'0' + nibble),
-        _ => char::from(b'A' + (nibble - 10)),
-    }
-}
-
-fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-}
-
-fn is_internal_marker(key: &str) -> bool {
-    if key
-        .split('/')
-        .any(|part| part == ".obsidian" || part.starts_with('_') || part.starts_with('.'))
-    {
-        return true;
-    }
-    false
-}
-
-fn read_sync_manifest() -> HashMap<String, SyncManifestEntry> {
-    let mut out = HashMap::new();
-    let Ok(contents) = fs::read_to_string(SYNC_STATUS_PATH) else {
-        return out;
-    };
-
-    for line in contents.lines() {
-        let Some(rest) = line.strip_prefix("M\t") else {
-            continue;
-        };
-        let mut parts = rest.split('\t');
-        let Some(key_raw) = parts.next() else {
-            continue;
-        };
-        let Some(size_raw) = parts.next() else {
-            continue;
-        };
-        let Some(etag_raw) = parts.next() else {
-            continue;
-        };
-        let Some(local_path_raw) = parts.next() else {
-            continue;
-        };
-        let Ok(size) = size_raw.parse::<u64>() else {
-            continue;
-        };
-
-        out.insert(
-            unescape_manifest_field(key_raw),
-            SyncManifestEntry {
-                size,
-                etag: unescape_manifest_field(etag_raw),
-                local_path: unescape_manifest_field(local_path_raw),
-            },
-        );
-    }
-
-    out
-}
-
-fn delete_stale_manifest_files(
-    previous_manifest: &HashMap<String, SyncManifestEntry>,
-    seen_keys: &HashSet<String>,
-) -> Result<usize> {
-    let mut deleted = 0usize;
-    for (key, entry) in previous_manifest {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        if entry.local_path.is_empty() || !entry.local_path.starts_with(VAULT_ROOT) {
-            continue;
-        }
-        let path = Path::new(&entry.local_path);
-        if path == Path::new(VAULT_ROOT) || path == Path::new(SYNC_STATUS_PATH) {
-            continue;
-        }
-        if path.exists() {
-            fs::remove_file(path).map_err(|e| anyhow!("remove stale {:?}: {}", path, e))?;
-            deleted += 1;
-            remove_empty_parent_dirs(path.parent());
-        }
-    }
-    Ok(deleted)
-}
-
-fn remove_empty_parent_dirs(mut dir: Option<&Path>) {
-    while let Some(path) = dir {
-        if path == Path::new(VAULT_ROOT) {
-            break;
-        }
-        match fs::remove_dir(path) {
-            Ok(()) => dir = path.parent(),
-            Err(_) => break,
-        }
-    }
-}
-
-fn escape_manifest_field(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn unescape_manifest_field(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-fn write_status_file(
-    config: &RemotelySaveConfig,
-    downloaded: usize,
-    skipped: usize,
-    deleted: usize,
-    manifest: &HashMap<String, SyncManifestEntry>,
-) -> Result<()> {
-    let now_ms = time::now_ms();
-    let mut status = format!(
-        concat!(
-            "sync_status=ok\n",
-            "timestamp_ms={}\n",
-            "endpoint={}\n",
-            "region={}\n",
-            "bucket={}\n",
-            "prefix={}\n",
-            "force_path_style={}\n",
-            "downloaded={}\n",
-            "skipped={}\n",
-            "deleted={}\n",
-            "manifest_version=1\n",
-            "manifest_begin\n"
-        ),
-        now_ms,
-        config.endpoint,
-        config.region,
-        config.bucket_name,
-        config.remote_prefix,
-        config.force_path_style,
-        downloaded,
-        skipped,
-        deleted
-    );
-
-    let mut keys: Vec<&String> = manifest.keys().collect();
-    keys.sort();
-    for key in keys {
-        if let Some(entry) = manifest.get(key) {
-            status.push_str("M\t");
-            status.push_str(&escape_manifest_field(key));
-            status.push('\t');
-            status.push_str(&entry.size.to_string());
-            status.push('\t');
-            status.push_str(&escape_manifest_field(&entry.etag));
-            status.push('\t');
-            status.push_str(&escape_manifest_field(&entry.local_path));
-            status.push('\n');
-        }
-    }
-    status.push_str("manifest_end\n");
-
-    fs::write(SYNC_STATUS_PATH, status)
-        .map_err(|e| anyhow!("write {}: {}", SYNC_STATUS_PATH, e))?;
-    Ok(())
 }

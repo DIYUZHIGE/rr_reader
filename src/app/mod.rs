@@ -143,16 +143,6 @@ impl ReaderApp {
         Ok(app)
     }
 
-    /// Connect WiFi after boot. Called separately so WiFi stack frames don't
-    /// overlap with display/font init frames, reducing peak stack usage.
-    pub fn connect_wifi(&mut self) {
-        let wifi_status = self.hardware.connect_wifi_from_storage();
-        info!("{}", wifi_status.boot_line());
-
-        // Boot screen stays blank; do not draw WiFi status here.
-        let _ = self.flush_display_if_dirty();
-    }
-
     pub fn tick(&mut self) -> Result<()> {
         let mode = self.activity.event_mode();
         let events = self
