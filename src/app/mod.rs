@@ -556,6 +556,10 @@ impl ReaderApp {
     }
 
     fn trigger_manual_sync(&mut self) {
+        // Aggressively release reader-related caches before network sync.
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
+
         let wifi_status = self.hardware.connect_wifi_from_storage();
         info!("{}", wifi_status.boot_line());
 
@@ -591,9 +595,10 @@ impl ReaderApp {
                             }
                         };
                         self.reload_browser_entries(None);
+                        info!("Sync status written to {}", report.status_path);
                         format!(
-                            "同步完成：下载 {}，跳过 {}",
-                            report.downloaded_files, report.skipped_files
+                            "同步完成：下载 {}，跳过 {}，删除 {}",
+                            report.downloaded_files, report.skipped_files, report.deleted_files
                         )
                     }
                     Err(e) => {
@@ -609,6 +614,7 @@ impl ReaderApp {
             }
         };
 
+        self.hardware.shutdown_wifi_after_sync();
         self.settings_status = final_status;
         self.render_settings_page();
     }

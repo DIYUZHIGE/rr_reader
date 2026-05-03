@@ -10,6 +10,8 @@ const REMOTELY_SAVE_CONFIG_PATHS: [&str; 3] = [
     "/sdcard/remotely_save.txt",
     "/sdcard/vault/remotely_save.conf",
 ];
+const REMOTELY_SAVE_CONFIG_MAX_BYTES: u64 = 16 * 1024;
+const REMOTE_PREFIX_MAX_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct RemotelySaveConfig {
@@ -28,6 +30,16 @@ impl super::Storage {
         for path in REMOTELY_SAVE_CONFIG_PATHS {
             if !Path::new(path).exists() {
                 continue;
+            }
+
+            let meta = fs::metadata(path).map_err(|e| anyhow!("stat {}: {}", path, e))?;
+            if meta.len() > REMOTELY_SAVE_CONFIG_MAX_BYTES {
+                return Err(anyhow!(
+                    "{} is too large: {} bytes, max {}",
+                    path,
+                    meta.len(),
+                    REMOTELY_SAVE_CONFIG_MAX_BYTES
+                ));
             }
 
             let contents = fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path, e))?;
@@ -89,6 +101,7 @@ fn parse_from_deep_link(link: &str) -> Result<RemotelySaveConfig> {
     validate_len("s3AccessKeyID", &access_key_id, 1, 128)?;
     validate_len("s3SecretAccessKey", &secret_access_key, 1, 256)?;
     validate_len("s3BucketName", &bucket_name, 1, 128)?;
+    validate_len("remotePrefix", &remote_prefix, 0, REMOTE_PREFIX_MAX_BYTES)?;
 
     Ok(RemotelySaveConfig {
         endpoint,
@@ -153,6 +166,7 @@ fn parse_from_key_values(contents: &str) -> Result<RemotelySaveConfig> {
     validate_len("access_key_id", &access_key_id, 1, 128)?;
     validate_len("secret_access_key", &secret_access_key, 1, 256)?;
     validate_len("bucket_name", &bucket_name, 1, 128)?;
+    validate_len("remote_prefix", &remote_prefix, 0, REMOTE_PREFIX_MAX_BYTES)?;
 
     Ok(RemotelySaveConfig {
         endpoint,

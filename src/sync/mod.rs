@@ -9,7 +9,9 @@ use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hmac::{Hmac, Mac};
 use log::{info, warn};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -17,6 +19,37 @@ type HmacSha256 = Hmac<Sha256>;
 const VAULT_ROOT: &str = "/sdcard/vault";
 const SYNC_STATUS_PATH: &str = "/sdcard/vault/.rr_sync_status";
 const EMPTY_PAYLOAD_SHA256: &str = "UNSIGNED-PAYLOAD";
+const LIST_MAX_KEYS: usize = 6;
+const LIST_BODY_LIMIT: usize = 20 * 1024;
+const ERROR_BODY_LIMIT: usize = 2 * 1024;
+const OBJECT_KEY_MAX_BYTES: usize = 768;
+const LOCAL_PATH_MAX_BYTES: usize = 1024;
+const DOWNLOAD_TIMEOUT_SECS: u64 = 20;
+const DOWNLOAD_READ_BUFFER_BYTES: usize = 1024;
+const DOWNLOAD_DIRECT_MAX_BYTES: u64 = 0;
+const DOWNLOAD_CHUNK_BYTES: u64 = 16 * 1024;
+const DOWNLOAD_MAX_ATTEMPTS: usize = 20;
+const DOWNLOAD_MIN_FREE_HEAP: u32 = 44 * 1024;
+const DOWNLOAD_LOW_HEAP_RETRY_DELAY_MS: u32 = 300;
+
+const SNTP_SERVERS: &str = "ntp.aliyun.com";
+
+/// Cache of the last server Date so we don't HEAD OSS for every signing.
+struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+static CACHED_SERVER_DATETIME: SyncUnsafeCell<Option<OffsetDateTime>> =
+    SyncUnsafeCell(core::cell::UnsafeCell::new(None));
+
+fn cached_server_datetime_get() -> Option<OffsetDateTime> {
+    unsafe { *CACHED_SERVER_DATETIME.0.get().as_ref().unwrap() }
+}
+
+fn cached_server_datetime_set(dt: OffsetDateTime) {
+    unsafe {
+        *CACHED_SERVER_DATETIME.0.get() = Some(dt);
+    }
+}
 
 unsafe extern "C" fn attach_crt_bundle(conf: *mut core::ffi::c_void) -> i32 {
     esp_idf_svc::sys::esp_crt_bundle_attach(conf)
@@ -26,12 +59,21 @@ unsafe extern "C" fn attach_crt_bundle(conf: *mut core::ffi::c_void) -> i32 {
 pub struct SyncReport {
     pub downloaded_files: usize,
     pub skipped_files: usize,
+    pub deleted_files: usize,
     pub status_path: String,
 }
 
 struct RemoteEntry {
     key: String,
     size: u64,
+    etag: String,
+}
+
+#[derive(Clone, Debug)]
+struct SyncManifestEntry {
+    size: u64,
+    etag: String,
+    local_path: String,
 }
 
 pub fn sync_vault_from_s3_config(
@@ -45,16 +87,19 @@ pub fn sync_vault_from_s3_config(
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
     let mut skipped_unchanged = 0usize;
+
     let mut continuation_token: Option<String> = None;
     let mut page = 0usize;
+    let previous_manifest = read_sync_manifest();
+    let mut new_manifest: HashMap<String, SyncManifestEntry> = HashMap::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
 
     loop {
         page += 1;
         on_progress(&format!("获取文件列表 第{}页...", page));
         let list_url = build_list_url(config, continuation_token.as_deref())?;
         info!("Listing remote objects: {}", list_url);
-        let list_xml = http_get_text_signed(config, &list_url)?;
-        let (entries, next_token) = parse_list_response(&list_xml);
+        let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
 
         if entries.is_empty() && next_token.is_none() {
             break;
@@ -77,37 +122,90 @@ pub fn sync_vault_from_s3_config(
                 continue;
             }
 
-            // ESP32 FAT driver rejects filenames longer than ~200 chars
-            if key.rsplit('/').next().unwrap_or(key.as_str()).len() > 200 {
-                warn!("Skipping file with very long name ({} chars): {}", key.len(), key);
+            if key.len() > OBJECT_KEY_MAX_BYTES {
+                warn!(
+                    "Skipping file with very long object key ({} bytes): {}",
+                    key.len(),
+                    key
+                );
                 skipped += 1;
                 continue;
             }
 
-            let target = key_to_local_path(key)?;
-            let target_str = target.to_string_lossy().to_string();
+            // ESP32 FAT driver rejects filenames longer than ~200 chars
+            if key.rsplit('/').next().unwrap_or(key.as_str()).len() > 200 {
+                warn!(
+                    "Skipping file with very long name ({} chars): {}",
+                    key.len(),
+                    key
+                );
+                skipped += 1;
+                continue;
+            }
 
-            // Skip if local file exists and has same size
+            let target = key_to_local_path(config, key)?;
+            let target_str = target.to_string_lossy().to_string();
+            if target_str.len() > LOCAL_PATH_MAX_BYTES {
+                warn!(
+                    "Skipping file with very long local path ({} bytes): {}",
+                    target_str.len(),
+                    target_str
+                );
+                skipped += 1;
+                continue;
+            }
+            seen_keys.insert(key.to_string());
+
+            // Skip only when both local size and the previous ETag match the remote entry.
+            // Size-only comparisons can miss changed files with identical byte length.
             if let Ok(meta) = fs::metadata(&target) {
-                if meta.len() == entry.size {
+                let manifest_matches = previous_manifest
+                    .get(key)
+                    .map(|old| {
+                        old.size == entry.size && !old.etag.is_empty() && old.etag == entry.etag
+                    })
+                    .unwrap_or(false);
+                let legacy_size_only_match = entry.etag.is_empty() && meta.len() == entry.size;
+                if meta.len() == entry.size && (manifest_matches || legacy_size_only_match) {
                     skipped_unchanged += 1;
+                    new_manifest.insert(
+                        key.to_string(),
+                        SyncManifestEntry {
+                            size: entry.size,
+                            etag: entry.etag.clone(),
+                            local_path: target_str.clone(),
+                        },
+                    );
                     continue;
                 }
             }
 
-            // Show progress every 5 files or on last file in page
-            if processed_in_page % 5 == 0 || processed_in_page == total_in_page {
+            // Show progress every 10 files or on last file in page
+            if processed_in_page % 10 == 0 || processed_in_page == total_in_page {
                 let name = key.rsplit('/').next().unwrap_or(key);
-                on_progress(&format!("下载: {} (已下载:{})", name, downloaded + 1));
+                on_progress(&format!(
+                    "下载: {} ({}/{})",
+                    name,
+                    downloaded + 1,
+                    processed_in_page
+                ));
             }
 
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| anyhow!("mkdir {:?}: {}", parent, e))?;
             }
             let object_url = build_object_url(config, key)?;
-            match download_file_signed(config, &object_url, &target_str) {
+            match download_file_signed(config, &object_url, &target_str, entry.size) {
                 Ok(()) => {
                     downloaded += 1;
+                    new_manifest.insert(
+                        key.to_string(),
+                        SyncManifestEntry {
+                            size: entry.size,
+                            etag: entry.etag.clone(),
+                            local_path: target_str.clone(),
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!("Download failed for {}: {}", key, e);
@@ -128,12 +226,18 @@ pub fn sync_vault_from_s3_config(
         info!("Skipped {} files (unchanged)", skipped_unchanged);
     }
 
+    let deleted_stale = delete_stale_manifest_files(&previous_manifest, &seen_keys)?;
+    if deleted_stale > 0 {
+        info!("Deleted {} stale files from previous sync", deleted_stale);
+    }
+
     on_progress("正在写入状态文件...");
-    write_status_file(config, downloaded, skipped)?;
+    write_status_file(config, downloaded, skipped, deleted_stale, &new_manifest)?;
 
     Ok(SyncReport {
         downloaded_files: downloaded,
         skipped_files: skipped,
+        deleted_files: deleted_stale,
         status_path: SYNC_STATUS_PATH.to_string(),
     })
 }
@@ -144,7 +248,11 @@ fn ensure_time_synced() -> Result<()> {
         return Ok(());
     }
 
-    let sntp = EspSntp::new_default().map_err(|e| anyhow!("SNTP init failed: {}", e))?;
+    let conf = esp_idf_svc::sntp::SntpConf {
+        servers: [SNTP_SERVERS],
+        ..Default::default()
+    };
+    let sntp = EspSntp::new(&conf).map_err(|e| anyhow!("SNTP init failed: {}", e))?;
 
     let mut completed = false;
     for _ in 0..120 {
@@ -198,7 +306,7 @@ fn validate_config(config: &RemotelySaveConfig) -> Result<()> {
 
 fn build_list_url(config: &RemotelySaveConfig, continuation_token: Option<&str>) -> Result<String> {
     let base = object_base_url(config)?;
-    let mut url = format!("{}/?list-type=2&max-keys=20", base);
+    let mut url = format!("{}/?list-type=2&max-keys={}", base, LIST_MAX_KEYS);
     if !config.remote_prefix.is_empty() {
         url.push_str("&prefix=");
         url.push_str(&percent_encode(&config.remote_prefix));
@@ -252,16 +360,17 @@ fn parse_list_response(xml: &str) -> (Vec<RemoteEntry>, Option<String>) {
         let block = &after_cs[..contents_end];
 
         // Extract <Key>
-        let key = extract_xml_text(block, "<Key>", "</Key>").unwrap_or_default();
+        let key = extract_xml_text_owned(block, "<Key>", "</Key>").unwrap_or_default();
         // Extract <Size>
-        let size_str = extract_xml_text(block, "<Size>", "</Size>").unwrap_or("0");
+        let size_str = extract_xml_text_ref(block, "<Size>", "</Size>").unwrap_or("0");
         let size: u64 = size_str.parse().unwrap_or(0);
+        let etag = extract_xml_text_owned(block, "<ETag>", "</ETag>")
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
 
         if !key.is_empty() {
-            entries.push(RemoteEntry {
-                key: key.to_string(),
-                size,
-            });
+            entries.push(RemoteEntry { key, size, etag });
         }
 
         rest = &after_cs[contents_end + 12..];
@@ -281,32 +390,265 @@ fn parse_list_response(xml: &str) -> (Vec<RemoteEntry>, Option<String>) {
     (entries, next_token)
 }
 
-fn extract_xml_text<'a>(xml: &'a str, open: &str, close: &str) -> Option<&'a str> {
+fn extract_xml_text_ref<'a>(xml: &'a str, open: &str, close: &str) -> Option<&'a str> {
     let start = xml.find(open)?;
     let after = &xml[start + open.len()..];
     let end = after.find(close)?;
-    Some(xml_unescape_ref(&after[..end]))
+    Some(&after[..end])
 }
 
-fn xml_unescape_ref(s: &str) -> &str {
-    // The slice is from the original XML buffer; XML entities like &amp;
-    // can't appear in OSS keys, so this is safe as-is.
-    s
+fn extract_xml_text_owned(xml: &str, open: &str, close: &str) -> Option<String> {
+    extract_xml_text_ref(xml, open, close).map(xml_unescape)
+}
+
+const XML_CONTENTS_OPEN: &[u8] = b"<Contents>";
+const XML_CONTENTS_CLOSE: &[u8] = b"</Contents>";
+const XML_KEY_OPEN: &[u8] = b"<Key>";
+const XML_KEY_CLOSE: &[u8] = b"</Key>";
+const XML_SIZE_OPEN: &[u8] = b"<Size>";
+const XML_SIZE_CLOSE: &[u8] = b"</Size>";
+const XML_ETAG_OPEN: &[u8] = b"<ETag>";
+const XML_ETAG_CLOSE: &[u8] = b"</ETag>";
+const XML_NEXT_TOKEN_OPEN: &[u8] = b"<NextContinuationToken>";
+const XML_NEXT_TOKEN_CLOSE: &[u8] = b"</NextContinuationToken>";
+const XML_STREAM_BUFFER_LIMIT: usize = 8 * 1024;
+
+struct ListXmlStreamParser {
+    buf: Vec<u8>,
+    entries: Vec<RemoteEntry>,
+    next_token: Option<String>,
+}
+
+impl ListXmlStreamParser {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(2048),
+            entries: Vec::new(),
+            next_token: None,
+        }
+    }
+
+    fn push(&mut self, incoming: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(incoming);
+        self.consume_complete_blocks();
+        self.capture_next_token_if_present();
+        self.trim_prefix();
+
+        if self.buf.len() > XML_STREAM_BUFFER_LIMIT {
+            return Err(anyhow!(
+                "list XML parser buffer exceeded {} bytes",
+                XML_STREAM_BUFFER_LIMIT
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(Vec<RemoteEntry>, Option<String>)> {
+        self.consume_complete_blocks();
+        self.capture_next_token_if_present();
+        Ok((self.entries, self.next_token))
+    }
+
+    fn consume_complete_blocks(&mut self) {
+        loop {
+            let Some(start) = find_subslice(&self.buf, XML_CONTENTS_OPEN) else {
+                break;
+            };
+            let after_start = start + XML_CONTENTS_OPEN.len();
+            let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_CONTENTS_CLOSE) else {
+                break;
+            };
+            let end = after_start + rel_end;
+
+            let block = &self.buf[after_start..end];
+            let key = extract_xml_text_bytes(block, XML_KEY_OPEN, XML_KEY_CLOSE)
+                .map(|s| xml_unescape(&s))
+                .unwrap_or_default();
+            let size = extract_xml_text_bytes(block, XML_SIZE_OPEN, XML_SIZE_CLOSE)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let etag = extract_xml_text_bytes(block, XML_ETAG_OPEN, XML_ETAG_CLOSE)
+                .map(|s| xml_unescape(&s).trim_matches('"').to_string())
+                .unwrap_or_default();
+
+            if !key.is_empty() {
+                self.entries.push(RemoteEntry { key, size, etag });
+            }
+
+            let consume_end = end + XML_CONTENTS_CLOSE.len();
+            self.buf.drain(..consume_end);
+        }
+    }
+
+    fn capture_next_token_if_present(&mut self) {
+        if self.next_token.is_some() {
+            return;
+        }
+
+        let Some(start) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) else {
+            return;
+        };
+        let after_start = start + XML_NEXT_TOKEN_OPEN.len();
+        let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_NEXT_TOKEN_CLOSE) else {
+            return;
+        };
+        let end = after_start + rel_end;
+        let token_raw = String::from_utf8_lossy(&self.buf[after_start..end]).to_string();
+        let token = xml_unescape(&token_raw);
+        if !token.is_empty() {
+            self.next_token = Some(token);
+        }
+    }
+
+    fn trim_prefix(&mut self) {
+        if self.buf.len() <= XML_STREAM_BUFFER_LIMIT / 2 {
+            return;
+        }
+
+        if let Some(pos) = find_subslice(&self.buf, XML_CONTENTS_OPEN) {
+            if pos > 0 {
+                self.buf.drain(..pos);
+            }
+            return;
+        }
+
+        if let Some(pos) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) {
+            if pos > 0 {
+                self.buf.drain(..pos);
+            }
+            return;
+        }
+
+        let keep = XML_STREAM_BUFFER_LIMIT / 4;
+        if self.buf.len() > keep {
+            let drop_len = self.buf.len() - keep;
+            self.buf.drain(..drop_len);
+        }
+    }
+}
+
+fn extract_xml_text_bytes(haystack: &[u8], open: &[u8], close: &[u8]) -> Option<String> {
+    let start = find_subslice(haystack, open)? + open.len();
+    let rel_end = find_subslice(&haystack[start..], close)?;
+    let end = start + rel_end;
+    Some(String::from_utf8_lossy(&haystack[start..end]).to_string())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn http_get_text_signed(config: &RemotelySaveConfig, url: &str) -> Result<String> {
-    let bytes = http_get_bytes_signed(config, url)?;
+    let bytes = http_get_bytes_signed_limited(config, url, LIST_BODY_LIMIT)?;
     String::from_utf8(bytes).map_err(|e| anyhow!("utf8 decode {}: {}", url, e))
 }
 
-fn http_get_bytes_signed(config: &RemotelySaveConfig, url: &str) -> Result<Vec<u8>> {
+fn http_list_objects_signed(
+    config: &RemotelySaveConfig,
+    url: &str,
+) -> Result<(Vec<RemoteEntry>, Option<String>)> {
     let parsed = parse_url(url)?;
     let candidates = signing_candidates(config, &parsed.host);
     let timestamp = resolve_signing_timestamp(url)?;
 
     let mut last_error: Option<anyhow::Error> = None;
     for candidate in candidates {
-        match http_get_bytes_signed_once(config, url, &parsed, &candidate, &timestamp) {
+        match http_list_objects_signed_once(config, url, &parsed, &candidate, &timestamp) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                warn!(
+                    "Signed list GET failed with service={} region={}: {}",
+                    candidate.service, candidate.region, e
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("signed list GET failed")))
+}
+
+fn http_list_objects_signed_once(
+    config: &RemotelySaveConfig,
+    url: &str,
+    parsed: &ParsedUrl,
+    candidate: &SigningCandidate,
+    timestamp: &SigningTimestamp,
+) -> Result<(Vec<RemoteEntry>, Option<String>)> {
+    let signing = signing_material(config, parsed, "GET", candidate, timestamp, &[])?;
+
+    let config_http = HttpConfiguration {
+        buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
+        buffer_size_tx: Some(1024),
+        timeout: Some(core::time::Duration::from_secs(30)),
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(attach_crt_bundle),
+        ..Default::default()
+    };
+    wait_for_download_heap("list GET request init");
+    let mut connection = EspHttpConnection::new(&config_http)?;
+
+    let headers = [
+        ("Host", parsed.host.as_str()),
+        ("x-oss-date", signing.request_date.as_str()),
+        ("x-oss-content-sha256", signing.payload_hash.as_str()),
+        ("Authorization", signing.authorization.as_str()),
+        ("Accept-Encoding", "identity"),
+    ];
+
+    connection.initiate_request(Method::Get, url, &headers)?;
+    connection.initiate_response()?;
+
+    let status = connection.status();
+    if !(200..300).contains(&status) {
+        let body = read_http_body_limited(&mut connection, url, ERROR_BODY_LIMIT)?;
+        let body_preview = String::from_utf8_lossy(&body);
+        return Err(anyhow!(
+            "list GET {} returned HTTP {} body={}",
+            url,
+            status,
+            truncate_debug_text(&body_preview, 1200)
+        ));
+    }
+
+    let mut parser = ListXmlStreamParser::new();
+    let mut chunk = [0u8; DOWNLOAD_READ_BUFFER_BYTES];
+    loop {
+        let n = connection
+            .read(&mut chunk)
+            .map_err(|e| anyhow!("read list response {}: {}", url, e))?;
+        if n == 0 {
+            break;
+        }
+        parser.push(&chunk[..n])?;
+    }
+
+    parser.finish()
+}
+
+fn http_get_bytes_signed_limited(
+    config: &RemotelySaveConfig,
+    url: &str,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>> {
+    let parsed = parse_url(url)?;
+    let candidates = signing_candidates(config, &parsed.host);
+    let timestamp = resolve_signing_timestamp(url)?;
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for candidate in candidates {
+        match http_get_bytes_signed_once(
+            config,
+            url,
+            &parsed,
+            &candidate,
+            &timestamp,
+            max_body_bytes,
+        ) {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 warn!(
@@ -321,33 +663,108 @@ fn http_get_bytes_signed(config: &RemotelySaveConfig, url: &str) -> Result<Vec<u
     Err(last_error.unwrap_or_else(|| anyhow!("signed GET failed")))
 }
 
-/// Stream a signed GET response directly to a file, never holding the
-/// entire body in memory. Essential for ESP32-C3 (~400 KB SRAM).
-fn download_file_signed(config: &RemotelySaveConfig, url: &str, file_path: &str) -> Result<()> {
+/// Stream a signed GET response directly to a file in small signed Range
+/// chunks. Each chunk closes its TLS connection, which is slower but much
+/// more robust on ESP32-C3 than one long-lived TLS read.
+#[derive(Clone, Copy, Debug)]
+struct DownloadChunkResult {
+    bytes_written: u64,
+    completed: bool,
+}
+
+fn download_file_signed(
+    config: &RemotelySaveConfig,
+    url: &str,
+    file_path: &str,
+    expected_size: u64,
+) -> Result<()> {
     let parsed = parse_url(url)?;
     let candidates = signing_candidates(config, &parsed.host);
     let timestamp = resolve_signing_timestamp(url)?;
+    let temp_path = temp_download_path(file_path);
 
-    // Retry up to 3 times with increasing delays for transient TLS errors
-    for attempt in 1..=3 {
+    if expected_size == 0 {
+        fs::write(&temp_path, [])
+            .map_err(|e| anyhow!("write empty temp {:?}: {}", temp_path, e))?;
+        finalize_temp_download(&temp_path, file_path, expected_size)?;
+        return Ok(());
+    }
+
+    if expected_size <= DOWNLOAD_DIRECT_MAX_BYTES {
+        match download_file_signed_direct(
+            config,
+            url,
+            &parsed,
+            &candidates,
+            &timestamp,
+            expected_size,
+            &temp_path,
+        ) {
+            Ok(()) => {
+                finalize_temp_download(&temp_path, file_path, expected_size)?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "Direct download failed for {}; falling back to ranged resume: {}",
+                    url, e
+                );
+                let _ = fs::remove_file(&temp_path);
+            }
+        }
+    }
+
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        match resume_offset(&temp_path, expected_size) {
+            Ok(done) if expected_size > 0 && done == expected_size => {
+                finalize_temp_download(&temp_path, file_path, expected_size)?;
+                return Ok(());
+            }
+            Ok(done) => {
+                info!(
+                    "Download progress before attempt {}/{}: {} / {} bytes for {}",
+                    attempt, DOWNLOAD_MAX_ATTEMPTS, done, expected_size, file_path
+                );
+            }
+            Err(e) => return Err(e),
+        }
+
         let mut last_error: Option<anyhow::Error> = None;
+        let mut made_progress = false;
         for candidate in &candidates {
-            match download_file_signed_once(config, url, &parsed, candidate, &timestamp, file_path) {
-                Ok(()) => return Ok(()),
+            match download_file_signed_chunk(
+                config,
+                url,
+                &parsed,
+                candidate,
+                &timestamp,
+                expected_size,
+                &temp_path,
+            ) {
+                Ok(chunk_result) => {
+                    if chunk_result.completed {
+                        finalize_temp_download(&temp_path, file_path, expected_size)?;
+                        return Ok(());
+                    }
+                    made_progress = chunk_result.bytes_written > 0;
+                    last_error = None;
+                    break;
+                }
                 Err(e) => {
                     let err_msg = format!("{}", e);
-                    // Only retry on transient errors (TLS/connection issues)
-                    if err_msg.contains("ERROR") || err_msg.contains("ESP_FAIL")
+                    if err_msg.contains("ERROR")
+                        || err_msg.contains("ESP_FAIL")
                         || err_msg.contains("No more processes")
+                        || err_msg.contains("timeout")
                     {
                         warn!(
-                            "Download attempt {}/3 failed (transient): {}",
-                            attempt, err_msg
+                            "Download attempt {}/{} failed (transient): {}",
+                            attempt, DOWNLOAD_MAX_ATTEMPTS, err_msg
                         );
                     } else {
                         warn!(
-                            "Download failed: {}",
-                            err_msg
+                            "Download attempt {}/{} failed: {}",
+                            attempt, DOWNLOAD_MAX_ATTEMPTS, err_msg
                         );
                     }
                     last_error = Some(e);
@@ -355,37 +772,82 @@ fn download_file_signed(config: &RemotelySaveConfig, url: &str, file_path: &str)
             }
         }
 
-        if attempt < 3 {
-            let delay_ms = attempt * 2000; // 2s, 4s backoff
-            info!("Retrying download in {}ms...", delay_ms);
-            FreeRtos::delay_ms(delay_ms as u32);
+        let delay_ms = if made_progress {
+            1000
         } else {
-            return Err(last_error.unwrap_or_else(|| anyhow!("signed download failed after 3 attempts")));
+            1000 * (1u32 << ((attempt - 1).min(5) as u32))
+        };
+        FreeRtos::delay_ms(delay_ms);
+
+        if attempt == DOWNLOAD_MAX_ATTEMPTS {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow!(
+                    "download did not complete after {} attempts; partial kept at {:?}",
+                    DOWNLOAD_MAX_ATTEMPTS,
+                    temp_path
+                )
+            }));
         }
     }
 
     Err(anyhow!("unreachable"))
 }
 
-fn download_file_signed_once(
+fn download_file_signed_direct(
+    config: &RemotelySaveConfig,
+    url: &str,
+    parsed: &ParsedUrl,
+    candidates: &[SigningCandidate],
+    timestamp: &SigningTimestamp,
+    expected_size: u64,
+    temp_path: &Path,
+) -> Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for candidate in candidates {
+        match download_file_signed_direct_once(
+            config,
+            url,
+            parsed,
+            candidate,
+            timestamp,
+            expected_size,
+            temp_path,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(
+                    "Direct GET failed with service={} region={}: {}",
+                    candidate.service, candidate.region, e
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("direct download failed")))
+}
+
+fn download_file_signed_direct_once(
     config: &RemotelySaveConfig,
     url: &str,
     parsed: &ParsedUrl,
     candidate: &SigningCandidate,
     timestamp: &SigningTimestamp,
-    file_path: &str,
+    expected_size: u64,
+    temp_path: &Path,
 ) -> Result<()> {
-    let signing = signing_material(config, parsed, "GET", candidate, timestamp)?;
+    let signing = signing_material(config, parsed, "GET", candidate, timestamp, &[])?;
 
-    let use_tls = url.starts_with("https://");
     let config_http = HttpConfiguration {
-        buffer_size: Some(2048),
+        buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
         buffer_size_tx: Some(1024),
-        timeout: Some(core::time::Duration::from_secs(60)),
-        use_global_ca_store: use_tls,
-        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
+        timeout: Some(core::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)),
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(attach_crt_bundle),
         ..Default::default()
     };
+    wait_for_download_heap("direct GET request init");
     let mut connection = EspHttpConnection::new(&config_http)?;
 
     let headers = [
@@ -393,55 +855,321 @@ fn download_file_signed_once(
         ("x-oss-date", signing.request_date.as_str()),
         ("x-oss-content-sha256", signing.payload_hash.as_str()),
         ("Authorization", signing.authorization.as_str()),
+        ("Accept-Encoding", "identity"),
     ];
 
     connection.initiate_request(Method::Get, url, &headers)?;
     connection.initiate_response()?;
 
     let status = connection.status();
-
     if !(200..300).contains(&status) {
-        // Read at most 1024 bytes for error diagnostics
-        let mut error_body = Vec::new();
-        let mut chunk = [0u8; 512];
-        for _ in 0..2 {
-            match connection.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => error_body.extend_from_slice(&chunk[..n]),
-                Err(_) => break,
-            }
-        }
-        let body_preview = String::from_utf8_lossy(&error_body);
+        let body = read_http_body_limited(&mut connection, url, ERROR_BODY_LIMIT)?;
+        let body_preview = String::from_utf8_lossy(&body);
         return Err(anyhow!(
-            "GET {} returned HTTP {} (service={} region={}) scope={} creq_sha256={} sts_sha256={} body={}",
-            url, status, candidate.service, candidate.region,
-            signing.credential_scope, signing.canonical_request_sha256,
-            signing.string_to_sign_sha256, truncate_debug_text(&body_preview, 2000)
+            "direct GET {} returned HTTP {} body={}",
+            url,
+            status,
+            truncate_debug_text(&body_preview, 2000)
         ));
     }
 
-    // Stream body directly to file in small chunks
+    if let Some(content_length) = connection.header("Content-Length") {
+        if let Ok(content_length) = content_length.parse::<u64>() {
+            if content_length != expected_size {
+                warn!(
+                    "Content-Length mismatch before direct download: url={} expected={} header={}",
+                    url, expected_size, content_length
+                );
+            }
+        }
+    }
+
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(file_path)
-        .map_err(|e| anyhow!("open {:?}: {}", file_path, e))?;
+        .open(temp_path)
+        .map_err(|e| anyhow!("open temp {:?}: {}", temp_path, e))?;
 
-    let mut chunk = [0u8; 2048];
+    let mut chunk = [0u8; DOWNLOAD_READ_BUFFER_BYTES];
+    let mut written = 0u64;
     loop {
         let n = connection
             .read(&mut chunk)
-            .map_err(|e| anyhow!("read response {}: {}", url, e))?;
+            .map_err(|e| anyhow!("read response {} after {} bytes: {}", url, written, e))?;
         if n == 0 {
             break;
         }
-        use std::io::Write;
         file.write_all(&chunk[..n])
-            .map_err(|e| anyhow!("write {:?}: {}", file_path, e))?;
+            .map_err(|e| anyhow!("write temp {:?} after {} bytes: {}", temp_path, written, e))?;
+        written += n as u64;
+        if written > expected_size {
+            return Err(anyhow!(
+                "direct download overshot for {}: expected {} bytes, wrote {} bytes",
+                url,
+                expected_size,
+                written
+            ));
+        }
     }
 
+    file.flush()
+        .map_err(|e| anyhow!("flush temp {:?}: {}", temp_path, e))?;
+
+    if written != expected_size {
+        return Err(anyhow!(
+            "direct download size mismatch for {}: expected {} bytes, wrote {} bytes",
+            url,
+            expected_size,
+            written
+        ));
+    }
+
+    info!("Direct downloaded {} bytes for {}", written, url);
     Ok(())
+}
+
+fn download_file_signed_chunk(
+    config: &RemotelySaveConfig,
+    url: &str,
+    parsed: &ParsedUrl,
+    candidate: &SigningCandidate,
+    timestamp: &SigningTimestamp,
+    expected_size: u64,
+    temp_path: &Path,
+) -> Result<DownloadChunkResult> {
+    let start = resume_offset(temp_path, expected_size)?;
+    if expected_size > 0 && start == expected_size {
+        return Ok(DownloadChunkResult {
+            bytes_written: 0,
+            completed: true,
+        });
+    }
+
+    let end = if expected_size > 0 {
+        (start + DOWNLOAD_CHUNK_BYTES - 1).min(expected_size - 1)
+    } else {
+        start + DOWNLOAD_CHUNK_BYTES - 1
+    };
+    let range_header = format!("bytes={}-{}", start, end);
+    let extra_signing_headers = [("range", range_header.as_str())];
+    let signing = signing_material(
+        config,
+        parsed,
+        "GET",
+        candidate,
+        timestamp,
+        &extra_signing_headers,
+    )?;
+
+    let config_http = HttpConfiguration {
+        buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
+        buffer_size_tx: Some(1024),
+        timeout: Some(core::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)),
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(attach_crt_bundle),
+        ..Default::default()
+    };
+    wait_for_download_heap("range GET request init");
+    let mut connection = EspHttpConnection::new(&config_http)?;
+
+    let headers = [
+        ("Host", parsed.host.as_str()),
+        ("x-oss-date", signing.request_date.as_str()),
+        ("x-oss-content-sha256", signing.payload_hash.as_str()),
+        ("Authorization", signing.authorization.as_str()),
+        ("Range", range_header.as_str()),
+        ("Accept-Encoding", "identity"),
+    ];
+
+    connection.initiate_request(Method::Get, url, &headers)?;
+    info!("Chunk req: {}-{} for {}", start, end, url);
+    connection.initiate_response()?;
+
+    let status = connection.status();
+    let mut written = start;
+    let mut append = true;
+
+    if status == 200 {
+        warn!(
+            "Server ignored Range for {}; restarting download from byte 0",
+            url
+        );
+        let _ = fs::remove_file(temp_path);
+        written = 0;
+        append = false;
+    } else if status != 206 {
+        let body = read_http_body_limited(&mut connection, url, ERROR_BODY_LIMIT)?;
+        let body_preview = String::from_utf8_lossy(&body);
+        return Err(anyhow!(
+            "range GET {} from byte {} returned HTTP {} body={}",
+            url,
+            start,
+            status,
+            truncate_debug_text(&body_preview, 2000)
+        ));
+    } else {
+        info!("Chunk rsp: {}-{} 206 h={}", start, end, free_heap());
+    }
+
+    if let Some(content_length) = connection.header("Content-Length") {
+        if let Ok(content_length) = content_length.parse::<u64>() {
+            let expected_response_len = if status == 206 {
+                end.saturating_sub(start) + 1
+            } else if expected_size > written {
+                expected_size - written
+            } else {
+                expected_size
+            };
+            if expected_response_len > 0 && content_length != expected_response_len {
+                warn!(
+                    "Content-Length mismatch before chunk: url={} expected_response={} header={} already_written={}",
+                    url, expected_response_len, content_length, written
+                );
+            }
+        }
+    }
+
+    let mut open_options = fs::OpenOptions::new();
+    open_options.write(true).create(true);
+    if append && written > 0 {
+        open_options.append(true);
+    } else {
+        open_options.truncate(true);
+    }
+    let mut file = match open_options.open(temp_path) {
+        Ok(f) => f,
+        Err(e) => return Err(anyhow!("open temp {:?}: {}", temp_path, e)),
+    };
+
+    let mut chunk = [0u8; DOWNLOAD_READ_BUFFER_BYTES];
+    let mut bytes_this_chunk = 0u64;
+    loop {
+        let n = match connection.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                return Err(anyhow!(
+                    "read response {} after {} bytes: {}",
+                    url,
+                    written,
+                    e
+                ));
+            }
+        };
+        if status == 206 && bytes_this_chunk + n as u64 > DOWNLOAD_CHUNK_BYTES {
+            return Err(anyhow!(
+                "server sent more than requested chunk for {}: chunk={} incoming={}",
+                url,
+                bytes_this_chunk,
+                n
+            ));
+        }
+        if let Err(e) = file.write_all(&chunk[..n]) {
+            return Err(anyhow!(
+                "write temp {:?} after {} bytes: {}",
+                temp_path,
+                written,
+                e
+            ));
+        }
+        bytes_this_chunk += n as u64;
+        written += n as u64;
+    }
+
+    if let Err(e) = file.flush() {
+        return Err(anyhow!("flush temp {:?}: {}", temp_path, e));
+    }
+    drop(file);
+
+    if expected_size > 0 && written > expected_size {
+        return Err(anyhow!(
+            "download overshot for {}: expected {} bytes, wrote {} bytes",
+            url,
+            expected_size,
+            written
+        ));
+    }
+
+    Ok(DownloadChunkResult {
+        bytes_written: bytes_this_chunk,
+        completed: expected_size > 0 && written == expected_size,
+    })
+}
+
+fn finalize_temp_download(temp_path: &Path, file_path: &str, expected_size: u64) -> Result<()> {
+    let written = fs::metadata(temp_path)
+        .map_err(|e| anyhow!("stat complete temp {:?}: {}", temp_path, e))?
+        .len();
+    if expected_size > 0 && written != expected_size {
+        return Err(anyhow!(
+            "complete temp size mismatch for {:?}: expected {} bytes, got {} bytes",
+            temp_path,
+            expected_size,
+            written
+        ));
+    }
+
+    let _ = fs::remove_file(file_path);
+    fs::rename(temp_path, file_path)
+        .map_err(|e| anyhow!("rename {:?} -> {:?}: {}", temp_path, file_path, e))?;
+    info!("Downloaded {} bytes to {}", written, file_path);
+    Ok(())
+}
+
+fn temp_download_path(file_path: &str) -> PathBuf {
+    let path = Path::new(file_path);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    name.push_str(".rrpart");
+
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+fn resume_offset(temp_path: &Path, expected_size: u64) -> Result<u64> {
+    let Ok(meta) = fs::metadata(temp_path) else {
+        return Ok(0);
+    };
+
+    let len = meta.len();
+    if len == 0 {
+        let _ = fs::remove_file(temp_path);
+        return Ok(0);
+    }
+
+    if expected_size > 0 && len > expected_size {
+        warn!(
+            "Discarding oversized partial download {:?}: partial={} expected={}",
+            temp_path, len, expected_size
+        );
+        let _ = fs::remove_file(temp_path);
+        return Ok(0);
+    }
+
+    Ok(len)
+}
+
+fn free_heap() -> u32 {
+    unsafe { esp_idf_hal::sys::esp_get_free_heap_size() }
+}
+
+fn wait_for_download_heap(tag: &str) {
+    for _ in 0..2 {
+        let heap = free_heap();
+        if heap >= DOWNLOAD_MIN_FREE_HEAP {
+            return;
+        }
+        warn!(
+            "Low heap before {}: {} bytes (< {}), brief wait",
+            tag, heap, DOWNLOAD_MIN_FREE_HEAP
+        );
+        FreeRtos::delay_ms(DOWNLOAD_LOW_HEAP_RETRY_DELAY_MS);
+    }
 }
 
 fn http_get_bytes_signed_once(
@@ -450,18 +1178,19 @@ fn http_get_bytes_signed_once(
     parsed: &ParsedUrl,
     candidate: &SigningCandidate,
     timestamp: &SigningTimestamp,
+    max_body_bytes: usize,
 ) -> Result<Vec<u8>> {
-    let signing = signing_material(config, parsed, "GET", candidate, timestamp)?;
+    let signing = signing_material(config, parsed, "GET", candidate, timestamp, &[])?;
 
-    let use_tls = url.starts_with("https://");
     let config_http = HttpConfiguration {
         buffer_size: Some(2048),
         buffer_size_tx: Some(1024),
         timeout: Some(core::time::Duration::from_secs(30)),
-        use_global_ca_store: use_tls,
-        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(attach_crt_bundle),
         ..Default::default()
     };
+    wait_for_download_heap("signed GET request init");
     let mut connection = EspHttpConnection::new(&config_http)?;
 
     let auth_header = signing.authorization;
@@ -473,13 +1202,14 @@ fn http_get_bytes_signed_once(
         ("x-oss-date", request_date.as_str()),
         ("x-oss-content-sha256", payload_hash.as_str()),
         ("Authorization", auth_header.as_str()),
+        ("Accept-Encoding", "identity"),
     ];
 
     connection.initiate_request(Method::Get, url, &headers)?;
     connection.initiate_response()?;
 
     let status = connection.status();
-    let body = read_http_body(&mut connection, url)?;
+    let body = read_http_body_limited(&mut connection, url, max_body_bytes)?;
 
     if !(200..300).contains(&status) {
         let body_preview = String::from_utf8_lossy(&body);
@@ -499,15 +1229,33 @@ fn http_get_bytes_signed_once(
     Ok(body)
 }
 
-fn read_http_body(connection: &mut EspHttpConnection, url: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 2048];
+fn read_http_body_limited(
+    connection: &mut EspHttpConnection,
+    url: &str,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut initial_cap = DOWNLOAD_READ_BUFFER_BYTES.min(max_body_bytes);
+    if let Some(content_length) = connection.header("Content-Length") {
+        if let Ok(content_length) = content_length.parse::<usize>() {
+            initial_cap = content_length.min(max_body_bytes);
+        }
+    }
+
+    let mut out = Vec::with_capacity(initial_cap.max(512));
+    let mut chunk = [0u8; DOWNLOAD_READ_BUFFER_BYTES];
     loop {
         let n = connection
             .read(&mut chunk)
             .map_err(|e| anyhow!("read response {}: {}", url, e))?;
         if n == 0 {
             break;
+        }
+        if out.len() + n > max_body_bytes {
+            return Err(anyhow!(
+                "response {} exceeded memory limit of {} bytes",
+                url,
+                max_body_bytes
+            ));
         }
         out.extend_from_slice(&chunk[..n]);
     }
@@ -538,8 +1286,21 @@ fn resolve_signing_timestamp(url: &str) -> Result<SigningTimestamp> {
         return Ok(signing_timestamp_from_datetime(now));
     }
 
+    // Try the in-memory cache first to avoid extra HTTPS HEAD requests.
+    if let Some(cached) = cached_server_datetime_get() {
+        let age_secs = (OffsetDateTime::now_utc() - cached).whole_seconds().abs();
+        if age_secs < 60 {
+            return Ok(signing_timestamp_from_datetime(cached));
+        }
+    }
+
     if let Some(server_dt) = fetch_server_datetime(url)? {
+        cached_server_datetime_set(server_dt);
         return Ok(signing_timestamp_from_datetime(server_dt));
+    }
+
+    if let Some(cached) = cached_server_datetime_get() {
+        return Ok(signing_timestamp_from_datetime(cached));
     }
 
     Err(anyhow!(
@@ -564,22 +1325,21 @@ fn signing_timestamp_from_datetime(dt: OffsetDateTime) -> SigningTimestamp {
 }
 
 fn fetch_server_datetime(url: &str) -> Result<Option<OffsetDateTime>> {
-    let use_tls = url.starts_with("https://");
     let config_http = HttpConfiguration {
         buffer_size: Some(4096),
         buffer_size_tx: Some(2048),
         timeout: Some(core::time::Duration::from_secs(15)),
-        use_global_ca_store: use_tls,
-        crt_bundle_attach: if use_tls { Some(attach_crt_bundle) } else { None },
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(attach_crt_bundle),
         ..Default::default()
     };
     let mut connection = EspHttpConnection::new(&config_http)?;
     let headers: [(&str, &str); 0] = [];
-    connection.initiate_request(Method::Get, url, &headers)?;
+    connection.initiate_request(Method::Head, url, &headers)?;
+    info!("HEAD Date req: {}", url);
     connection.initiate_response()?;
 
     let server_date = connection.header("Date").map(|s| s.to_string());
-    let _ = read_http_body(&mut connection, url);
 
     match server_date {
         Some(value) => parse_http_date(&value).map(Some),
@@ -740,6 +1500,7 @@ fn signing_material(
     method: &str,
     candidate: &SigningCandidate,
     timestamp: &SigningTimestamp,
+    additional_headers: &[(&str, &str)],
 ) -> Result<SigningMaterial> {
     let date_stamp = timestamp.date_stamp.clone();
     let request_date = timestamp.request_date.clone();
@@ -753,11 +1514,29 @@ fn signing_material(
         url.canonical_uri.clone()
     };
 
-    let canonical_headers = format!(
-        "host:{}\nx-oss-content-sha256:{}\nx-oss-date:{}\n",
-        url.host, EMPTY_PAYLOAD_SHA256, request_date
-    );
-    let signed_headers = "host;x-oss-content-sha256;x-oss-date";
+    let mut canonical_header_pairs = vec![
+        ("host".to_string(), url.host.clone()),
+        (
+            "x-oss-content-sha256".to_string(),
+            EMPTY_PAYLOAD_SHA256.to_string(),
+        ),
+        ("x-oss-date".to_string(), request_date.clone()),
+    ];
+    for (name, value) in additional_headers {
+        canonical_header_pairs.push((name.to_ascii_lowercase(), value.trim().to_string()));
+    }
+    canonical_header_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut canonical_headers = String::new();
+    let mut signed_header_names = Vec::new();
+    for (name, value) in &canonical_header_pairs {
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value);
+        canonical_headers.push('\n');
+        signed_header_names.push(name.as_str());
+    }
+    let signed_headers = signed_header_names.join(";");
 
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
@@ -837,8 +1616,8 @@ fn hex_lower(nibble: u8) -> char {
     }
 }
 
-fn key_to_local_path(key: &str) -> Result<PathBuf> {
-    let key = key.trim_start_matches('/');
+fn key_to_local_path(config: &RemotelySaveConfig, key: &str) -> Result<PathBuf> {
+    let key = strip_remote_prefix(key.trim_start_matches('/'), &config.remote_prefix);
     let mut rel = PathBuf::new();
 
     for part in key.split('/') {
@@ -864,6 +1643,21 @@ fn key_to_local_path(key: &str) -> Result<PathBuf> {
     }
 
     Ok(Path::new(VAULT_ROOT).join(normalized))
+}
+
+fn strip_remote_prefix<'a>(key: &'a str, prefix: &str) -> &'a str {
+    let prefix = prefix.trim_start_matches('/');
+    if prefix.is_empty() {
+        return key;
+    }
+    let prefix = prefix.trim_end_matches('/');
+    if key == prefix {
+        ""
+    } else if key.starts_with(prefix) && key.as_bytes().get(prefix.len()) == Some(&b'/') {
+        &key[prefix.len() + 1..]
+    } else {
+        key
+    }
 }
 
 fn encode_path_segments(path: &str) -> String {
@@ -907,12 +1701,138 @@ fn xml_unescape(s: &str) -> String {
 }
 
 fn is_internal_marker(key: &str) -> bool {
-    key.starts_with('.') || key.starts_with('_') || key.ends_with(".obsidian/workspace.json")
+    if key
+        .split('/')
+        .any(|part| part == ".obsidian" || part.starts_with('_') || part.starts_with('.'))
+    {
+        return true;
+    }
+    false
 }
 
-fn write_status_file(config: &RemotelySaveConfig, downloaded: usize, skipped: usize) -> Result<()> {
+fn read_sync_manifest() -> HashMap<String, SyncManifestEntry> {
+    let mut out = HashMap::new();
+    let Ok(contents) = fs::read_to_string(SYNC_STATUS_PATH) else {
+        return out;
+    };
+
+    for line in contents.lines() {
+        let Some(rest) = line.strip_prefix("M\t") else {
+            continue;
+        };
+        let mut parts = rest.split('\t');
+        let Some(key_raw) = parts.next() else {
+            continue;
+        };
+        let Some(size_raw) = parts.next() else {
+            continue;
+        };
+        let Some(etag_raw) = parts.next() else {
+            continue;
+        };
+        let Some(local_path_raw) = parts.next() else {
+            continue;
+        };
+        let Ok(size) = size_raw.parse::<u64>() else {
+            continue;
+        };
+
+        out.insert(
+            unescape_manifest_field(key_raw),
+            SyncManifestEntry {
+                size,
+                etag: unescape_manifest_field(etag_raw),
+                local_path: unescape_manifest_field(local_path_raw),
+            },
+        );
+    }
+
+    out
+}
+
+fn delete_stale_manifest_files(
+    previous_manifest: &HashMap<String, SyncManifestEntry>,
+    seen_keys: &HashSet<String>,
+) -> Result<usize> {
+    let mut deleted = 0usize;
+    for (key, entry) in previous_manifest {
+        if seen_keys.contains(key) {
+            continue;
+        }
+        if entry.local_path.is_empty() || !entry.local_path.starts_with(VAULT_ROOT) {
+            continue;
+        }
+        let path = Path::new(&entry.local_path);
+        if path == Path::new(VAULT_ROOT) || path == Path::new(SYNC_STATUS_PATH) {
+            continue;
+        }
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| anyhow!("remove stale {:?}: {}", path, e))?;
+            deleted += 1;
+            remove_empty_parent_dirs(path.parent());
+        }
+    }
+    Ok(deleted)
+}
+
+fn remove_empty_parent_dirs(mut dir: Option<&Path>) {
+    while let Some(path) = dir {
+        if path == Path::new(VAULT_ROOT) {
+            break;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => dir = path.parent(),
+            Err(_) => break,
+        }
+    }
+}
+
+fn escape_manifest_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_manifest_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn write_status_file(
+    config: &RemotelySaveConfig,
+    downloaded: usize,
+    skipped: usize,
+    deleted: usize,
+    manifest: &HashMap<String, SyncManifestEntry>,
+) -> Result<()> {
     let now_ms = time::now_ms();
-    let status = format!(
+    let mut status = format!(
         concat!(
             "sync_status=ok\n",
             "timestamp_ms={}\n",
@@ -922,7 +1842,10 @@ fn write_status_file(config: &RemotelySaveConfig, downloaded: usize, skipped: us
             "prefix={}\n",
             "force_path_style={}\n",
             "downloaded={}\n",
-            "skipped={}\n"
+            "skipped={}\n",
+            "deleted={}\n",
+            "manifest_version=1\n",
+            "manifest_begin\n"
         ),
         now_ms,
         config.endpoint,
@@ -931,8 +1854,26 @@ fn write_status_file(config: &RemotelySaveConfig, downloaded: usize, skipped: us
         config.remote_prefix,
         config.force_path_style,
         downloaded,
-        skipped
+        skipped,
+        deleted
     );
+
+    let mut keys: Vec<&String> = manifest.keys().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(entry) = manifest.get(key) {
+            status.push_str("M\t");
+            status.push_str(&escape_manifest_field(key));
+            status.push('\t');
+            status.push_str(&entry.size.to_string());
+            status.push('\t');
+            status.push_str(&escape_manifest_field(&entry.etag));
+            status.push('\t');
+            status.push_str(&escape_manifest_field(&entry.local_path));
+            status.push('\n');
+        }
+    }
+    status.push_str("manifest_end\n");
 
     fs::write(SYNC_STATUS_PATH, status)
         .map_err(|e| anyhow!("write {}: {}", SYNC_STATUS_PATH, e))?;

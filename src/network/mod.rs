@@ -100,6 +100,19 @@ impl NetworkManager {
         }
     }
 
+    pub fn shutdown_after_sync(&mut self) {
+        if let Some(wifi) = self.wifi.as_mut() {
+            if let Err(e) = wifi.disconnect() {
+                warn!("WiFi disconnect after sync failed: {}", e);
+            }
+            if let Err(e) = wifi.stop() {
+                warn!("WiFi stop after sync failed: {}", e);
+            }
+        }
+        self.suspended = false;
+        info!("WiFi stopped after sync");
+    }
+
     pub fn resume(&mut self) {
         if !self.suspended {
             return;

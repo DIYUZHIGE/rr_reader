@@ -49,6 +49,10 @@ impl Hardware {
         self.network.resume();
     }
 
+    pub fn shutdown_wifi_after_sync(&mut self) {
+        self.network.shutdown_after_sync();
+    }
+
     /// Update button state. Call once per loop iteration.
     pub fn update_inputs(&mut self, idle_ticks: u32) {
         self.input.update_with_idle_ticks(idle_ticks);
