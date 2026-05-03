@@ -1,7 +1,7 @@
 use crate::font::{Font, GlyphInfo};
 use flate2::Decompress;
 
-const GLYPH_CACHE_CAPACITY: usize = 32;
+const GLYPH_CACHE_CAPACITY: usize = 12;
 
 struct GlyphCacheEntry {
     font_id: usize,

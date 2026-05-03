@@ -898,7 +898,7 @@ impl ReaderApp {
 
     fn select_reader_window_len(&self) -> usize {
         let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
-        if free_heap >= 120 * 1024 {
+        if free_heap >= 80 * 1024 {
             PAGE_CACHE_SIZE_MAX
         } else {
             PAGE_CACHE_SIZE_MIN
@@ -907,8 +907,7 @@ impl ReaderApp {
 
     fn should_keep_all_pages(&self, page_count: usize) -> bool {
         let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
-        // Conservative rule: keep full pages only for small/medium files when heap is healthy.
-        free_heap >= 150 * 1024 && page_count <= 120
+        free_heap >= 100 * 1024 && page_count <= 80
     }
 
     fn reader_page_count(&self) -> usize {

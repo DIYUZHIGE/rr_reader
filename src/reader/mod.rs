@@ -30,8 +30,8 @@ const INLINE_MATH_END: char = '\u{E001}';
 
 /// Max number of rendered pages to keep in the sliding window cache.
 /// Actual window size is selected dynamically based on free heap.
-pub const PAGE_CACHE_SIZE_MAX: usize = 5;
-pub const PAGE_CACHE_SIZE_MIN: usize = 3;
+pub const PAGE_CACHE_SIZE_MAX: usize = 2;
+pub const PAGE_CACHE_SIZE_MIN: usize = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderState {
