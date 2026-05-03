@@ -22,7 +22,7 @@ pub fn init_shared_spi_bus() -> Result<()> {
         sclk_io_num: SPI_SCLK_GPIO,
         __bindgen_anon_3: sys::spi_bus_config_t__bindgen_ty_3 { quadwp_io_num: -1 },
         __bindgen_anon_4: sys::spi_bus_config_t__bindgen_ty_4 { quadhd_io_num: -1 },
-        max_transfer_sz: 16384,
+        max_transfer_sz: 4096,
         ..Default::default()
     };
     unsafe {

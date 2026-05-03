@@ -7,6 +7,10 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{info, warn};
 
+fn free_heap() -> u32 {
+    unsafe { esp_idf_hal::sys::esp_get_free_heap_size() }
+}
+
 #[derive(Clone, Debug)]
 pub enum WifiStatus {
     NotConfigured,
@@ -102,6 +106,7 @@ impl NetworkManager {
 
     pub fn shutdown_after_sync(&mut self) {
         if let Some(wifi) = self.wifi.as_mut() {
+            warn!("Heap before WiFi shutdown: {}", free_heap());
             if let Err(e) = wifi.disconnect() {
                 warn!("WiFi disconnect after sync failed: {}", e);
             }
@@ -110,7 +115,7 @@ impl NetworkManager {
             }
         }
         self.suspended = false;
-        info!("WiFi stopped after sync");
+        warn!("WiFi stopped after sync heap={}", free_heap());
     }
 
     pub fn resume(&mut self) {
@@ -137,6 +142,7 @@ impl NetworkManager {
     }
 
     fn connect(&mut self, credentials: WifiCredentials) -> Result<WifiStatus> {
+        warn!("Heap before WiFi connect: {}", free_heap());
         let ssid = credentials.ssid.clone();
         let password_len = credentials.password.as_bytes().len();
         info!(
@@ -190,7 +196,12 @@ impl NetworkManager {
 
         let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
         let ip = ip_info.ip.to_string();
-        info!("WiFi connected: ssid={} ip={}", ssid, ip);
+        warn!(
+            "WiFi connected: ssid={} ip={} heap={}",
+            ssid,
+            ip,
+            free_heap()
+        );
 
         Ok(WifiStatus::Connected { ssid, ip })
     }

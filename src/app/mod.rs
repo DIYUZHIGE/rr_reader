@@ -511,7 +511,7 @@ impl ReaderApp {
     }
 
     fn settings_option_count(&self) -> usize {
-        3
+        2
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -531,18 +531,24 @@ impl ReaderApp {
         }
 
         match self.settings_selected {
-            0 => self.apply_selected_dir_as_browser_root(),
-            1 => {
-                self.browser_root_dir.clear();
-                self.browser.current_dir.clear();
-                let _ = self.hardware.storage.write_browser_root_dir("");
-                self.settings_status = "已重置文件根目录".to_string();
-                self.reload_browser_entries(None);
-                self.render_settings_page();
-            }
-            2 => self.trigger_manual_sync(),
+            0 => self.trigger_manual_sync(),
+            1 => self.trigger_delete_notes_and_sync(),
             _ => {}
         }
+    }
+
+    fn render_sync_status_light(&mut self, status: &str) {
+        self.display.clear(0xFF);
+        self.display
+            .draw_text_font(&self.ui_font, "同步中...", LIST_X, LIST_TOP_Y);
+        let status_text = format!("状态: {}", status);
+        let status_line = truncate_for_width(&self.ui_font, &status_text, Display::width() - 48);
+        self.display.draw_text_font(
+            &self.ui_font,
+            &status_line,
+            LIST_X,
+            LIST_TOP_Y + self.ui_font.glyph_height as usize + 18,
+        );
     }
 
     fn trigger_manual_sync(&mut self) {
@@ -568,15 +574,23 @@ impl ReaderApp {
 
                 // Initial status
                 self.settings_status = "正在连接...".to_string();
-                self.render_settings_page();
+                self.render_sync_status_light("正在连接...");
                 self.flush_ui_refresh();
+                self.display.clear_glyph_cache();
 
                 match sync::sync_vault_from_s3_config(&cfg, &mut |msg: &str| {
                     self.settings_status = msg.to_string();
-                    self.render_settings_page();
+                    self.render_sync_status_light(msg);
                     self.flush_ui_refresh();
+                    self.display.clear_glyph_cache();
                 }) {
                     Ok(report) => {
+                        self.browser_root_dir = "notes".to_string();
+                        self.browser.current_dir = self.browser_root_dir.clone();
+                        let _ = self
+                            .hardware
+                            .storage
+                            .write_browser_root_dir(&self.browser_root_dir);
                         self.md_files = match self.hardware.storage.list_markdown_files("") {
                             Ok(files) => files,
                             Err(e) => {
@@ -609,23 +623,33 @@ impl ReaderApp {
         self.render_settings_page();
     }
 
-    fn apply_selected_dir_as_browser_root(&mut self) {
-        let selected = match self.browser.entries.get(self.browser.selected) {
-            Some(entry) if entry.is_dir => entry.rel_path.clone(),
-            _ => self.browser.current_dir.clone(),
-        };
+    fn trigger_delete_notes_and_sync(&mut self) {
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
 
-        self.browser_root_dir = selected.clone();
-        self.browser.current_dir = selected;
-        if let Err(e) = self
-            .hardware
-            .storage
-            .write_browser_root_dir(&self.browser_root_dir)
-        {
-            warn!("Failed to persist browser root dir: {}", e);
+        self.settings_status = "正在删除本地 notes...".to_string();
+        self.render_sync_status_light("正在删除本地 notes...");
+        self.flush_ui_refresh();
+        self.display.clear_glyph_cache();
+
+        match self.hardware.storage.delete_synced_notes() {
+            Ok(()) => {
+                self.md_files.clear();
+                self.browser_root_dir = "notes".to_string();
+                self.browser.current_dir = self.browser_root_dir.clone();
+                let _ = self
+                    .hardware
+                    .storage
+                    .write_browser_root_dir(&self.browser_root_dir);
+                self.reload_browser_entries(None);
+                self.trigger_manual_sync();
+            }
+            Err(e) => {
+                warn!("Failed to delete local synced notes: {}", e);
+                self.settings_status = format!("删除 notes 失败: {}", e);
+                self.render_settings_page();
+            }
         }
-        self.reload_browser_entries(None);
-        self.render_settings_page();
     }
 
     fn render_settings_page(&mut self) {
@@ -637,11 +661,7 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = [
-            "将当前目录设为文件根目录",
-            "重置文件根目录为 vault 根",
-            "手动同步 vault（S3）",
-        ];
+        let options = ["手动同步 notes（S3）", "删除本地 notes 并重新同步"];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);
@@ -681,7 +701,7 @@ impl ReaderApp {
         if self.md_files.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
-                "没有 Markdown 文件\n/sdcard/vault",
+                "没有 Markdown 文件\n/sdcard/vault/notes",
                 24,
                 20,
                 Display::width() - 24,

@@ -1,0 +1,6 @@
+.rr_sync_status
+.rr_sync_status.tmp
+.rr_sync_status.bak
+.rr_sync_status.entries.tmp
+*.rrpart
+*.rrpart.meta

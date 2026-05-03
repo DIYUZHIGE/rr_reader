@@ -46,7 +46,7 @@ const CMD_WRITE_TEMPERATURE: u8 = 0x1A;
 const BUSY_ACTIVE_HIGH: bool = true;
 const INIT_BUSY_TIMEOUT_MS: u32 = 2_000;
 const REFRESH_BUSY_TIMEOUT_MS: u32 = 30_000;
-const SPI_WRITE_CHUNK: usize = 4096;
+const SPI_WRITE_CHUNK: usize = 1024;
 
 // Framebuffer in static .bss section instead of heap — saves 48KB of heap.
 // SyncUnsafeCell wraps UnsafeCell and asserts thread-safety; safe because the

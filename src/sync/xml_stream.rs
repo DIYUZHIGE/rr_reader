@@ -1,16 +1,11 @@
 use anyhow::Result;
 
-const XML_CONTENTS_OPEN: &[u8] = b"<Contents>";
-const XML_CONTENTS_CLOSE: &[u8] = b"</Contents>";
-const XML_KEY_OPEN: &[u8] = b"<Key>";
-const XML_KEY_CLOSE: &[u8] = b"</Key>";
-const XML_SIZE_OPEN: &[u8] = b"<Size>";
-const XML_SIZE_CLOSE: &[u8] = b"</Size>";
-const XML_ETAG_OPEN: &[u8] = b"<ETag>";
-const XML_ETAG_CLOSE: &[u8] = b"</ETag>";
-const XML_NEXT_TOKEN_OPEN: &[u8] = b"<NextContinuationToken>";
-const XML_NEXT_TOKEN_CLOSE: &[u8] = b"</NextContinuationToken>";
-const XML_STREAM_BUFFER_LIMIT: usize = 8 * 1024;
+const XML_STREAM_BUFFER_LIMIT: usize = 16 * 1024;
+const TAG_CONTENTS: &str = "Contents";
+const TAG_KEY: &str = "Key";
+const TAG_SIZE: &str = "Size";
+const TAG_ETAG: &str = "ETag";
+const TAG_NEXT_TOKEN: &str = "NextContinuationToken";
 
 #[derive(Clone, Debug)]
 pub(super) struct RemoteEntry {
@@ -58,23 +53,23 @@ impl ListXmlStreamParser {
 
     fn consume_complete_blocks(&mut self) {
         loop {
-            let Some(start) = find_subslice(&self.buf, XML_CONTENTS_OPEN) else {
+            let Some((_, after_start)) = find_open_tag(&self.buf, TAG_CONTENTS) else {
                 break;
             };
-            let after_start = start + XML_CONTENTS_OPEN.len();
-            let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_CONTENTS_CLOSE) else {
+            let Some((end, close_end)) = find_close_tag(&self.buf[after_start..], TAG_CONTENTS)
+                .map(|(rel_start, rel_end)| (after_start + rel_start, after_start + rel_end))
+            else {
                 break;
             };
-            let end = after_start + rel_end;
 
             let block = &self.buf[after_start..end];
-            let key = extract_xml_text_bytes(block, XML_KEY_OPEN, XML_KEY_CLOSE)
+            let key = extract_xml_text_bytes(block, TAG_KEY)
                 .map(|s| xml_unescape(&s))
                 .unwrap_or_default();
-            let size = extract_xml_text_bytes(block, XML_SIZE_OPEN, XML_SIZE_CLOSE)
+            let size = extract_xml_text_bytes(block, TAG_SIZE)
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            let etag = extract_xml_text_bytes(block, XML_ETAG_OPEN, XML_ETAG_CLOSE)
+            let etag = extract_xml_text_bytes(block, TAG_ETAG)
                 .map(|s| xml_unescape(&s).trim_matches('"').to_string())
                 .unwrap_or_default();
 
@@ -82,8 +77,7 @@ impl ListXmlStreamParser {
                 self.entries.push(RemoteEntry { key, size, etag });
             }
 
-            let consume_end = end + XML_CONTENTS_CLOSE.len();
-            self.buf.drain(..consume_end);
+            self.buf.drain(..close_end);
         }
     }
 
@@ -92,14 +86,14 @@ impl ListXmlStreamParser {
             return;
         }
 
-        let Some(start) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) else {
+        let Some((_, after_start)) = find_open_tag(&self.buf, TAG_NEXT_TOKEN) else {
             return;
         };
-        let after_start = start + XML_NEXT_TOKEN_OPEN.len();
-        let Some(rel_end) = find_subslice(&self.buf[after_start..], XML_NEXT_TOKEN_CLOSE) else {
+        let Some((end, _)) = find_close_tag(&self.buf[after_start..], TAG_NEXT_TOKEN)
+            .map(|(rel_start, rel_end)| (after_start + rel_start, after_start + rel_end))
+        else {
             return;
         };
-        let end = after_start + rel_end;
         let token_raw = String::from_utf8_lossy(&self.buf[after_start..end]).to_string();
         let token = xml_unescape(&token_raw);
         if !token.is_empty() {
@@ -112,14 +106,14 @@ impl ListXmlStreamParser {
             return;
         }
 
-        if let Some(pos) = find_subslice(&self.buf, XML_CONTENTS_OPEN) {
+        if let Some((pos, _)) = find_open_tag(&self.buf, TAG_CONTENTS) {
             if pos > 0 {
                 self.buf.drain(..pos);
             }
             return;
         }
 
-        if let Some(pos) = find_subslice(&self.buf, XML_NEXT_TOKEN_OPEN) {
+        if let Some((pos, _)) = find_open_tag(&self.buf, TAG_NEXT_TOKEN) {
             if pos > 0 {
                 self.buf.drain(..pos);
             }
@@ -134,24 +128,109 @@ impl ListXmlStreamParser {
     }
 }
 
-fn extract_xml_text_bytes(haystack: &[u8], open: &[u8], close: &[u8]) -> Option<String> {
-    let start = find_subslice(haystack, open)? + open.len();
-    let rel_end = find_subslice(&haystack[start..], close)?;
-    let end = start + rel_end;
-    Some(String::from_utf8_lossy(&haystack[start..end]).to_string())
+fn extract_xml_text_bytes(haystack: &[u8], tag: &str) -> Option<String> {
+    let (_, start) = find_open_tag(haystack, tag)?;
+    let (end, _) = find_close_tag(&haystack[start..], tag)?;
+    Some(String::from_utf8_lossy(&haystack[start..start + end]).to_string())
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+fn find_open_tag(haystack: &[u8], local_name: &str) -> Option<(usize, usize)> {
+    find_xml_tag(haystack, local_name, false)
+}
+
+fn find_close_tag(haystack: &[u8], local_name: &str) -> Option<(usize, usize)> {
+    find_xml_tag(haystack, local_name, true)
+}
+
+fn find_xml_tag(haystack: &[u8], local_name: &str, closing: bool) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    while i < haystack.len() {
+        if haystack[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let name_start = if closing { i + 2 } else { i + 1 };
+        if closing && haystack.get(i + 1) != Some(&b'/') {
+            i += 1;
+            continue;
+        }
+        if name_start >= haystack.len()
+            || haystack[name_start] == b'!'
+            || haystack[name_start] == b'?'
+        {
+            i += 1;
+            continue;
+        }
+        let mut name_end = name_start;
+        while name_end < haystack.len()
+            && !matches!(
+                haystack[name_end],
+                b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
+            )
+        {
+            name_end += 1;
+        }
+        let full_name = core::str::from_utf8(&haystack[name_start..name_end]).ok()?;
+        let matched = full_name == local_name
+            || full_name
+                .rsplit_once(':')
+                .map(|(_, suffix)| suffix == local_name)
+                .unwrap_or(false);
+        if !matched {
+            i += 1;
+            continue;
+        }
+        let mut tag_end = name_end;
+        while tag_end < haystack.len() && haystack[tag_end] != b'>' {
+            tag_end += 1;
+        }
+        if tag_end >= haystack.len() {
+            return None;
+        }
+        return Some((i, tag_end + 1));
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    None
 }
 
 fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        let Some(end) = rest.find(';') else {
+            out.push_str(rest);
+            return out;
+        };
+        let entity = &rest[1..end];
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                if let Ok(value) = u32::from_str_radix(&entity[2..], 16) {
+                    if let Some(ch) = char::from_u32(value) {
+                        out.push(ch);
+                    }
+                }
+            }
+            _ if entity.starts_with('#') => {
+                if let Ok(value) = entity[1..].parse::<u32>() {
+                    if let Some(ch) = char::from_u32(value) {
+                        out.push(ch);
+                    }
+                }
+            }
+            _ => {
+                out.push('&');
+                out.push_str(entity);
+                out.push(';');
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }

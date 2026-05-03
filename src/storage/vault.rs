@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 
 const READER_CONFIG_FILE: &str = ".rr_reader.conf";
 const BROWSER_ROOT_KEY: &str = "browser_root";
+const SYNC_NOTES_DIR: &str = "notes";
 
 impl Storage {
     /// Ensure the vault directory structure exists.
     pub fn ensure_vault_dirs(&self) -> Result<()> {
         let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-        let notes = vault.join("notes");
+        let notes = vault.join(SYNC_NOTES_DIR);
         fs::create_dir_all(&notes).map_err(|e| anyhow!("mkdir {:?}: {}", notes, e))?;
         info!("Vault dirs ready: {:?}", vault);
         Ok(())
@@ -44,7 +45,7 @@ impl Storage {
             .join(VAULT_DIR)
             .join(READER_CONFIG_FILE);
         if !config_path.exists() {
-            return Ok(String::new());
+            return Ok(SYNC_NOTES_DIR.to_string());
         }
 
         let contents = fs::read_to_string(&config_path)
@@ -65,17 +66,34 @@ impl Storage {
             }
         }
 
-        Ok(String::new())
+        Ok(SYNC_NOTES_DIR.to_string())
     }
 
     pub fn write_browser_root_dir(&self, root: &str) -> Result<()> {
         validated_relative_path(root)?;
+        let root = if root.is_empty() {
+            SYNC_NOTES_DIR
+        } else {
+            root
+        };
 
         let config_path = Path::new(SD_MOUNT_POINT)
             .join(VAULT_DIR)
             .join(READER_CONFIG_FILE);
         let contents = format!("{}={}\n", BROWSER_ROOT_KEY, root);
         fs::write(&config_path, contents).map_err(|e| anyhow!("write {:?}: {}", config_path, e))
+    }
+
+    pub fn delete_synced_notes(&self) -> Result<()> {
+        let notes = Path::new(SD_MOUNT_POINT)
+            .join(VAULT_DIR)
+            .join(SYNC_NOTES_DIR);
+        if notes.exists() {
+            fs::remove_dir_all(&notes).map_err(|e| anyhow!("remove {:?}: {}", notes, e))?;
+        }
+        fs::create_dir_all(&notes).map_err(|e| anyhow!("mkdir {:?}: {}", notes, e))?;
+        info!("Deleted local synced notes under {:?}", notes);
+        Ok(())
     }
 
     /// Read a markdown file relative to /sdcard/vault.

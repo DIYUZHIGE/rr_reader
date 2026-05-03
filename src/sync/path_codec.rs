@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
-use super::VAULT_ROOT;
+use super::SYNC_CONTENT_ROOT;
 use crate::storage::RemotelySaveConfig;
 
 pub(super) fn key_to_local_path(config: &RemotelySaveConfig, key: &str) -> Result<PathBuf> {
@@ -30,28 +30,43 @@ pub(super) fn key_to_local_path(config: &RemotelySaveConfig, key: &str) -> Resul
         }
     }
 
-    Ok(Path::new(VAULT_ROOT).join(normalized))
+    Ok(Path::new(SYNC_CONTENT_ROOT).join(normalized))
 }
 
 pub(super) fn is_internal_marker(key: &str) -> bool {
-    if key
-        .split('/')
-        .any(|part| part == ".obsidian" || part.starts_with('_') || part.starts_with('.'))
-    {
-        return true;
-    }
-    false
+    key.split('/').any(|part| {
+        matches!(
+            part,
+            ".obsidian"
+                | ".rr_sync_status"
+                | ".rr_sync_status.tmp"
+                | ".rr_sync_status.bak"
+                | ".rr_sync_status.entries.tmp"
+        ) || part.ends_with(".rrpart")
+            || part.ends_with(".rrpart.meta")
+    })
 }
 
 pub(super) fn encode_path_segments(path: &str) -> String {
-    path.split('/')
-        .map(percent_encode)
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    let mut first = true;
+    for segment in path.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+        percent_encode_into(segment, &mut out);
+    }
+    out
 }
 
 pub(super) fn percent_encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
+    percent_encode_into(raw, &mut out);
+    out
+}
+
+fn percent_encode_into(raw: &str, out: &mut String) {
     for &b in raw.as_bytes() {
         if is_unreserved(b) {
             out.push(char::from(b));
@@ -61,7 +76,6 @@ pub(super) fn percent_encode(raw: &str) -> String {
             out.push(hex_upper(b & 0x0f));
         }
     }
-    out
 }
 
 fn strip_remote_prefix<'a>(key: &'a str, prefix: &str) -> &'a str {
