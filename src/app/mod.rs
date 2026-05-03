@@ -613,11 +613,6 @@ impl ReaderApp {
                             }
                         };
                         self.reload_browser_entries(None);
-                        warn!(
-                            "Browser reloaded after sync: entries={}",
-                            self.browser.entries.len()
-                        );
-                        self.hardware.storage.dump_vault_tree();
                         info!("Sync status written to {}", report.status_path);
                         format!(
                             "同步完成：下载 {}，跳过 {}，删除 {}",

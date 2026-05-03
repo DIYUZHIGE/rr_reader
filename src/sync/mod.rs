@@ -27,7 +27,7 @@ const VAULT_ROOT: &str = "/sdcard/vault";
 const SYNC_CONTENT_ROOT: &str = "/sdcard/vault";
 const SYNC_STATUS_PATH: &str = "/sdcard/vault/.rr_sync_status";
 const EMPTY_PAYLOAD_SHA256: &str = "UNSIGNED-PAYLOAD";
-const LIST_MAX_KEYS: usize = 20;
+const LIST_MAX_KEYS: usize = 100;
 const LIST_MAX_PAGES: usize = 10_000;
 const LIST_MAX_ATTEMPTS: usize = 5;
 const ERROR_BODY_LIMIT: usize = 2 * 1024;
@@ -36,10 +36,11 @@ const LOCAL_PATH_MAX_BYTES: usize = 1024;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const DOWNLOAD_READ_BUFFER_BYTES: usize = 4096;
 const DOWNLOAD_TX_BUFFER_BYTES: usize = 8192;
-const DOWNLOAD_DIRECT_MAX_BYTES: u64 = 0;
-const DOWNLOAD_MAX_ATTEMPTS: usize = 30;
-const DOWNLOAD_MIN_FREE_HEAP: u32 = 60 * 1024;
-const DOWNLOAD_LOW_HEAP_RETRY_DELAY_MS: u32 = 500;
+const DOWNLOAD_DIRECT_MAX_BYTES: u64 = 128 * 1024;
+const DOWNLOAD_MAX_ATTEMPTS: usize = 5;
+const DOWNLOAD_MIN_FREE_HEAP: u32 = 52 * 1024;
+const DOWNLOAD_CRITICAL_HEAP: u32 = 56 * 1024;
+const DOWNLOAD_LOW_HEAP_RETRY_DELAY_MS: u32 = 200;
 
 const SNTP_SERVERS: &str = "ntp.aliyun.com";
 
@@ -179,17 +180,7 @@ fn process_remote_entry(
     }
 
     let ctx = match build_entry_context(config, key) {
-        Ok(v) => {
-            warn!(
-                "sync: [{}/{}] {} -> {:?} ({} bytes)",
-                page_progress.processed_in_page,
-                page_progress.total_in_page,
-                key,
-                v.target_path_str,
-                entry.size
-            );
-            v
-        }
+        Ok(v) => v,
         Err(e) => {
             warn!("Skip {}: {}", key, e);
             counters.skipped += 1;
@@ -227,12 +218,6 @@ fn process_remote_entry(
     match download_file_signed(config, &object_url, &ctx.target_path_str, entry) {
         Ok(()) => {
             counters.downloaded += 1;
-            warn!("Downloaded: {}", key);
-            if std::path::Path::new(&ctx.target_path_str).exists() {
-                warn!("  verified: {}", ctx.target_path_str);
-            } else {
-                warn!("  MISSING after download: {}", ctx.target_path_str);
-            }
             let manifest_entry = manifest_entry_for_remote(entry, &ctx.target_path_str);
             manifest_writer.append_entry(&entry.key, &manifest_entry)?;
         }
@@ -278,15 +263,16 @@ pub fn sync_vault_from_s3_config(
         info!("Listing remote objects: {}", list_url);
 
         let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
-        warn!(
-            "List page {}: {} entries, next={:?}",
-            page,
-            entries.len(),
-            next_token
-        );
         if entries.is_empty() && next_token.is_none() {
             break;
         }
+        warn!(
+            "List page {}: {} entries (sample: {} -> {:?})",
+            page,
+            entries.len(),
+            entries.first().map(|e| e.key.as_str()).unwrap_or("-"),
+            entries.first().map(|e| e.size).unwrap_or(0)
+        );
 
         let total_in_page = entries.len();
         for (idx, entry) in entries.iter().enumerate() {
@@ -302,6 +288,15 @@ pub fn sync_vault_from_s3_config(
                 &mut manifest_writer,
                 on_progress,
             )?;
+
+            // Prevent heap exhaustion: flush manifest and pause every N files.
+            if idx > 0 && idx % 25 == 0 {
+                manifest_writer.flush()?;
+                while free_heap() < DOWNLOAD_CRITICAL_HEAP {
+                    warn!("Low heap during sync: {} bytes, pausing...", free_heap());
+                    FreeRtos::delay_ms(1000);
+                }
+            }
         }
 
         continuation_token = next_token;
@@ -317,13 +312,6 @@ pub fn sync_vault_from_s3_config(
         }
     }
 
-    warn!(
-        "Sync done: downloaded={} skipped={} skipped_unchanged={}",
-        counters.downloaded, counters.skipped, counters.skipped_unchanged
-    );
-    warn!("=== vault before stale cleanup ===");
-    dump_vault_tree_warn(&Path::new(VAULT_ROOT));
-    warn!("=== vault before stale cleanup end ===");
     if counters.skipped_unchanged > 0 {
         info!("Skipped {} files (unchanged)", counters.skipped_unchanged);
     }
@@ -1575,28 +1563,5 @@ fn hex_lower(nibble: u8) -> char {
     match nibble {
         0..=9 => char::from(b'0' + nibble),
         _ => char::from(b'a' + (nibble - 10)),
-    }
-}
-
-fn dump_vault_tree_warn(dir: &Path) {
-    dump_dir_warn(dir, 0);
-}
-
-fn dump_dir_warn(dir: &Path, depth: usize) {
-    let prefix = "  ".repeat(depth);
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        if path.is_dir() {
-            warn!("{}{}/ (dir)", prefix, name);
-            dump_dir_warn(&path, depth + 1);
-        } else {
-            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            warn!("{}{} ({} bytes)", prefix, name, size);
-        }
     }
 }
