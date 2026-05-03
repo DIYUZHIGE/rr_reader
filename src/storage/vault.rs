@@ -3,28 +3,63 @@ use super::path::{
 };
 use super::{Storage, SD_MOUNT_POINT, VAULT_DIR};
 use anyhow::{anyhow, Result};
-use log::info;
+use log::{info, warn};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const READER_CONFIG_FILE: &str = ".rr_reader.conf";
 const BROWSER_ROOT_KEY: &str = "browser_root";
-const SYNC_NOTES_DIR: &str = "notes";
 
 impl Storage {
     /// Ensure the vault directory structure exists.
     pub fn ensure_vault_dirs(&self) -> Result<()> {
         let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-        let notes = vault.join(SYNC_NOTES_DIR);
-        fs::create_dir_all(&notes).map_err(|e| anyhow!("mkdir {:?}: {}", notes, e))?;
-        info!("Vault dirs ready: {:?}", vault);
+        fs::create_dir_all(&vault).map_err(|e| anyhow!("mkdir {:?}: {}", vault, e))?;
+        info!("Vault dir ready: {:?}", vault);
+        self.dump_vault_tree();
         Ok(())
+    }
+
+    pub fn dump_vault_tree(&self) {
+        let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+        warn!("=== vault tree: {:?} ===", vault);
+        self.dump_dir_tree(&vault, 0);
+        warn!("=== vault tree end ===");
+    }
+
+    fn dump_dir_tree(&self, dir: &Path, depth: usize) {
+        let prefix = "  ".repeat(depth);
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("{}read_dir {:?} failed: {}", prefix, dir, e);
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("{}dir entry error: {}", prefix, e);
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            if path.is_dir() {
+                warn!("{}{}/ (dir)", prefix, name);
+                self.dump_dir_tree(&path, depth + 1);
+            } else {
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                warn!("{}{} ({} bytes)", prefix, name, size);
+            }
+        }
     }
 
     /// List markdown files recursively under /sdcard/vault.
     ///
-    /// This covers both a copied Obsidian vault directly under /sdcard/vault
-    /// and the eventual sync cache layout under /sdcard/vault/notes.
+    /// This scans markdown files under /sdcard/vault, covering both a
+    /// manually copied vault and S3-synced content.
     pub fn list_markdown_files(&self, base: &str) -> Result<Vec<String>> {
         let base = validated_relative_path(base)?;
         let scan_root = Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(base);
@@ -45,7 +80,7 @@ impl Storage {
             .join(VAULT_DIR)
             .join(READER_CONFIG_FILE);
         if !config_path.exists() {
-            return Ok(SYNC_NOTES_DIR.to_string());
+            return Ok(String::new());
         }
 
         let contents = fs::read_to_string(&config_path)
@@ -60,22 +95,24 @@ impl Storage {
             if let Some((key, value)) = line.split_once('=') {
                 if key.trim() == BROWSER_ROOT_KEY {
                     let value = value.trim();
+                    // Migrate old default "notes" to vault root.
+                    if value == "notes" {
+                        let _ = fs::remove_file(&config_path);
+                        warn!("Migrated stale browser_root=notes config to vault root");
+                        return Ok(String::new());
+                    }
                     validated_relative_path(value)?;
                     return Ok(value.to_string());
                 }
             }
         }
 
-        Ok(SYNC_NOTES_DIR.to_string())
+        Ok(String::new())
     }
 
+    #[allow(dead_code)]
     pub fn write_browser_root_dir(&self, root: &str) -> Result<()> {
         validated_relative_path(root)?;
-        let root = if root.is_empty() {
-            SYNC_NOTES_DIR
-        } else {
-            root
-        };
 
         let config_path = Path::new(SD_MOUNT_POINT)
             .join(VAULT_DIR)
@@ -84,15 +121,33 @@ impl Storage {
         fs::write(&config_path, contents).map_err(|e| anyhow!("write {:?}: {}", config_path, e))
     }
 
+    /// Delete synced markdown files and assets, keeping config files.
     pub fn delete_synced_notes(&self) -> Result<()> {
-        let notes = Path::new(SD_MOUNT_POINT)
-            .join(VAULT_DIR)
-            .join(SYNC_NOTES_DIR);
-        if notes.exists() {
-            fs::remove_dir_all(&notes).map_err(|e| anyhow!("remove {:?}: {}", notes, e))?;
+        let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
+        if vault.exists() {
+            self.remove_synced_content(&vault)?;
         }
-        fs::create_dir_all(&notes).map_err(|e| anyhow!("mkdir {:?}: {}", notes, e))?;
-        info!("Deleted local synced notes under {:?}", notes);
+        fs::create_dir_all(&vault).map_err(|e| anyhow!("mkdir {:?}: {}", vault, e))?;
+        info!("Deleted synced content under {:?}", vault);
+        Ok(())
+    }
+
+    fn remove_synced_content(&self, dir: &Path) -> Result<()> {
+        for entry in fs::read_dir(dir).map_err(|e| anyhow!("read_dir {:?}: {}", dir, e))? {
+            let entry = entry.map_err(|e| anyhow!("dir entry: {}", e))?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|e| anyhow!("remove_dir {:?}: {}", path, e))?;
+            } else {
+                fs::remove_file(&path).map_err(|e| anyhow!("remove {:?}: {}", path, e))?;
+            }
+        }
         Ok(())
     }
 

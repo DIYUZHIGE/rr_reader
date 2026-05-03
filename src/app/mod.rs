@@ -183,6 +183,13 @@ impl ReaderApp {
             AppEvent::SettingsBack => {
                 if matches!(self.activity, Activity::Settings) {
                     self.activity = Activity::FileBrowser;
+                    self.reload_browser_entries(None);
+                    warn!(
+                        "Switched to FileBrowser: md_files={} browser_entries={} current_dir={:?}",
+                        self.md_files.len(),
+                        self.browser.entries.len(),
+                        self.browser.current_dir
+                    );
                     self.render_file_browser();
                 }
             }
@@ -271,6 +278,16 @@ impl ReaderApp {
             .collect();
         entries.extend(files);
         sort_browser_entries(&mut entries);
+
+        warn!(
+            "reload_browser_entries: md_files={} root_prefix={:?} current_dir={:?} entries={} (dirs={} files={})",
+            self.md_files.len(),
+            root_prefix,
+            self.browser.current_dir,
+            entries.len(),
+            entries.iter().filter(|e| e.is_dir).count(),
+            entries.iter().filter(|e| !e.is_dir).count()
+        );
 
         self.browser.entries = entries;
         self.browser.selected = 0;
@@ -585,20 +602,22 @@ impl ReaderApp {
                     self.display.clear_glyph_cache();
                 }) {
                     Ok(report) => {
-                        self.browser_root_dir = "notes".to_string();
-                        self.browser.current_dir = self.browser_root_dir.clone();
-                        let _ = self
-                            .hardware
-                            .storage
-                            .write_browser_root_dir(&self.browser_root_dir);
                         self.md_files = match self.hardware.storage.list_markdown_files("") {
-                            Ok(files) => files,
+                            Ok(files) => {
+                                warn!("Rescan after sync: {} files", files.len());
+                                files
+                            }
                             Err(e) => {
                                 warn!("Failed to rescan vault after sync: {}", e);
                                 self.md_files.clone()
                             }
                         };
                         self.reload_browser_entries(None);
+                        warn!(
+                            "Browser reloaded after sync: entries={}",
+                            self.browser.entries.len()
+                        );
+                        self.hardware.storage.dump_vault_tree();
                         info!("Sync status written to {}", report.status_path);
                         format!(
                             "同步完成：下载 {}，跳过 {}，删除 {}",
@@ -628,19 +647,13 @@ impl ReaderApp {
         self.display.clear_glyph_cache();
 
         self.settings_status = "正在删除本地 notes...".to_string();
-        self.render_sync_status_light("正在删除本地 notes...");
+        self.render_sync_status_light("正在删除本地文件...");
         self.flush_ui_refresh();
         self.display.clear_glyph_cache();
 
         match self.hardware.storage.delete_synced_notes() {
             Ok(()) => {
                 self.md_files.clear();
-                self.browser_root_dir = "notes".to_string();
-                self.browser.current_dir = self.browser_root_dir.clone();
-                let _ = self
-                    .hardware
-                    .storage
-                    .write_browser_root_dir(&self.browser_root_dir);
                 self.reload_browser_entries(None);
                 self.trigger_manual_sync();
             }
@@ -661,7 +674,7 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = ["手动同步 notes（S3）", "删除本地 notes 并重新同步"];
+        let options = ["手动同步（S3）", "删除本地文件并重新同步"];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);
@@ -701,7 +714,7 @@ impl ReaderApp {
         if self.md_files.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
-                "没有 Markdown 文件\n/sdcard/vault/notes",
+                "没有 Markdown 文件\n/sdcard/vault",
                 24,
                 20,
                 Display::width() - 24,

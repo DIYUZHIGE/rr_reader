@@ -43,7 +43,7 @@ impl Storage {
         let mut card: *mut sys::sdmmc_card_t = std::ptr::null_mut();
         let mount_config = sys::esp_vfs_fat_mount_config_t {
             format_if_mount_failed: false,
-            max_files: 2,
+            max_files: 4,
             allocation_unit_size: 0,
             disk_status_check_enable: false,
             use_one_fat: false,

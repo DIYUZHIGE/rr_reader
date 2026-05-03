@@ -28,6 +28,12 @@ impl SyncManifestWriter {
         write_manifest_entry(&mut self.entries_file, key, entry)
     }
 
+    pub(super) fn flush(&mut self) -> Result<()> {
+        self.entries_file
+            .sync_all()
+            .map_err(|e| anyhow!("sync {}: {}", SYNC_STATUS_ENTRIES_TMP_PATH, e))
+    }
+
     pub(super) fn entries_path(&self) -> &'static str {
         SYNC_STATUS_ENTRIES_TMP_PATH
     }

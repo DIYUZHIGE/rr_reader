@@ -24,7 +24,7 @@ use xml_stream::{ListXmlStreamParser, RemoteEntry};
 type HmacSha256 = Hmac<Sha256>;
 
 const VAULT_ROOT: &str = "/sdcard/vault";
-const SYNC_CONTENT_ROOT: &str = "/sdcard/vault/notes";
+const SYNC_CONTENT_ROOT: &str = "/sdcard/vault";
 const SYNC_STATUS_PATH: &str = "/sdcard/vault/.rr_sync_status";
 const EMPTY_PAYLOAD_SHA256: &str = "UNSIGNED-PAYLOAD";
 const LIST_MAX_KEYS: usize = 20;
@@ -34,10 +34,11 @@ const ERROR_BODY_LIMIT: usize = 2 * 1024;
 const OBJECT_KEY_MAX_BYTES: usize = 768;
 const LOCAL_PATH_MAX_BYTES: usize = 1024;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 20;
-const DOWNLOAD_READ_BUFFER_BYTES: usize = 512;
+const DOWNLOAD_READ_BUFFER_BYTES: usize = 4096;
+const DOWNLOAD_TX_BUFFER_BYTES: usize = 8192;
 const DOWNLOAD_DIRECT_MAX_BYTES: u64 = 0;
 const DOWNLOAD_MAX_ATTEMPTS: usize = 30;
-const DOWNLOAD_MIN_FREE_HEAP: u32 = 68 * 1024;
+const DOWNLOAD_MIN_FREE_HEAP: u32 = 60 * 1024;
 const DOWNLOAD_LOW_HEAP_RETRY_DELAY_MS: u32 = 500;
 
 const SNTP_SERVERS: &str = "ntp.aliyun.com";
@@ -171,14 +172,24 @@ fn process_remote_entry(
     let key = entry.key.as_str();
 
     if let Some(reason) = classify_skip_reason(key) {
-        info!("Skip {}: {}", key, reason);
+        warn!("Skip {}: {}", key, reason);
         counters.skipped += 1;
         append_old_manifest_entry_if_present(manifest_writer, key)?;
         return Ok(());
     }
 
     let ctx = match build_entry_context(config, key) {
-        Ok(v) => v,
+        Ok(v) => {
+            warn!(
+                "sync: [{}/{}] {} -> {:?} ({} bytes)",
+                page_progress.processed_in_page,
+                page_progress.total_in_page,
+                key,
+                v.target_path_str,
+                entry.size
+            );
+            v
+        }
         Err(e) => {
             warn!("Skip {}: {}", key, e);
             counters.skipped += 1;
@@ -216,6 +227,12 @@ fn process_remote_entry(
     match download_file_signed(config, &object_url, &ctx.target_path_str, entry) {
         Ok(()) => {
             counters.downloaded += 1;
+            warn!("Downloaded: {}", key);
+            if std::path::Path::new(&ctx.target_path_str).exists() {
+                warn!("  verified: {}", ctx.target_path_str);
+            } else {
+                warn!("  MISSING after download: {}", ctx.target_path_str);
+            }
             let manifest_entry = manifest_entry_for_remote(entry, &ctx.target_path_str);
             manifest_writer.append_entry(&entry.key, &manifest_entry)?;
         }
@@ -257,9 +274,16 @@ pub fn sync_vault_from_s3_config(
         }
         on_progress(&format!("获取文件列表 第{}页...", page));
         let list_url = build_list_url(config, continuation_token.as_deref())?;
+        warn!("List URL page {}: {}", page, list_url);
         info!("Listing remote objects: {}", list_url);
 
         let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
+        warn!(
+            "List page {}: {} entries, next={:?}",
+            page,
+            entries.len(),
+            next_token
+        );
         if entries.is_empty() && next_token.is_none() {
             break;
         }
@@ -293,9 +317,19 @@ pub fn sync_vault_from_s3_config(
         }
     }
 
+    warn!(
+        "Sync done: downloaded={} skipped={} skipped_unchanged={}",
+        counters.downloaded, counters.skipped, counters.skipped_unchanged
+    );
+    warn!("=== vault before stale cleanup ===");
+    dump_vault_tree_warn(&Path::new(VAULT_ROOT));
+    warn!("=== vault before stale cleanup end ===");
     if counters.skipped_unchanged > 0 {
         info!("Skipped {} files (unchanged)", counters.skipped_unchanged);
     }
+
+    // Flush buffered manifest entries so delete_stale sees them.
+    manifest_writer.flush()?;
 
     let deleted_stale = delete_stale_manifest_files(manifest_writer.entries_path())?;
     if deleted_stale > 0 {
@@ -454,7 +488,7 @@ fn http_list_objects_signed_once(
 
     let config_http = HttpConfiguration {
         buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
-        buffer_size_tx: Some(512),
+        buffer_size_tx: Some(DOWNLOAD_TX_BUFFER_BYTES),
         timeout: Some(core::time::Duration::from_secs(20)),
         use_global_ca_store: true,
         crt_bundle_attach: Some(attach_crt_bundle),
@@ -678,7 +712,7 @@ fn download_file_signed_direct_once(
 
     let config_http = HttpConfiguration {
         buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
-        buffer_size_tx: Some(512),
+        buffer_size_tx: Some(DOWNLOAD_TX_BUFFER_BYTES),
         timeout: Some(core::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)),
         use_global_ca_store: true,
         crt_bundle_attach: Some(attach_crt_bundle),
@@ -799,7 +833,7 @@ fn download_file_signed_chunk(
 
     let config_http = HttpConfiguration {
         buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
-        buffer_size_tx: Some(512),
+        buffer_size_tx: Some(DOWNLOAD_TX_BUFFER_BYTES),
         timeout: Some(core::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)),
         use_global_ca_store: true,
         crt_bundle_attach: Some(attach_crt_bundle),
@@ -1271,7 +1305,7 @@ fn signing_timestamp_from_datetime(dt: OffsetDateTime) -> SigningTimestamp {
 fn fetch_server_datetime(url: &str) -> Result<Option<OffsetDateTime>> {
     let config_http = HttpConfiguration {
         buffer_size: Some(DOWNLOAD_READ_BUFFER_BYTES),
-        buffer_size_tx: Some(512),
+        buffer_size_tx: Some(DOWNLOAD_TX_BUFFER_BYTES),
         timeout: Some(core::time::Duration::from_secs(15)),
         use_global_ca_store: true,
         crt_bundle_attach: Some(attach_crt_bundle),
@@ -1541,5 +1575,28 @@ fn hex_lower(nibble: u8) -> char {
     match nibble {
         0..=9 => char::from(b'0' + nibble),
         _ => char::from(b'a' + (nibble - 10)),
+    }
+}
+
+fn dump_vault_tree_warn(dir: &Path) {
+    dump_dir_warn(dir, 0);
+}
+
+fn dump_dir_warn(dir: &Path, depth: usize) {
+    let prefix = "  ".repeat(depth);
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        if path.is_dir() {
+            warn!("{}{}/ (dir)", prefix, name);
+            dump_dir_warn(&path, depth + 1);
+        } else {
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            warn!("{}{} ({} bytes)", prefix, name, size);
+        }
     }
 }
