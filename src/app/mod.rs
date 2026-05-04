@@ -528,7 +528,7 @@ impl ReaderApp {
     }
 
     fn settings_option_count(&self) -> usize {
-        3
+        5
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -551,6 +551,8 @@ impl ReaderApp {
             0 => self.trigger_manual_sync(),
             1 => self.trigger_delete_notes_and_sync(),
             2 => self.trigger_clear_page_cache(),
+            3 => self.trigger_clear_image_cache(),
+            4 => self.trigger_cache_all_images(),
             _ => {}
         }
     }
@@ -672,6 +674,29 @@ impl ReaderApp {
         self.render_settings_page();
     }
 
+    fn trigger_clear_image_cache(&mut self) {
+        let removed = crate::reader::clear_image_cache();
+        self.settings_status = format!("已清除 {} 个图片缓存", removed);
+        self.render_settings_page();
+    }
+
+    fn trigger_cache_all_images(&mut self) {
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
+        self.settings_status = "正在缓存图片...".to_string();
+        self.render_settings_page();
+        self.flush_ui_refresh();
+
+        let cached = crate::reader::cache_all_images(&mut |msg: &str| {
+            self.settings_status = msg.to_string();
+            self.render_settings_page();
+            self.flush_ui_refresh();
+            self.display.clear_glyph_cache();
+        });
+        self.settings_status = format!("图片缓存完成: {} 张", cached);
+        self.render_settings_page();
+    }
+
     fn render_settings_page(&mut self) {
         self.display.clear(0xFF);
 
@@ -681,7 +706,13 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = ["手动同步（S3）", "删除本地文件并重新同步", "清除页面缓存"];
+        let options = [
+            "手动同步（S3）",
+            "删除本地文件并重新同步",
+            "清除页面缓存",
+            "清除图片缓存",
+            "缓存所有图片",
+        ];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);

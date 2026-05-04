@@ -10,6 +10,8 @@ pub mod markdown;
 mod math;
 mod pagination;
 
+pub use self::image::cache_all_images;
+pub use self::image::clear_image_cache;
 use self::image::draw_reader_image;
 pub(super) use self::markdown::parse_markdown_blocks;
 pub use self::markdown::preprocess_obsidian_embeds;

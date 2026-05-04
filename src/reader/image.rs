@@ -336,11 +336,66 @@ fn load_img_cache(full_path: &str, max_w: usize, max_h: usize) -> Result<(usize,
     Err(anyhow!("cache miss"))
 }
 
-// --- Image caching stubs (functions use same callback, no new extern "C") ---
-pub fn cache_all_images(_on_progress: &mut dyn FnMut(&str)) -> usize {
-    0
+// --- Image caching ---
+pub fn clear_image_cache() -> usize {
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(IMG_CACHE_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("img") {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
 }
 
-pub fn clear_image_cache() -> usize {
-    0
+pub fn cache_all_images(on_progress: &mut dyn FnMut(&str)) -> usize {
+    let mut cached = 0usize;
+    cache_dir_images(
+        std::path::Path::new("/sdcard/vault"),
+        &mut cached,
+        on_progress,
+    );
+    cached
+}
+
+fn cache_dir_images(dir: &std::path::Path, cached: &mut usize, on_progress: &mut dyn FnMut(&str)) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let disp_w = 752;
+    let disp_h = 240;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') {
+                    continue;
+                }
+            }
+            cache_dir_images(&path, cached, on_progress);
+        } else {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if !lower.ends_with(".jpg") && !lower.ends_with(".jpeg") {
+                continue;
+            }
+            let full = path.to_string_lossy();
+            let cpath = img_cache_path(&full);
+            if std::path::Path::new(&cpath).exists() {
+                continue;
+            }
+            on_progress(&format!("缓存: {}", name));
+            if let Ok((w, h, mono)) = decode_jpeg_to_mono(&full, disp_w, disp_h) {
+                save_img_cache(&cpath, w, h, &mono);
+                *cached += 1;
+            }
+        }
+    }
 }
