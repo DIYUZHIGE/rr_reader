@@ -28,42 +28,6 @@ impl Storage {
         Ok(())
     }
 
-    pub fn dump_vault_tree(&self) {
-        let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
-        warn!("=== vault tree: {:?} ===", vault);
-        self.dump_dir_tree(&vault, 0);
-        warn!("=== vault tree end ===");
-    }
-
-    fn dump_dir_tree(&self, dir: &Path, depth: usize) {
-        let prefix = "  ".repeat(depth);
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("{}read_dir {:?} failed: {}", prefix, dir, e);
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!("{}dir entry error: {}", prefix, e);
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            if path.is_dir() {
-                warn!("{}{}/ (dir)", prefix, name);
-                self.dump_dir_tree(&path, depth + 1);
-            } else {
-                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                warn!("{}{} ({} bytes)", prefix, name, size);
-            }
-        }
-    }
-
     /// List markdown files recursively under /sdcard/vault.
     ///
     /// This scans markdown files under /sdcard/vault, covering both a
@@ -157,13 +121,6 @@ impl Storage {
             }
         }
         Ok(())
-    }
-
-    /// Read a markdown file relative to /sdcard/vault.
-    pub fn read_markdown_file(&self, rel_path: &str) -> Result<String> {
-        let rel = validated_relative_path(rel_path)?;
-        let full = Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(rel);
-        fs::read_to_string(&full).map_err(|e| anyhow!("read {:?}: {}", full, e))
     }
 
     pub fn resolve_asset_path_relative_to(

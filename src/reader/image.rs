@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::sys;
 use jpeg_decoder::Decoder as HeaderDecoder;
 use std::ffi::CString;
@@ -110,15 +109,11 @@ fn draw_packed_to_display(
 
 const IMG_CACHE_DIR: &str = "/sdcard/vault/.rr_cache";
 
-struct DrawCtx<'a> {
-    display: Option<&'a mut Display>,
-    draw_x: usize,
-    draw_y: usize,
-    max_w: usize,
-    max_h: usize,
-    // Buffer mode: if set, write packed bits here instead of display
+struct DrawCtx {
     buf: *mut u8,
     buf_stride: usize,
+    max_w: usize,
+    max_h: usize,
 }
 
 unsafe extern "C" fn jpeg_gray_block_cb(
@@ -133,7 +128,7 @@ unsafe extern "C" fn jpeg_gray_block_cb(
         return 0;
     }
 
-    let ctx = &mut *(ctx as *mut DrawCtx<'_>);
+    let ctx = &mut *(ctx as *mut DrawCtx);
     let bw = (right as usize)
         .saturating_sub(left as usize)
         .saturating_add(1);
@@ -144,98 +139,25 @@ unsafe extern "C" fn jpeg_gray_block_cb(
         return 1;
     }
 
-    // Buffer mode: write ALL blocks (including partial edges)
-    if !ctx.buf.is_null() {
-        let src = std::slice::from_raw_parts(gray, bw.saturating_mul(bh));
-        for row in 0..bh {
-            let y = top as usize + row;
-            if y >= ctx.max_h {
+    let src = std::slice::from_raw_parts(gray, bw.saturating_mul(bh));
+    for row in 0..bh {
+        let y = top as usize + row;
+        if y >= ctx.max_h {
+            break;
+        }
+        for col in 0..bw {
+            let px = left as usize + col;
+            if px >= ctx.max_w {
                 break;
             }
-            for col in 0..bw {
-                let px = left as usize + col;
-                if px >= ctx.max_w {
-                    break;
-                }
-                let byte_off = y * ctx.buf_stride + px / 8;
-                let bit_off = px % 8;
-                if src[row * bw + col] <= 128 {
-                    let dst = &mut *ctx.buf.add(byte_off);
-                    *dst |= 0x80 >> bit_off;
-                }
+            let byte_off = y * ctx.buf_stride + px / 8;
+            if src[row * bw + col] <= 128 {
+                let dst = &mut *ctx.buf.add(byte_off);
+                *dst |= 0x80 >> (px % 8);
             }
         }
-        return 1;
     }
-
-    // Display mode
-    // Display mode: clip to max bounds
-    if left as usize >= ctx.max_w || top as usize >= ctx.max_h {
-        return 1;
-    }
-
-    let display = ctx.display.as_deref_mut().unwrap();
-    let dx = ctx.draw_x + left as usize;
-    let dy = ctx.draw_y + top as usize;
-
-    let draw_w = bw.min(ctx.max_w.saturating_sub(left as usize));
-    let draw_h = bh.min(ctx.max_h.saturating_sub(top as usize));
-    let src = std::slice::from_raw_parts(gray, bw.saturating_mul(bh));
-
-    if draw_w == bw && draw_h == bh {
-        display.draw_mono_bitmap(dx, dy, bw, bh, src);
-        return 1;
-    }
-
-    let mut clipped = Vec::with_capacity(draw_w.saturating_mul(draw_h));
-    for row in 0..draw_h {
-        let start = row.saturating_mul(bw);
-        let end = start.saturating_add(draw_w).min(src.len());
-        clipped.extend_from_slice(&src[start..end]);
-    }
-    display.draw_mono_bitmap(dx, dy, draw_w, draw_h, &clipped);
     1
-}
-
-fn draw_jpeg_streaming(display: &mut Display, full_path: &str, image: &RenderImage) -> Result<()> {
-    let (src_w, src_h) = read_jpeg_size(full_path)?;
-    if src_w == 0 || src_h == 0 || src_w > MAX_JPEG_DIMENSION || src_h > MAX_JPEG_DIMENSION {
-        return Err(anyhow!("jpeg dimension unsupported: {}x{}", src_w, src_h));
-    }
-    let scale = choose_tjpgd_scale(src_w, src_h, image.width, image.height);
-    let dec_w = scaled_dim(src_w, scale);
-    let draw_x = image.x + image.width.saturating_sub(dec_w) / 2;
-    let draw_y = image.y;
-
-    let c_path = CString::new(full_path).map_err(|_| anyhow!("invalid image path"))?;
-    let mut out_w: u16 = 0;
-    let mut out_h: u16 = 0;
-
-    let mut ctx = DrawCtx {
-        display: Some(display),
-        draw_x,
-        draw_y,
-        max_w: image.width,
-        max_h: image.height,
-        buf: std::ptr::null_mut(),
-        buf_stride: 0,
-    };
-
-    let rc = unsafe {
-        sys::rr_decode_jpeg_streaming(
-            c_path.as_ptr(),
-            scale,
-            Some(jpeg_gray_block_cb),
-            (&mut ctx as *mut DrawCtx<'_>).cast::<c_void>(),
-            &mut out_w,
-            &mut out_h,
-        )
-    };
-    if rc != 0 {
-        return Err(anyhow!("tjpgd decode failed: {}", rc));
-    }
-    FreeRtos::delay_ms(1);
-    Ok(())
 }
 
 fn read_jpeg_size(path: &str) -> Result<(usize, usize)> {
@@ -281,13 +203,10 @@ fn decode_jpeg_to_mono(
 
     let c_path = CString::new(full_path).map_err(|_| anyhow!("invalid path"))?;
     let mut ctx = DrawCtx {
-        display: None,
-        draw_x: 0,
-        draw_y: 0,
-        max_w: dec_w,
-        max_h: dec_h,
         buf: buffer.as_mut_ptr(),
         buf_stride: stride,
+        max_w: dec_w,
+        max_h: dec_h,
     };
 
     let rc = unsafe {
@@ -295,7 +214,7 @@ fn decode_jpeg_to_mono(
             c_path.as_ptr(),
             scale,
             Some(jpeg_gray_block_cb),
-            (&mut ctx as *mut DrawCtx<'_>).cast::<c_void>(),
+            (&mut ctx as *mut DrawCtx).cast::<c_void>(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )

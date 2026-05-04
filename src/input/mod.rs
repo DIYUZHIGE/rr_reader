@@ -24,7 +24,7 @@ const ADC_RANGES_2: [i32; 3] = [ADC_NO_BUTTON as i32, 1120, i32::MIN];
 const DEBOUNCE_DELAY_MS: u64 = 5;
 const ADC_SAMPLE_COUNT: usize = 3;
 const IDLE_SAMPLING_ENTER_TICKS: u32 = 120;
-const IDLE_SAMPLING_STRIDE: u8 = 4;
+const IDLE_SAMPLING_STRIDE: u8 = 2;
 
 // ── Logical button types ────────────────────────────────────────
 
@@ -307,6 +307,14 @@ impl InputManager {
         self.released_events = 0;
         self.deferred_pressed_events = 0;
         self.deferred_released_events = 0;
+    }
+
+    pub fn clear_power_event(&mut self) {
+        let mask = 1u8 << BTN_POWER;
+        self.pressed_events &= !mask;
+        self.released_events &= !mask;
+        self.deferred_pressed_events &= !mask;
+        self.deferred_released_events &= !mask;
     }
 
     // ── Logical mapping ──────────────────────────────────────────

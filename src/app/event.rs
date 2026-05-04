@@ -21,6 +21,7 @@ pub(super) enum EventMode {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum AppEvent {
+    PowerShortPress,
     PowerLongPress,
     BrowserMove(isize),
     BrowserConfirm,
@@ -87,6 +88,11 @@ impl EventPump {
         {
             events.push(AppEvent::PowerLongPress);
             return events;
+        }
+
+        if hardware.input.was_released(BTN_POWER) {
+            hardware.input.clear_power_event();
+            events.push(AppEvent::PowerShortPress);
         }
 
         match mode {

@@ -154,8 +154,22 @@ impl ReaderApp {
         Ok(())
     }
 
+    fn open_random_file(&mut self) {
+        if self.md_files.is_empty() {
+            return;
+        }
+        let idx = (crate::time::now_ms() as usize) % self.md_files.len();
+        self.on_enter_reader_mode();
+        self.activity = Activity::Reader(ReaderState {
+            file_index: idx,
+            page_index: 0,
+        });
+        self.render_current_file();
+    }
+
     fn handle_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
+            AppEvent::PowerShortPress => self.open_random_file(),
             AppEvent::PowerLongPress => {
                 info!("Power long press -> sleep");
                 self.power.enter_deep_sleep(None);
