@@ -8,7 +8,7 @@ use esp_idf_hal::sys;
 use log::{debug, info};
 
 const POWER_BUTTON_PIN: u64 = POWER_BUTTON_GPIO as u64;
-const DEFAULT_SLEEP_TIMEOUT_SECS: u32 = 5 * 60; // 5 minutes
+const DEFAULT_SLEEP_TIMEOUT_SECS: u32 = 30 * 60; // 30 minutes
 pub const POWER_BUTTON_SLEEP_MS: u32 = 2000;
 
 pub struct PowerManager {
@@ -38,8 +38,6 @@ impl PowerManager {
     pub fn should_sleep(&self) -> bool {
         now_ms().saturating_sub(self.last_activity_ms) >= self.sleep_timeout_ms
     }
-
-
 
     pub fn set_power_saving(&mut self, enable: bool) {
         if enable && !self.power_saving {

@@ -294,8 +294,8 @@ fn cache_dir_images(dir: &std::path::Path, cached: &mut usize, on_progress: &mut
         Ok(e) => e,
         Err(_) => return,
     };
-    let disp_w = 752;
-    let disp_h = 240;
+    let disp_w = Display::width() - super::READER_X - super::READER_RIGHT_MARGIN;
+    let disp_h = Display::height() / 2;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
