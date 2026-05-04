@@ -16,7 +16,15 @@ impl Storage {
         let vault = Path::new(SD_MOUNT_POINT).join(VAULT_DIR);
         fs::create_dir_all(&vault).map_err(|e| anyhow!("mkdir {:?}: {}", vault, e))?;
         info!("Vault dir ready: {:?}", vault);
-        self.dump_vault_tree();
+        Ok(())
+    }
+
+    pub fn clear_page_cache(&self) -> Result<()> {
+        let cache_dir = Path::new(SD_MOUNT_POINT).join(VAULT_DIR).join(".rr_cache");
+        if cache_dir.exists() {
+            fs::remove_dir_all(&cache_dir).map_err(|e| anyhow!("remove {:?}: {}", cache_dir, e))?;
+        }
+        info!("Page cache cleared: {:?}", cache_dir);
         Ok(())
     }
 

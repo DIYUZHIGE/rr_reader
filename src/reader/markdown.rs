@@ -79,7 +79,7 @@ impl TableState {
     }
 }
 
-pub(super) fn preprocess_obsidian_embeds(markdown: &str) -> String {
+pub fn preprocess_obsidian_embeds(markdown: &str) -> String {
     let mut output = String::with_capacity(markdown.len());
     let mut in_fence = false;
 
@@ -140,7 +140,7 @@ fn escape_markdown_destination(path: &str) -> String {
     path.replace('>', "%3E")
 }
 
-pub(super) fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
+pub fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
     let mut blocks = Vec::new();
     let mut current: Option<CurrentBlock> = None;
     let mut code_block: Option<String> = None;

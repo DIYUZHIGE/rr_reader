@@ -8,10 +8,7 @@ use crate::display::{Display, RefreshMode};
 use crate::font::{Font, FontSet};
 use crate::hardware::Hardware;
 use crate::power::PowerManager;
-use crate::reader::{
-    draw_reader_page, markdown_blocks_and_pages, ReaderCache, ReaderPage, ReaderState,
-    PAGE_CACHE_SIZE_MAX, PAGE_CACHE_SIZE_MIN, READER_X,
-};
+use crate::reader::{draw_reader_page, ReaderCache, ReaderState, READER_X};
 use crate::sync;
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -391,6 +388,8 @@ impl ReaderApp {
     }
 
     fn on_enter_reader_mode(&mut self) {
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
         if !self.wifi_suspended_for_reader {
             self.hardware.suspend_wifi_for_reader();
             self.wifi_suspended_for_reader = true;
@@ -529,7 +528,7 @@ impl ReaderApp {
     }
 
     fn settings_option_count(&self) -> usize {
-        2
+        4
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -551,6 +550,8 @@ impl ReaderApp {
         match self.settings_selected {
             0 => self.trigger_manual_sync(),
             1 => self.trigger_delete_notes_and_sync(),
+            2 => self.trigger_clear_page_cache(),
+            3 => self.trigger_cache_all_images(),
             _ => {}
         }
     }
@@ -634,6 +635,9 @@ impl ReaderApp {
         };
 
         self.hardware.shutdown_wifi_after_sync();
+        // Aggressively free all caches after sync.
+        self.reader_cache = None;
+        self.display.clear_glyph_cache();
         self.settings_status = final_status;
         self.render_settings_page();
     }
@@ -661,6 +665,23 @@ impl ReaderApp {
         }
     }
 
+    fn trigger_clear_page_cache(&mut self) {
+        self.settings_status = match self.hardware.storage.clear_page_cache() {
+            Ok(()) => "页面缓存已清除".to_string(),
+            Err(e) => format!("清除缓存失败: {}", e),
+        };
+        self.render_settings_page();
+    }
+
+    fn trigger_cache_all_images(&mut self) {
+        self.settings_status = "正在缓存图片...".to_string();
+        self.render_settings_page();
+        self.flush_ui_refresh();
+        // TODO: scan and cache all images
+        self.settings_status = "图片缓存功能待实现".to_string();
+        self.render_settings_page();
+    }
+
     fn render_settings_page(&mut self) {
         self.display.clear(0xFF);
 
@@ -670,7 +691,12 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = ["手动同步（S3）", "删除本地文件并重新同步"];
+        let options = [
+            "手动同步（S3）",
+            "删除本地文件并重新同步",
+            "清除页面缓存",
+            "缓存所有图片",
+        ];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);
@@ -752,7 +778,7 @@ impl ReaderApp {
                     &self.script_font,
                 );
                 if let Some(cache) = self.reader_cache.as_mut() {
-                    cache.ensure_window(page_index, &fonts);
+                    cache.load_page(page_index);
                 }
 
                 let (_, name) = file_browser_parts(&rel_path);
@@ -763,11 +789,11 @@ impl ReaderApp {
                 self.display
                     .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
 
-                let cache = self
+                let page = self
                     .reader_cache
-                    .as_ref()
-                    .filter(|c| c.file_index == file_index);
-                if let Some(page) = cache.and_then(|c| c.get_page(page_index)) {
+                    .as_mut()
+                    .and_then(|c| c.load_page(page_index));
+                if let Some(page) = page {
                     draw_reader_page(&mut self.display, &fonts, page, |image_path| {
                         self.hardware
                             .storage
@@ -828,7 +854,7 @@ impl ReaderApp {
         }
 
         let rel_path = &self.md_files[file_index];
-        let markdown = self.hardware.storage.read_markdown_file(rel_path)?;
+        let full_path = format!("/sdcard/vault/{}", rel_path);
         let fonts = FontSet::new(
             &self.ui_font,
             &self.reader_font,
@@ -836,53 +862,8 @@ impl ReaderApp {
             &self.script_font,
         );
 
-        // Parse blocks and paginate. We keep blocks for re-pagination and
-        // only cache a sliding window of rendered pages to save RAM.
-        let (mut blocks, all_pages) = markdown_blocks_and_pages(&markdown, &fonts);
-
-        // Compact parsed markdown structures to reduce long-lived heap.
-        for block in &mut blocks {
-            block.text.shrink_to_fit();
-            block.prefix.shrink_to_fit();
-            if let Some(image) = block.image.as_mut() {
-                image.path.shrink_to_fit();
-                image.alt.shrink_to_fit();
-            }
-        }
-        blocks.shrink_to_fit();
-
-        let page_count = all_pages.len().max(1);
-        let window_len = self.select_reader_window_len();
-        let keep_all_pages = self.should_keep_all_pages(page_count);
-
-        // Build cache with first window of pages
-        let mut page_window: Vec<(usize, Option<ReaderPage>)> =
-            Vec::with_capacity(window_len.max(PAGE_CACHE_SIZE_MIN));
-        page_window.resize_with(window_len.max(PAGE_CACHE_SIZE_MIN), || (0, None));
-
-        let window_end = window_len.min(page_count);
-        for (i, page) in all_pages.iter().cloned().enumerate().take(window_end) {
-            if i < window_len {
-                page_window[i] = (i, Some(page));
-            }
-        }
-
-        self.reader_cache = Some(ReaderCache {
-            file_index,
-            blocks,
-            page_count,
-            all_pages: if keep_all_pages {
-                Some(all_pages)
-            } else {
-                None
-            },
-            page_window,
-            window_len,
-            window_cursor: crate::reader::PaginationCursor::default(),
-        });
-
-        // Drop the markdown string (blocks own their text now)
-        drop(markdown);
+        let cache = crate::reader::ReaderCache::load(file_index, &full_path, &fonts)?;
+        self.reader_cache = Some(cache);
 
         #[cfg(debug_assertions)]
         {
@@ -895,20 +876,6 @@ impl ReaderApp {
         }
 
         Ok(())
-    }
-
-    fn select_reader_window_len(&self) -> usize {
-        let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
-        if free_heap >= 80 * 1024 {
-            PAGE_CACHE_SIZE_MAX
-        } else {
-            PAGE_CACHE_SIZE_MIN
-        }
-    }
-
-    fn should_keep_all_pages(&self, page_count: usize) -> bool {
-        let free_heap = unsafe { esp_idf_hal::sys::esp_get_free_heap_size() } as usize;
-        free_heap >= 100 * 1024 && page_count <= 80
     }
 
     fn reader_page_count(&self) -> usize {
