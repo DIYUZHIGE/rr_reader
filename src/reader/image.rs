@@ -144,21 +144,24 @@ unsafe extern "C" fn jpeg_gray_block_cb(
         return 1;
     }
 
-    if left as usize >= ctx.max_w || top as usize >= ctx.max_h {
-        return 1;
-    }
-
-    // Buffer mode
+    // Buffer mode: write ALL blocks (including partial edges)
     if !ctx.buf.is_null() {
         let src = std::slice::from_raw_parts(gray, bw.saturating_mul(bh));
         for row in 0..bh {
             let y = top as usize + row;
-            let byte_off = y * ctx.buf_stride + (left as usize / 8);
-            let bit_off = left as usize % 8;
-            let dst = &mut *ctx.buf.add(byte_off);
+            if y >= ctx.max_h {
+                break;
+            }
             for col in 0..bw {
+                let px = left as usize + col;
+                if px >= ctx.max_w {
+                    break;
+                }
+                let byte_off = y * ctx.buf_stride + px / 8;
+                let bit_off = px % 8;
                 if src[row * bw + col] <= 128 {
-                    *dst |= 0x80 >> ((bit_off + col) % 8);
+                    let dst = &mut *ctx.buf.add(byte_off);
+                    *dst |= 0x80 >> bit_off;
                 }
             }
         }
@@ -166,6 +169,11 @@ unsafe extern "C" fn jpeg_gray_block_cb(
     }
 
     // Display mode
+    // Display mode: clip to max bounds
+    if left as usize >= ctx.max_w || top as usize >= ctx.max_h {
+        return 1;
+    }
+
     let display = ctx.display.as_deref_mut().unwrap();
     let dx = ctx.draw_x + left as usize;
     let dy = ctx.draw_y + top as usize;
