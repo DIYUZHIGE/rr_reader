@@ -528,7 +528,7 @@ impl ReaderApp {
     }
 
     fn settings_option_count(&self) -> usize {
-        4
+        3
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -551,7 +551,6 @@ impl ReaderApp {
             0 => self.trigger_manual_sync(),
             1 => self.trigger_delete_notes_and_sync(),
             2 => self.trigger_clear_page_cache(),
-            3 => self.trigger_cache_all_images(),
             _ => {}
         }
     }
@@ -673,15 +672,6 @@ impl ReaderApp {
         self.render_settings_page();
     }
 
-    fn trigger_cache_all_images(&mut self) {
-        self.settings_status = "正在缓存图片...".to_string();
-        self.render_settings_page();
-        self.flush_ui_refresh();
-        // TODO: scan and cache all images
-        self.settings_status = "图片缓存功能待实现".to_string();
-        self.render_settings_page();
-    }
-
     fn render_settings_page(&mut self) {
         self.display.clear(0xFF);
 
@@ -691,12 +681,7 @@ impl ReaderApp {
             format!("/{}", self.browser_root_dir)
         };
 
-        let options = [
-            "手动同步（S3）",
-            "删除本地文件并重新同步",
-            "清除页面缓存",
-            "缓存所有图片",
-        ];
+        let options = ["手动同步（S3）", "删除本地文件并重新同步", "清除页面缓存"];
 
         for (i, option) in options.iter().enumerate() {
             let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);

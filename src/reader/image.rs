@@ -204,3 +204,12 @@ fn scaled_dim(dim: usize, scale: u8) -> usize {
     let div = 1usize << scale;
     dim.saturating_add(div - 1) / div
 }
+
+// Image caching stubs -- disabled due to boot crash from jpeg decoder linking
+pub fn cache_all_images(_on_progress: &mut dyn FnMut(&str)) -> usize {
+    0
+}
+
+pub fn clear_image_cache() -> usize {
+    0
+}
