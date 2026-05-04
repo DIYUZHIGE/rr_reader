@@ -137,6 +137,10 @@ impl Display {
         y + line_height
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn draw_mono_bitmap(
         &mut self,
         x: usize,
@@ -216,7 +220,7 @@ impl Display {
         }
     }
 
-    fn set_pixel(&mut self, x: usize, y: usize, white: bool) {
+    pub(crate) fn set_pixel(&mut self, x: usize, y: usize, white: bool) {
         if x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT {
             return;
         }
