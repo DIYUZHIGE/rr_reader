@@ -450,6 +450,7 @@ impl ReaderApp {
     }
 
     fn render_file_browser(&mut self) {
+        self.display.clear_glyph_cache();
         self.display.clear(0xFF);
 
         if self.browser.entries.is_empty() {
