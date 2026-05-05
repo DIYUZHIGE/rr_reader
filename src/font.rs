@@ -7,7 +7,7 @@
 //   [6..8]   glyph_count: u16 LE
 //   [8..]    index: glyph_count × 16 bytes (codepoint:u32, offset:u32,
 //            compressed_size:u16, uncompressed_size:u16, advance:u8,
-//            reserved:3 — numeric fields LE)
+//            baseline:u8, reserved:2 — numeric fields LE)
 //   [...data blob...]
 
 use anyhow::{anyhow, Result};
@@ -49,6 +49,10 @@ pub struct GlyphInfo {
     compressed_size: usize,
     uncompressed_size: usize,
     advance_width: usize,
+    /// Distance from top of glyph cell to the font baseline (pixels).
+    /// Zero for fonts generated before this field was added; callers
+    /// should fall back to `glyph_height * 3/4` in that case.
+    pub baseline: usize,
 }
 
 impl Font {
@@ -124,12 +128,14 @@ impl Font {
         let compressed_size = u16::from_le_bytes([entry[8], entry[9]]) as usize;
         let uncompressed_size = u16::from_le_bytes([entry[10], entry[11]]) as usize;
         let advance_width = entry[12] as usize;
+        let baseline = entry[13] as usize;
 
         Some(GlyphInfo {
             data_offset,
             compressed_size,
             uncompressed_size,
             advance_width,
+            baseline,
         })
     }
 
@@ -176,6 +182,21 @@ impl Font {
         }
 
         self.fallback_advance_width(ch as u32)
+    }
+
+    /// Return the baseline distance from top of glyph cell.
+    ///
+    /// For fonts generated with the updated generator this is read from
+    /// the binary; for older fonts it falls back to 3/4 of glyph height.
+    pub fn baseline(&self) -> usize {
+        // All glyphs in a font share the same baseline.  Look it up from
+        // a representative character that every font should have.
+        if let Some(info) = self.find_glyph('x' as u32) {
+            if info.baseline > 0 {
+                return info.baseline;
+            }
+        }
+        self.glyph_height as usize * 3 / 4
     }
 
     fn fallback_advance_width(&self, codepoint: u32) -> usize {

@@ -547,7 +547,7 @@ fn math_font_for_role<'a>(fonts: &'a FontSet<'_>, role: MathFontRole) -> &'a Fon
 }
 
 pub(super) fn math_text_baseline(font: &Font) -> usize {
-    font.glyph_height as usize * 3 / 4
+    font.baseline()
 }
 
 fn tex_symbol(command: &str) -> Option<&'static str> {
