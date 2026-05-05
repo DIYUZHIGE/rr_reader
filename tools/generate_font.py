@@ -384,7 +384,6 @@ def generate(args):
     t0 = time.time()
     font = ImageFont.truetype(args.ttf_path, args.size)
 
-    # Calculate the shared baseline position for this font
     baseline_px = get_font_baseline(font, args.size)
     oversample = max(1, args.oversample)
     dither = args.dither
