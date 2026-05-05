@@ -63,6 +63,7 @@ pub struct ReaderApp {
     activity: Activity,
     reader_cache: Option<ReaderCache>,
     wifi_suspended_for_reader: bool,
+    reader_history: Vec<ReaderState>,
 }
 
 impl ReaderApp {
@@ -133,6 +134,7 @@ impl ReaderApp {
             activity: Activity::FileBrowser,
             reader_cache: None,
             wifi_suspended_for_reader: false,
+            reader_history: Vec::new(),
         };
         app.browser.current_dir = app.browser_root_dir.clone();
         app.reload_browser_entries(None);
@@ -161,6 +163,7 @@ impl ReaderApp {
         }
         let idx = (crate::time::now_ms() as usize) % self.md_files.len();
         self.on_enter_reader_mode();
+        self.reader_history.clear();
         self.activity = Activity::Reader(ReaderState {
             file_index: idx,
             page_index: 0,
@@ -181,6 +184,8 @@ impl ReaderApp {
             AppEvent::BrowserBack => self.handle_browser_back(),
             AppEvent::BrowserOpenSettings => self.open_settings_page(),
             AppEvent::ReaderBack => {
+                // Long-press Back: return to file browser, clear history
+                self.reader_history.clear();
                 if let Activity::Reader(reader) = self.activity {
                     self.on_exit_reader_mode();
                     self.activity = Activity::FileBrowser;
@@ -190,12 +195,18 @@ impl ReaderApp {
                 }
             }
             AppEvent::ReaderMove(delta) => self.move_reader_page(delta),
+            AppEvent::ReaderBackHistory => {
+                // Short-press Back: go back in navigation history
+                self.navigate_back_in_history();
+            }
             AppEvent::ReaderFollowLink => {
+                // Short press: follow selected wiki link
                 if !self.try_follow_wiki_link() {
                     self.render_current_file();
                 }
             }
             AppEvent::ReaderRefresh => {
+                // Long press: cycle wiki link selection
                 self.cycle_wiki_link_selection();
             }
             AppEvent::SettingsMove(delta) => self.move_settings_selection(delta),
@@ -370,6 +381,7 @@ impl ReaderApp {
         };
 
         self.on_enter_reader_mode();
+        self.reader_history.clear();
         self.activity = Activity::Reader(ReaderState {
             file_index,
             page_index: 0,
@@ -807,6 +819,28 @@ impl ReaderApp {
         self.render_current_file();
     }
 
+    /// Navigate back to the previous file in the navigation history.
+    fn navigate_back_in_history(&mut self) {
+        if let Some(prev_state) = self.reader_history.pop() {
+            info!(
+                "Navigating back: file {} page {}",
+                prev_state.file_index, prev_state.page_index
+            );
+            self.on_enter_reader_mode();
+            self.activity = Activity::Reader(prev_state);
+            self.render_current_file();
+        } else {
+            // No history: return to file browser
+            if let Activity::Reader(reader) = self.activity {
+                self.on_exit_reader_mode();
+                self.activity = Activity::FileBrowser;
+                let selected_path = self.md_files.get(reader.file_index).cloned();
+                self.reload_browser_entries(selected_path.as_deref());
+                self.render_file_browser();
+            }
+        }
+    }
+
     /// Attempt to follow the currently selected wiki link on the reader page.
     /// Returns true if a link was followed, false otherwise.
     fn try_follow_wiki_link(&mut self) -> bool {
@@ -842,6 +876,10 @@ impl ReaderApp {
 
         match resolve_wiki_link_target(&target, &self.md_files) {
             Some(idx) => {
+                // Push current state to history before navigating
+                if let Activity::Reader(current) = self.activity {
+                    self.reader_history.push(current);
+                }
                 self.on_enter_reader_mode();
                 self.activity = Activity::Reader(ReaderState {
                     file_index: idx,

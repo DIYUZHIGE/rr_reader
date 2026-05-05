@@ -573,6 +573,16 @@ pub fn markdown_blocks_and_pages(markdown: String, fonts: &FontSet<'_>) -> Vec<R
 }
 
 /// Underline (or highlight) wiki link aliases found in the given text.
+/// Fill a rectangle with a dithered pattern (alternating lines)
+/// to simulate gray on a 1-bit e-ink display.
+fn fill_rect_dithered(display: &mut Display, x: usize, y: usize, w: usize, h: usize) {
+    for row in 0..h {
+        if row % 2 == 0 {
+            display.fill_rect(x, y + row, w, 1, 0x00);
+        }
+    }
+}
+
 fn underline_wiki_links_in_text(
     display: &mut Display,
     font: &Font,
@@ -596,12 +606,9 @@ fn underline_wiki_links_in_text(
             let link_x = base_x + font.text_width(&text[..abs_pos]);
             let link_w = alias_width.min(Display::width().saturating_sub(base_x));
             if is_selected {
-                // Highlight: black background, white text (invert)
-                display.fill_rect(link_x, base_y, link_w, font.glyph_height as usize, 0x00);
-                // The text is already drawn in black by the caller, so we
-                // need to redraw it in white. We use fill_rect to invert.
-                // Since we can't easily redraw text in white on e-ink,
-                // just rely on the filled black rect as the indicator.
+                // Dithered gray background (alternating horizontal lines)
+                // on 1-bit e-ink to indicate selection without hiding text
+                fill_rect_dithered(display, link_x, base_y, link_w, font.glyph_height as usize);
             } else {
                 display.fill_rect(link_x, underline_y, link_w, 1, 0x00);
             }

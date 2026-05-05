@@ -12,6 +12,7 @@ const SETTINGS_REPEAT_START_MS: u32 = 280;
 const SETTINGS_REPEAT_INTERVAL_MS: u64 = 140;
 const BROWSER_SETTINGS_LONG_PRESS_MS: u32 = 700;
 const READER_CONFIRM_LONG_PRESS_MS: u32 = 500;
+const READER_BACK_LONG_PRESS_MS: u32 = 500;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum EventMode {
@@ -29,6 +30,7 @@ pub(super) enum AppEvent {
     BrowserBack,
     BrowserOpenSettings,
     ReaderBack,
+    ReaderBackHistory,
     ReaderMove(isize),
     ReaderRefresh,
     ReaderFollowLink,
@@ -48,6 +50,7 @@ pub(super) struct EventPump {
     browser_back_long_handled: bool,
     suppress_settings_back_release: bool,
     reader_confirm_long_handled: bool,
+    reader_back_long_handled: bool,
 }
 
 impl EventPump {
@@ -62,6 +65,7 @@ impl EventPump {
             browser_back_long_handled: false,
             suppress_settings_back_release: false,
             reader_confirm_long_handled: false,
+            reader_back_long_handled: false,
         }
     }
 
@@ -175,15 +179,28 @@ impl EventPump {
     fn collect_reader_events(&mut self, input: &mut InputManager, events: &mut Vec<AppEvent>) {
         use Button::*;
 
-        if input.logical_was_released(Back) {
+        // Long-press Back: return to file browser
+        let back_button = input.logical_to_physical(Back);
+        if input.long_pressed_once(back_button, READER_BACK_LONG_PRESS_MS) {
             events.push(AppEvent::ReaderBack);
+            self.reader_back_long_handled = true;
             return;
         }
 
-        // Long-press Confirm: follow the currently selected wiki link
+        // Short-press Back (on release): go back in navigation history
+        if input.logical_was_released(Back) {
+            if self.reader_back_long_handled {
+                self.reader_back_long_handled = false;
+                return;
+            }
+            events.push(AppEvent::ReaderBackHistory);
+            return;
+        }
+
+        // Long-press Confirm: cycle wiki link selection
         let confirm_button = input.logical_to_physical(Confirm);
         if input.long_pressed_once(confirm_button, READER_CONFIRM_LONG_PRESS_MS) {
-            events.push(AppEvent::ReaderFollowLink);
+            events.push(AppEvent::ReaderRefresh);
             self.reader_confirm_long_handled = true;
             return;
         }
@@ -199,13 +216,13 @@ impl EventPump {
             return;
         }
 
-        // Short-press Confirm (on release): cycle wiki link selection
+        // Short-press Confirm (on release): follow selected wiki link
         if input.logical_was_released(Confirm) {
             if self.reader_confirm_long_handled {
                 self.reader_confirm_long_handled = false;
                 return;
             }
-            events.push(AppEvent::ReaderRefresh);
+            events.push(AppEvent::ReaderFollowLink);
         }
     }
 
