@@ -13,6 +13,7 @@ use super::{
 pub(super) fn paginate_blocks(blocks: &[RenderBlock], fonts: &FontSet<'_>) -> Vec<ReaderPage> {
     let mut pages = vec![ReaderPage {
         elements: Vec::new(),
+        wiki_links: Vec::new(),
     }];
     let mut y = READER_TEXT_Y;
     let bottom_y = Display::height() - READER_BOTTOM_MARGIN;
@@ -33,6 +34,7 @@ pub(super) fn paginate_blocks(blocks: &[RenderBlock], fonts: &FontSet<'_>) -> Ve
     if pages.is_empty() {
         pages.push(ReaderPage {
             elements: Vec::new(),
+            wiki_links: Vec::new(),
         });
     }
     pages
@@ -84,6 +86,7 @@ fn paginate_text_block(
         if y + font.glyph_height as usize > bottom_y {
             pages.push(ReaderPage {
                 elements: Vec::new(),
+                wiki_links: Vec::new(),
             });
             y = READER_TEXT_Y;
         }
@@ -101,6 +104,12 @@ fn paginate_text_block(
         y += line_step;
     }
 
+    // Append wiki links from this block to the last page that got elements
+    if !block.wiki_links.is_empty() {
+        if let Some(page) = pages.last_mut() {
+            page.wiki_links.extend(block.wiki_links.iter().cloned());
+        }
+    }
     advance_vertical(pages, y, bottom_gap, bottom_y, font.glyph_height as usize)
 }
 
@@ -121,6 +130,7 @@ fn paginate_math_block(
     if y + height > bottom_y {
         pages.push(ReaderPage {
             elements: Vec::new(),
+            wiki_links: Vec::new(),
         });
         y = READER_TEXT_Y;
     }
@@ -188,6 +198,7 @@ fn paginate_inline_text_block(
         if y + spec.height > bottom_y {
             pages.push(ReaderPage {
                 elements: Vec::new(),
+                wiki_links: Vec::new(),
             });
             y = READER_TEXT_Y;
         }
@@ -217,6 +228,12 @@ fn paginate_inline_text_block(
         y += spec.height + line_step_extra;
     }
 
+    // Append wiki links from this block to the last page that got elements
+    if !block.wiki_links.is_empty() {
+        if let Some(page) = pages.last_mut() {
+            page.wiki_links.extend(block.wiki_links.iter().cloned());
+        }
+    }
     advance_vertical(pages, y, bottom_gap, bottom_y, min_height)
 }
 
@@ -235,6 +252,7 @@ fn paginate_image_block(
     if y + height > bottom_y {
         pages.push(ReaderPage {
             elements: Vec::new(),
+            wiki_links: Vec::new(),
         });
         y = READER_TEXT_Y;
     }
@@ -610,6 +628,7 @@ fn advance_vertical(
     if y != READER_TEXT_Y && y + amount + glyph_height > bottom_y {
         pages.push(ReaderPage {
             elements: Vec::new(),
+            wiki_links: Vec::new(),
         });
         READER_TEXT_Y
     } else {

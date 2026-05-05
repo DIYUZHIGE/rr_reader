@@ -65,8 +65,6 @@ pub enum RefreshMode {
 }
 
 impl Display {
-
-
     pub fn flush_if_dirty_polling<F>(&mut self, mut poll: F) -> Result<()>
     where
         F: FnMut(),
@@ -105,8 +103,6 @@ impl Display {
         }
         Ok(())
     }
-
-
 
     fn refresh(&mut self, mode: RefreshMode) -> Result<()> {
         let mut no_poll = None;

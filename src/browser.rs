@@ -4,8 +4,16 @@ use std::borrow::Cow;
 #[derive(Clone, Debug)]
 pub struct BrowserEntry {
     pub rel_path: String,
-    pub name: String,
     pub is_dir: bool,
+}
+
+impl BrowserEntry {
+    /// Extract the display name from the relative path.
+    /// For "foo/bar.md", returns "bar". For "foo/baz", returns "baz".
+    pub fn display_name(&self) -> &str {
+        let file_name = self.rel_path.rsplit('/').next().unwrap_or(&self.rel_path);
+        strip_markdown_extension(file_name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +79,7 @@ pub fn sort_browser_entries(entries: &mut [BrowserEntry]) {
     entries.sort_by_cached_key(|entry| {
         (
             !entry.is_dir,
-            entry.name.to_lowercase(),
+            entry.display_name().to_lowercase(),
             entry.rel_path.to_lowercase(),
         )
     });
@@ -84,6 +92,52 @@ pub fn file_browser_parts(path: &str) -> (&str, &str) {
     };
 
     (folder, strip_markdown_extension(file_name))
+}
+
+/// Resolve an Obsidian wiki link target to a file index in the md_files list.
+/// The target is typically a page name like "Projects/rr_reader" without extension.
+/// Returns the index in md_files if a matching file is found.
+pub fn resolve_wiki_link_target(target: &str, md_files: &[String]) -> Option<usize> {
+    let target_normalized = target.replace('\\', "/");
+
+    // 1. Try exact match with .md extension
+    let with_md = format!("{}.md", target_normalized);
+    if let Some(idx) = md_files.iter().position(|p| p == &with_md) {
+        return Some(idx);
+    }
+
+    // 2. Try exact match with .markdown extension
+    let with_markdown = format!("{}.markdown", target_normalized);
+    if let Some(idx) = md_files.iter().position(|p| p == &with_markdown) {
+        return Some(idx);
+    }
+
+    // 3. Try case-insensitive match with extensions
+    let lower_target = target_normalized.to_lowercase();
+    for (idx, path) in md_files.iter().enumerate() {
+        let lower_path = path.to_lowercase();
+        if lower_path == format!("{}.md", lower_target)
+            || lower_path == format!("{}.markdown", lower_target)
+        {
+            return Some(idx);
+        }
+    }
+
+    // 4. Try matching the target as a suffix of some file path
+    //    e.g., target="rr_reader" matches "Projects/rr_reader.md"
+    let target_last = target_normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&target_normalized);
+    let lower_last = target_last.to_lowercase();
+    for (idx, path) in md_files.iter().enumerate() {
+        let (_, name) = file_browser_parts(path);
+        if name.to_lowercase() == lower_last {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 fn strip_markdown_extension(file_name: &str) -> &str {

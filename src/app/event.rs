@@ -11,6 +11,7 @@ const READER_REPEAT_INTERVAL_MS: u64 = 450;
 const SETTINGS_REPEAT_START_MS: u32 = 280;
 const SETTINGS_REPEAT_INTERVAL_MS: u64 = 140;
 const BROWSER_SETTINGS_LONG_PRESS_MS: u32 = 700;
+const READER_CONFIRM_LONG_PRESS_MS: u32 = 500;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum EventMode {
@@ -30,6 +31,7 @@ pub(super) enum AppEvent {
     ReaderBack,
     ReaderMove(isize),
     ReaderRefresh,
+    ReaderFollowLink,
     SettingsMove(isize),
     SettingsConfirm,
     SettingsBack,
@@ -45,6 +47,7 @@ pub(super) struct EventPump {
     settings_repeater: NavigationRepeater,
     browser_back_long_handled: bool,
     suppress_settings_back_release: bool,
+    reader_confirm_long_handled: bool,
 }
 
 impl EventPump {
@@ -58,6 +61,7 @@ impl EventPump {
             settings_repeater: NavigationRepeater::new(),
             browser_back_long_handled: false,
             suppress_settings_back_release: false,
+            reader_confirm_long_handled: false,
         }
     }
 
@@ -176,6 +180,14 @@ impl EventPump {
             return;
         }
 
+        // Long-press Confirm: follow the currently selected wiki link
+        let confirm_button = input.logical_to_physical(Confirm);
+        if input.long_pressed_once(confirm_button, READER_CONFIRM_LONG_PRESS_MS) {
+            events.push(AppEvent::ReaderFollowLink);
+            self.reader_confirm_long_handled = true;
+            return;
+        }
+
         if let Some(delta) = self.reader_repeater.navigation_delta(
             input,
             &[PageForward, Right],
@@ -187,7 +199,12 @@ impl EventPump {
             return;
         }
 
-        if input.logical_was_pressed(Confirm) {
+        // Short-press Confirm (on release): cycle wiki link selection
+        if input.logical_was_released(Confirm) {
+            if self.reader_confirm_long_handled {
+                self.reader_confirm_long_handled = false;
+                return;
+            }
             events.push(AppEvent::ReaderRefresh);
         }
     }

@@ -1,4 +1,5 @@
 use crate::display::Display;
+use crate::font::Font;
 use crate::font::FontSet;
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
@@ -37,6 +38,7 @@ const INLINE_MATH_END: char = '\u{E001}';
 pub struct ReaderState {
     pub file_index: usize,
     pub page_index: usize,
+    pub wiki_link_selected: Option<usize>,
 }
 
 /// Minimal page cache backed by SD card files.
@@ -52,7 +54,6 @@ pub struct ReaderCache {
 }
 
 const CACHE_ROOT: &str = "/sdcard/vault/.rr_cache";
-
 fn file_hash(path: &str) -> u64 {
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
@@ -172,14 +173,24 @@ impl ReaderCache {
 #[derive(Clone, Debug)]
 pub struct ReaderPage {
     pub elements: Vec<PageElement>,
+    pub wiki_links: Vec<WikiLink>,
 }
 
 impl ReaderPage {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.push(1u8); // version byte
         out.extend(&(self.elements.len() as u16).to_le_bytes());
         for el in &self.elements {
             el.write_to(&mut out);
+        }
+        // Serialize wiki_links
+        write_u16(&mut out, self.wiki_links.len() as u16);
+        for link in &self.wiki_links {
+            write_str(&mut out, &link.target);
+            write_str(&mut out, &link.alias);
+            write_u16(&mut out, link.start_byte as u16);
+            write_u16(&mut out, link.end_byte as u16);
         }
         out
     }
@@ -188,15 +199,43 @@ impl ReaderPage {
         if data.len() < 2 {
             return Err(anyhow!("page data too short"));
         }
-        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
-        let mut pos = 2;
+        // Check for version byte: if first byte is 0x01, it's v1 with wiki_links
+        let (version, count_offset) = if data[0] == 1u8 {
+            (1u8, 1usize)
+        } else {
+            (0u8, 0usize)
+        };
+        let count = u16::from_le_bytes([data[count_offset], data[count_offset + 1]]) as usize;
+        let mut pos = count_offset + 2;
         let mut elements = Vec::with_capacity(count);
         for _ in 0..count {
             let (el, used) = PageElement::read_from(&data[pos..])?;
             pos += used;
             elements.push(el);
         }
-        Ok(Self { elements })
+        let wiki_links = if version >= 1 && pos + 2 <= data.len() {
+            let link_count = read_u16(data, &mut pos) as usize;
+            let mut links = Vec::with_capacity(link_count);
+            for _ in 0..link_count {
+                let target = read_str(data, &mut pos);
+                let alias = read_str(data, &mut pos);
+                let start_byte = read_u16(data, &mut pos) as usize;
+                let end_byte = read_u16(data, &mut pos) as usize;
+                links.push(WikiLink {
+                    target,
+                    alias,
+                    start_byte,
+                    end_byte,
+                });
+            }
+            links
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            elements,
+            wiki_links,
+        })
     }
 }
 
@@ -209,6 +248,17 @@ pub enum PageElement {
 }
 
 #[derive(Clone, Debug)]
+pub struct WikiLink {
+    /// The link target (page name without extension)
+    pub target: String,
+    /// Display text in the rendered output
+    pub alias: String,
+    /// Byte offset of the alias text within the block/page text
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct RenderBlock {
     pub text: String,
     pub style: BlockStyle,
@@ -216,6 +266,7 @@ pub struct RenderBlock {
     pub quote_depth: usize,
     pub prefix: String,
     pub image: Option<MarkdownImage>,
+    pub wiki_links: Vec<WikiLink>,
 }
 
 #[derive(Clone, Debug)]
@@ -521,18 +572,61 @@ pub fn markdown_blocks_and_pages(markdown: String, fonts: &FontSet<'_>) -> Vec<R
     }
 }
 
+/// Underline (or highlight) wiki link aliases found in the given text.
+fn underline_wiki_links_in_text(
+    display: &mut Display,
+    font: &Font,
+    text: &str,
+    base_x: usize,
+    base_y: usize,
+    wiki_links: &[WikiLink],
+    selected_index: Option<usize>,
+) {
+    if wiki_links.is_empty() {
+        return;
+    }
+    let underline_y = base_y + font.glyph_height as usize + 1;
+    for (idx, link) in wiki_links.iter().enumerate() {
+        let is_selected = selected_index == Some(idx);
+        // Find all occurrences of the alias in the text
+        let mut search_start = 0usize;
+        while let Some(pos) = text[search_start..].find(&link.alias) {
+            let abs_pos = search_start + pos;
+            let alias_width = font.text_width(&link.alias);
+            let link_x = base_x + font.text_width(&text[..abs_pos]);
+            let link_w = alias_width.min(Display::width().saturating_sub(base_x));
+            if is_selected {
+                // Highlight: black background, white text (invert)
+                display.fill_rect(link_x, base_y, link_w, font.glyph_height as usize, 0x00);
+                // The text is already drawn in black by the caller, so we
+                // need to redraw it in white. We use fill_rect to invert.
+                // Since we can't easily redraw text in white on e-ink,
+                // just rely on the filled black rect as the indicator.
+            } else {
+                display.fill_rect(link_x, underline_y, link_w, 1, 0x00);
+            }
+            search_start = abs_pos + link.alias.len();
+        }
+    }
+}
+
 pub fn draw_reader_page<F>(
     display: &mut Display,
     fonts: &FontSet<'_>,
     page: &ReaderPage,
+    wiki_link_selected: Option<usize>,
     mut resolve_image_path: F,
 ) where
     F: FnMut(&str) -> Result<String>,
 {
     for element in &page.elements {
         match element {
-            PageElement::Line(line) => draw_reader_line(display, fonts, line),
-            PageElement::InlineLine(line) => draw_reader_inline_line(display, fonts, line),
+            PageElement::Line(line) => {
+                draw_reader_line(display, fonts, line, &page.wiki_links, wiki_link_selected)
+            }
+            PageElement::InlineLine(line) => {
+                draw_reader_inline_line(display, fonts, line, &page.wiki_links, wiki_link_selected)
+            }
             PageElement::Math(math) => draw_reader_math(display, fonts, math),
             PageElement::Image(image) => {
                 draw_reader_image(display, fonts.ui, image, &mut resolve_image_path)
@@ -541,7 +635,13 @@ pub fn draw_reader_page<F>(
     }
 }
 
-fn draw_reader_inline_line(display: &mut Display, fonts: &FontSet<'_>, line: &RenderInlineLine) {
+fn draw_reader_inline_line(
+    display: &mut Display,
+    fonts: &FontSet<'_>,
+    line: &RenderInlineLine,
+    wiki_links: &[WikiLink],
+    selected_index: Option<usize>,
+) {
     for depth in 0..line.quote_depth {
         let x = READER_X + depth * QUOTE_INDENT;
         display.fill_rect(x, line.y, QUOTE_BAR_WIDTH, line.height, 0x00);
@@ -584,9 +684,30 @@ fn draw_reader_inline_line(display: &mut Display, fonts: &FontSet<'_>, line: &Re
             0x00,
         );
     }
+
+    // Underline wiki links found in inline text runs
+    for run in &line.runs {
+        if let RenderInlineRunKind::Text(text) = &run.kind {
+            underline_wiki_links_in_text(
+                display,
+                text_font,
+                text,
+                line.x + run.x,
+                line.y,
+                wiki_links,
+                selected_index,
+            );
+        }
+    }
 }
 
-fn draw_reader_line(display: &mut Display, fonts: &FontSet<'_>, line: &RenderLine) {
+fn draw_reader_line(
+    display: &mut Display,
+    fonts: &FontSet<'_>,
+    line: &RenderLine,
+    wiki_links: &[WikiLink],
+    selected_index: Option<usize>,
+) {
     let reader_font = fonts.reader;
     let ui_font = fonts.ui;
     let line_font = font_for_style(line.style, fonts);
@@ -645,4 +766,15 @@ fn draw_reader_line(display: &mut Display, fonts: &FontSet<'_>, line: &RenderLin
             display.draw_text_font(reader_font, &line.text, line.x, line.y);
         }
     }
+
+    // Underline wiki links in the line text
+    underline_wiki_links_in_text(
+        display,
+        line_font,
+        &line.text,
+        line.x,
+        line.y,
+        wiki_links,
+        selected_index,
+    );
 }

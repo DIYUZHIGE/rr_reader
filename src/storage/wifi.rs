@@ -25,8 +25,8 @@ impl super::Storage {
             }
 
             let contents = fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path, e))?;
-            let mut credentials = parse_wifi_credentials(&contents)
-                .map_err(|e| anyhow!("parse {}: {}", path, e))?;
+            let mut credentials =
+                parse_wifi_credentials(&contents).map_err(|e| anyhow!("parse {}: {}", path, e))?;
             credentials.source_path = path.to_owned();
             info!("Loaded WiFi credentials from {}", path);
             return Ok(Some(credentials));
@@ -110,4 +110,3 @@ fn unquote(value: &str) -> String {
 
     value.to_owned()
 }
-

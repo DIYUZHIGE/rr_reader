@@ -1,6 +1,6 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use super::{BlockStyle, MarkdownImage, RenderBlock, INLINE_MATH_END, INLINE_MATH_START};
+use super::{BlockStyle, MarkdownImage, RenderBlock, WikiLink, INLINE_MATH_END, INLINE_MATH_START};
 
 #[derive(Debug)]
 struct ListState {
@@ -398,6 +398,7 @@ pub fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
                     quote_depth,
                     prefix: String::new(),
                     image: None,
+                    wiki_links: Vec::new(),
                 });
             }
             Event::TaskListMarker(checked) => {
@@ -410,6 +411,19 @@ pub fn parse_markdown_blocks(markdown: &str) -> Vec<RenderBlock> {
     }
 
     flush_current(&mut current, &mut blocks);
+
+    // Extract wiki links from each block's text
+    for block in &mut blocks {
+        if !matches!(
+            block.style,
+            BlockStyle::Code | BlockStyle::Math | BlockStyle::Rule | BlockStyle::Image
+        ) {
+            let (new_text, links) = extract_wiki_links(&block.text);
+            block.text = new_text;
+            block.wiki_links = links;
+        }
+    }
+
     blocks
 }
 
@@ -427,6 +441,7 @@ fn push_math_block(
             quote_depth,
             prefix: String::new(),
             image: None,
+            wiki_links: Vec::new(),
         });
     }
     if text.ends_with('\n') || text.is_empty() {
@@ -437,6 +452,7 @@ fn push_math_block(
             quote_depth,
             prefix: String::new(),
             image: None,
+            wiki_links: Vec::new(),
         });
     }
 }
@@ -455,6 +471,7 @@ fn push_code_blocks(
             quote_depth,
             prefix: String::new(),
             image: None,
+            wiki_links: Vec::new(),
         });
     }
     if text.ends_with('\n') || text.is_empty() {
@@ -465,6 +482,7 @@ fn push_code_blocks(
             quote_depth,
             prefix: String::new(),
             image: None,
+            wiki_links: Vec::new(),
         });
     }
 }
@@ -480,6 +498,7 @@ fn push_image_block(blocks: &mut Vec<RenderBlock>, image: ImageState) {
             path: image.path,
             alt: image.alt,
         }),
+        wiki_links: Vec::new(),
     });
 }
 
@@ -640,6 +659,7 @@ fn push_table_row(
         quote_depth,
         prefix: String::new(),
         image: None,
+        wiki_links: Vec::new(),
     });
 }
 
@@ -669,6 +689,7 @@ fn flush_current(current: &mut Option<CurrentBlock>, blocks: &mut Vec<RenderBloc
         quote_depth: block.quote_depth,
         prefix: block.prefix,
         image: None,
+        wiki_links: Vec::new(),
     });
 }
 
@@ -685,6 +706,7 @@ fn push_blank(blocks: &mut Vec<RenderBlock>) {
         quote_depth: 0,
         prefix: String::new(),
         image: None,
+        wiki_links: Vec::new(),
     });
 }
 
@@ -697,4 +719,93 @@ fn heading_level_number(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// Extract Obsidian wiki links from text, replacing `[[target]]` with the
+/// display alias and returning link metadata for navigation.
+pub(super) fn extract_wiki_links(text: &str) -> (String, Vec<WikiLink>) {
+    if !text.contains("[[") {
+        return (text.to_owned(), Vec::new());
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut links = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        // Check for `![[` (image embed passthrough)
+        if bytes[pos] == b'!'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1] == b'['
+            && bytes[pos + 2] == b'['
+        {
+            out.push('!');
+            out.push_str("[[");
+            pos += 3;
+            // Find closing `]]`, copying chars properly
+            while pos < bytes.len() {
+                if bytes[pos] == b']' && pos + 1 < bytes.len() && bytes[pos + 1] == b']' {
+                    out.push_str("]]");
+                    pos += 2;
+                    break;
+                }
+                let ch = next_utf8_char(text, &mut pos);
+                out.push(ch);
+            }
+            continue;
+        }
+
+        // Check for `[[` (wiki link)
+        if bytes[pos] == b'[' && pos + 1 < bytes.len() && bytes[pos + 1] == b'[' {
+            pos += 2;
+            let link_start = pos;
+            // Find closing `]]`
+            while pos < bytes.len() {
+                if bytes[pos] == b']' && pos + 1 < bytes.len() && bytes[pos + 1] == b']' {
+                    break;
+                }
+                pos += 1;
+            }
+            if pos >= bytes.len() || bytes[pos] != b']' {
+                // No closing ]], treat as literal text
+                out.push_str("[[");
+                continue;
+            }
+            let link_end = pos;
+            pos += 2; // skip `]]`
+
+            let inner = &text[link_start..link_end];
+            let (target, alias) = match inner.split_once('|') {
+                Some((target, alias)) => (target.trim().to_owned(), alias.trim().to_owned()),
+                None => {
+                    let t = inner.trim().to_owned();
+                    (t.clone(), t)
+                }
+            };
+            let start_byte = out.len();
+            out.push_str(&alias);
+            let end_byte = out.len();
+            links.push(WikiLink {
+                target,
+                alias,
+                start_byte,
+                end_byte,
+            });
+        } else {
+            let ch = next_utf8_char(text, &mut pos);
+            out.push(ch);
+        }
+    }
+
+    (out, links)
+}
+
+/// Read the next UTF-8 character from `text` starting at `*pos`,
+/// advancing `pos` by the character's byte length.
+fn next_utf8_char(text: &str, pos: &mut usize) -> char {
+    let tail = &text[*pos..];
+    let ch = tail.chars().next().unwrap_or('\u{FFFD}');
+    *pos += ch.len_utf8();
+    ch
 }

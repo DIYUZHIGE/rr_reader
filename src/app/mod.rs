@@ -2,7 +2,8 @@ mod event;
 
 use self::event::{AppEvent, EventMode, EventPump};
 use crate::browser::{
-    file_browser_parts, sort_browser_entries, truncate_for_width, BrowserEntry, FileBrowserState,
+    file_browser_parts, resolve_wiki_link_target, sort_browser_entries, truncate_for_width,
+    BrowserEntry, FileBrowserState,
 };
 use crate::display::{Display, RefreshMode};
 use crate::font::{Font, FontSet};
@@ -12,7 +13,7 @@ use crate::reader::{draw_reader_page, ReaderCache, ReaderState, READER_X};
 use crate::sync;
 use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
@@ -163,6 +164,7 @@ impl ReaderApp {
         self.activity = Activity::Reader(ReaderState {
             file_index: idx,
             page_index: 0,
+            wiki_link_selected: None,
         });
         self.render_current_file();
     }
@@ -188,7 +190,14 @@ impl ReaderApp {
                 }
             }
             AppEvent::ReaderMove(delta) => self.move_reader_page(delta),
-            AppEvent::ReaderRefresh => self.render_current_file(),
+            AppEvent::ReaderFollowLink => {
+                if !self.try_follow_wiki_link() {
+                    self.render_current_file();
+                }
+            }
+            AppEvent::ReaderRefresh => {
+                self.cycle_wiki_link_selection();
+            }
             AppEvent::SettingsMove(delta) => self.move_settings_selection(delta),
             AppEvent::SettingsConfirm => self.confirm_settings_selection(),
             AppEvent::SettingsBack => {
@@ -241,7 +250,7 @@ impl ReaderApp {
             format!("{}/", self.browser_root_dir)
         };
         let current_prefix = self.absolute_prefix_for_current_dir();
-        let mut dirs: BTreeMap<String, String> = BTreeMap::new();
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
         let mut files: Vec<BrowserEntry> = Vec::new();
 
         for rel in &self.md_files {
@@ -267,13 +276,10 @@ impl ReaderApp {
                 } else {
                     format!("{}/{}", current_dir, child_dir)
                 };
-                dirs.entry(child_rel_path)
-                    .or_insert_with(|| child_dir.to_string());
+                dirs.insert(child_rel_path);
             } else {
-                let (_, name) = file_browser_parts(rel_from_dir);
                 files.push(BrowserEntry {
                     rel_path: rel.clone(),
-                    name: name.to_string(),
                     is_dir: false,
                 });
             }
@@ -281,9 +287,8 @@ impl ReaderApp {
 
         let mut entries: Vec<BrowserEntry> = dirs
             .into_iter()
-            .map(|(rel_path, name)| BrowserEntry {
+            .map(|rel_path| BrowserEntry {
                 rel_path,
-                name,
                 is_dir: true,
             })
             .collect();
@@ -368,6 +373,7 @@ impl ReaderApp {
         self.activity = Activity::Reader(ReaderState {
             file_index,
             page_index: 0,
+            wiki_link_selected: None,
         });
         self.render_current_file();
     }
@@ -446,6 +452,7 @@ impl ReaderApp {
         self.activity = Activity::Reader(ReaderState {
             file_index: reader.file_index,
             page_index: next,
+            wiki_link_selected: None,
         });
         self.render_current_file();
     }
@@ -507,9 +514,9 @@ impl ReaderApp {
 
             let entry = &self.browser.entries[idx];
             let display_name = if entry.is_dir {
-                format!("{} /", entry.name)
+                format!("{} /", entry.display_name())
             } else {
-                entry.name.clone()
+                entry.display_name().to_string()
             };
 
             let name = truncate_for_width(
@@ -760,6 +767,97 @@ impl ReaderApp {
         }
     }
 
+    /// Cycle the wiki link selection on the current page.
+    /// If no wiki links are present, re-render the page (legacy behavior).
+    fn cycle_wiki_link_selection(&mut self) {
+        let (file_index, page_index) = match &self.activity {
+            Activity::Reader(r) => (r.file_index, r.page_index),
+            _ => return,
+        };
+
+        let link_count = self
+            .reader_cache
+            .as_mut()
+            .and_then(|c| c.load_page(page_index))
+            .map(|p| p.wiki_links.len())
+            .unwrap_or(0);
+
+        if link_count == 0 {
+            // No wiki links: re-render (original behavior)
+            self.render_current_file();
+            return;
+        }
+
+        let current = match &self.activity {
+            Activity::Reader(r) => r.wiki_link_selected,
+            _ => None,
+        };
+
+        let next = match current {
+            None => Some(0),
+            Some(i) if i + 1 < link_count => Some(i + 1),
+            Some(_) => None, // wrap: last → none (deselect)
+        };
+
+        self.activity = Activity::Reader(ReaderState {
+            file_index,
+            page_index,
+            wiki_link_selected: next,
+        });
+        self.render_current_file();
+    }
+
+    /// Attempt to follow the currently selected wiki link on the reader page.
+    /// Returns true if a link was followed, false otherwise.
+    fn try_follow_wiki_link(&mut self) -> bool {
+        let (_file_index, page_index, selected) = match &self.activity {
+            Activity::Reader(r) => (r.file_index, r.page_index, r.wiki_link_selected),
+            _ => return false,
+        };
+
+        let selected = match selected {
+            Some(i) => i,
+            None => {
+                // No link selected; try the first one as a fallback
+                0
+            }
+        };
+
+        let page = match self
+            .reader_cache
+            .as_mut()
+            .and_then(|c| c.load_page(page_index))
+        {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let link = match page.wiki_links.get(selected) {
+            Some(l) => l,
+            None => return false,
+        };
+
+        let target = link.target.clone();
+        info!("Following wiki link: [[{}]]", target);
+
+        match resolve_wiki_link_target(&target, &self.md_files) {
+            Some(idx) => {
+                self.on_enter_reader_mode();
+                self.activity = Activity::Reader(ReaderState {
+                    file_index: idx,
+                    page_index: 0,
+                    wiki_link_selected: None,
+                });
+                self.render_current_file();
+                true
+            }
+            None => {
+                warn!("Wiki link target not found: [[{}]]", target);
+                false
+            }
+        }
+    }
+
     fn render_current_file(&mut self) {
         self.display.clear(0xFF);
 
@@ -797,6 +895,7 @@ impl ReaderApp {
                         self.activity = Activity::Reader(ReaderState {
                             file_index,
                             page_index,
+                            wiki_link_selected: None,
                         });
                     }
                 }
@@ -824,7 +923,8 @@ impl ReaderApp {
                     .as_mut()
                     .and_then(|c| c.load_page(page_index));
                 if let Some(page) = page {
-                    draw_reader_page(&mut self.display, &fonts, page, |image_path| {
+                    let selected = reader.and_then(|r| r.wiki_link_selected);
+                    draw_reader_page(&mut self.display, &fonts, page, selected, |image_path| {
                         self.hardware
                             .storage
                             .resolve_asset_path_relative_to(&rel_path, image_path)
