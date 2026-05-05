@@ -2,7 +2,7 @@
 """Generate a compressed bitmap font binary for the rr_reader e-ink firmware.
 
 Usage:
-    python3 generate_font.py <ttf_path> <output_bin> [--size PX] [--profile full|math] [--chars-file CHARS.txt] [--oversample N] [--dither]
+    python3 generate_font.py <ttf_path> <output_bin> [--size PX] [--profile full|math] [--chars-file CHARS.txt] [--oversample N] [--dither] [--shrink F]
 
 Output: a binary blob consumed by src/font.rs via include_bytes!().
 
@@ -15,6 +15,9 @@ Optimizations over the original:
   - Adaptive thresholding: adjusts the binarization threshold per glyph
     based on stroke density to avoid broken strokes in light glyphs and
     filled-in counters in heavy glyphs.
+  - Shrink fitting (--shrink): slightly scales down the rendered glyph
+    within its cell to prevent clipping at the top/bottom edges.
+    Default 0.94 (94%).
   - Bayer ordered dithering (--dither): replaces simple thresholding with
     a 4×4 Bayer matrix comparison that simulates up to 17 gray levels on
     the 1-bit e-ink display.  Significantly smooths glyph edges at the
@@ -145,8 +148,11 @@ def get_font_baseline(font: ImageFont.FreeTypeFont, size: int) -> int:
     try:
         ascent, descent = font.getmetrics()
         if ascent + descent > 0:
-            # Proportionally scale baseline into the target cell
-            return int(size * ascent / (ascent + descent))
+            # Proportionally scale baseline into the target cell, then push
+            # it ~15% lower.  The design metrics often underestimate the
+            # actual rendered ascent; extra headroom prevents top clipping.
+            ratio = ascent / (ascent + descent)
+            return min(int(size * ratio * 1.15), size - 1)
     except AttributeError:
         pass
 
@@ -156,8 +162,8 @@ def get_font_baseline(font: ImageFont.FreeTypeFont, size: int) -> int:
         _left, _top, _right, bottom = bbox
         return min(bottom, size - 1)
 
-    # Last resort: 78% from top (typical for CJK)
-    return int(size * 0.78)
+    # Last resort: 85% from top (conservative headroom)
+    return int(size * 0.85)
 
 
 # ── Glyph rendering ──────────────────────────────────────────────────
@@ -169,12 +175,13 @@ def render_glyph_oversampled(
     size: int,
     baseline_px: int,
     oversample: int,
+    shrink: float,
 ) -> Image.Image:
     """Render a glyph with oversampling, returning a grayscale PIL Image.
 
-    Renders at `size * oversample` resolution, then downscales to `size`
-    with Lanczos filtering.  The baseline is placed at a consistent position
-    so glyphs share the same vertical reference.
+    Renders at `size * oversample` resolution, then Lanczos-downscales to
+    `size`.  If shrink < 1.0 the glyph is further scaled down and centered
+    to leave a safety margin against cell-edge clipping.
     """
     big_size = size * oversample
     big_baseline = baseline_px * oversample
@@ -198,6 +205,15 @@ def render_glyph_oversampled(
     if oversample > 1:
         img = img.resize((size, size), Image.LANCZOS)
 
+    # Optional shrink to prevent clipping at cell edges
+    if shrink < 1.0:
+        glyph_px = max(4, round(size * shrink))
+        img = img.resize((glyph_px, glyph_px), Image.LANCZOS)
+        canvas = Image.new("L", (size, size), 255)
+        offset = (size - glyph_px) // 2
+        canvas.paste(img, (offset, offset))
+        img = canvas
+
     return img
 
 
@@ -206,6 +222,7 @@ def render_glyph_direct(
     ch: str,
     size: int,
     baseline_px: int,
+    shrink: float,
 ) -> Image.Image:
     """Render a glyph at the target size (no oversampling)."""
     img = Image.new("L", (size, size), 255)
@@ -219,6 +236,16 @@ def render_glyph_direct(
         x = 0
 
     draw.text((x, baseline_px), ch, font=font, fill=0, anchor="ls")
+
+    # Optional shrink to prevent clipping at cell edges
+    if shrink < 1.0:
+        glyph_px = max(4, round(size * shrink))
+        img = img.resize((glyph_px, glyph_px), Image.LANCZOS)
+        canvas = Image.new("L", (size, size), 255)
+        offset = (size - glyph_px) // 2
+        canvas.paste(img, (offset, offset))
+        img = canvas
+
     return img
 
 
@@ -307,12 +334,13 @@ def glyph_bitmap(
     baseline_px: int,
     oversample: int,
     dither: bool,
+    shrink: float,
 ) -> bytes:
     """Render, optionally oversample, binarize, and return packed bitmap."""
     if oversample > 1:
-        img = render_glyph_oversampled(font, ch, size, baseline_px, oversample)
+        img = render_glyph_oversampled(font, ch, size, baseline_px, oversample, shrink)
     else:
-        img = render_glyph_direct(font, ch, size, baseline_px)
+        img = render_glyph_direct(font, ch, size, baseline_px, shrink)
 
     if dither:
         bitmap = binarize_image_dithered(img, size)
@@ -360,6 +388,7 @@ def generate(args):
     baseline_px = get_font_baseline(font, args.size)
     oversample = max(1, args.oversample)
     dither = args.dither
+    shrink = args.shrink
 
     # Collect characters
     if args.chars_file:
@@ -389,6 +418,7 @@ def generate(args):
     print(f"Generating {glyph_count} glyphs at {glyph_width}x{glyph_height}px...")
     print(f"  Oversample: {oversample}×")
     print(f"  Baseline:   {baseline_px}px from top")
+    print(f"  Shrink:     {shrink:.0%}")
     print(f"  Binarize:   {mode}")
 
     # ── Build index and data blob ──────────────────────────────────
@@ -396,7 +426,9 @@ def generate(args):
     data_offset = 8 + glyph_count * INDEX_ENTRY_SIZE  # header + index
 
     for i, ch in enumerate(chars):
-        bitmap = glyph_bitmap(font, ch, args.size, baseline_px, oversample, dither)
+        bitmap = glyph_bitmap(
+            font, ch, args.size, baseline_px, oversample, dither, args.shrink
+        )
         compressed = zlib.compress(bitmap, level=9)
         advance = glyph_advance(font, ch, args.size)
 
@@ -494,6 +526,12 @@ def main():
         default=False,
         help="Use Bayer 4x4 ordered dithering instead of adaptive thresholding",
     )
+    parser.add_argument(
+        "--shrink",
+        type=float,
+        default=0.94,
+        help="Scale glyph down within cell to prevent edge clipping (default: 0.94, range: 0.80..1.0)",
+    )
     args = parser.parse_args()
 
     if not Path(args.ttf_path).exists():
@@ -504,6 +542,10 @@ def main():
         print(
             f"Error: --oversample must be 1..8, got {args.oversample}", file=sys.stderr
         )
+        sys.exit(1)
+
+    if args.shrink < 0.8 or args.shrink > 1.0:
+        print(f"Error: --shrink must be 0.8..1.0, got {args.shrink}", file=sys.stderr)
         sys.exit(1)
 
     generate(args)
