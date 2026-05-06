@@ -173,7 +173,7 @@ fn process_remote_entry(
     let key = entry.key.as_str();
 
     if let Some(reason) = classify_skip_reason(key) {
-        warn!("Skip {}: {}", key, reason);
+        debug!("Skip {}: {}", key, reason);
         counters.skipped += 1;
         append_old_manifest_entry_if_present(manifest_writer, key)?;
         return Ok(());
@@ -182,7 +182,7 @@ fn process_remote_entry(
     let ctx = match build_entry_context(config, key) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Skip {}: {}", key, e);
+            debug!("Skip {}: {}", key, e);
             counters.skipped += 1;
             append_old_manifest_entry_if_present(manifest_writer, key)?;
             return Ok(());
@@ -259,14 +259,14 @@ pub fn sync_vault_from_s3_config(
         }
         on_progress(&format!("获取文件列表 第{}页...", page));
         let list_url = build_list_url(config, continuation_token.as_deref())?;
-        warn!("List URL page {}: {}", page, list_url);
+        debug!("List URL page {}: {}", page, list_url);
         info!("Listing remote objects: {}", list_url);
 
         let (entries, next_token) = http_list_objects_signed(config, &list_url)?;
         if entries.is_empty() && next_token.is_none() {
             break;
         }
-        warn!(
+        debug!(
             "List page {}: {} entries (sample: {} -> {:?})",
             page,
             entries.len(),
@@ -483,7 +483,7 @@ fn http_list_objects_signed_once(
         ..Default::default()
     };
     wait_for_download_heap("list GET request init");
-    warn!("Heap before list GET: {}", free_heap());
+    debug!("Heap before list GET: {}", free_heap());
     let mut connection = EspHttpConnection::new(&config_http)?;
 
     let headers = [
@@ -707,7 +707,7 @@ fn download_file_signed_direct_once(
         ..Default::default()
     };
     wait_for_download_heap("direct GET request init");
-    warn!("Heap before direct GET: {}", free_heap());
+    debug!("Heap before direct GET: {}", free_heap());
     let mut connection = EspHttpConnection::new(&config_http)?;
 
     let headers = [
@@ -828,7 +828,7 @@ fn download_file_signed_chunk(
         ..Default::default()
     };
     wait_for_download_heap("range GET request init");
-    warn!("Heap before range GET: {}", free_heap());
+    debug!("Heap before range GET: {}", free_heap());
     let mut connection = EspHttpConnection::new(&config_http)?;
 
     let headers = [

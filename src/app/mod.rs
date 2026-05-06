@@ -215,7 +215,7 @@ impl ReaderApp {
                 if matches!(self.activity, Activity::Settings) {
                     self.activity = Activity::FileBrowser;
                     self.reload_browser_entries(None);
-                    warn!(
+                    debug!(
                         "Switched to FileBrowser: md_files={} browser_entries={} current_dir={:?}",
                         self.md_files.len(),
                         self.browser.entries.len(),
@@ -306,7 +306,7 @@ impl ReaderApp {
         entries.extend(files);
         sort_browser_entries(&mut entries);
 
-        warn!(
+        debug!(
             "reload_browser_entries: md_files={} root_prefix={:?} current_dir={:?} entries={} (dirs={} files={})",
             self.md_files.len(),
             root_prefix,
@@ -640,7 +640,7 @@ impl ReaderApp {
                     Ok(report) => {
                         self.md_files = match self.hardware.storage.list_markdown_files("") {
                             Ok(files) => {
-                                warn!("Rescan after sync: {} files", files.len());
+                                info!("Rescan after sync: {} files", files.len());
                                 files
                             }
                             Err(e) => {
@@ -890,7 +890,7 @@ impl ReaderApp {
                 true
             }
             None => {
-                warn!("Wiki link target not found: [[{}]]", target);
+                info!("Wiki link target not found: [[{}]]", target);
                 false
             }
         }

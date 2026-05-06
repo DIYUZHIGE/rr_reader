@@ -70,7 +70,7 @@ impl Storage {
                     // Migrate old default "notes" to vault root.
                     if value == "notes" {
                         let _ = fs::remove_file(&config_path);
-                        warn!("Migrated stale browser_root=notes config to vault root");
+                        info!("Migrated stale browser_root=notes config to vault root");
                         return Ok(String::new());
                     }
                     validated_relative_path(value)?;
