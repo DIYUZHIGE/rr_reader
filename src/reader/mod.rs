@@ -19,9 +19,9 @@ pub use self::markdown::preprocess_obsidian_embeds;
 use self::math::{draw_math_layout, draw_reader_math, layout_math, parse_math};
 use self::pagination::{font_for_style, paginate_blocks};
 
-pub const READER_X: usize = 24;
-pub const READER_TEXT_Y: usize = 42;
-pub const READER_RIGHT_MARGIN: usize = 24;
+pub const READER_X: usize = 16;
+pub const READER_TEXT_Y: usize = 12;
+pub const READER_RIGHT_MARGIN: usize = 16;
 pub const READER_BOTTOM_MARGIN: usize = 36;
 
 const QUOTE_BAR_WIDTH: usize = 3;

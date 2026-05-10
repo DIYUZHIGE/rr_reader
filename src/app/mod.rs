@@ -19,11 +19,9 @@ use std::collections::BTreeSet;
 
 const DEFAULT_LOOP_DELAY_MS: u32 = 5;
 const IDLE_LOOP_DELAY_MS: u32 = 50;
-const LIST_TOP_Y: usize = 28;
-const LIST_BOTTOM_MARGIN: usize = 36;
-const LIST_X: usize = 48;
-const LIST_RIGHT_MARGIN: usize = 24;
-const PAGE_PATH_Y_OFFSET: usize = 34;
+const CONTENT_TOP: usize = 12;
+const LIST_X: usize = 24;
+const LIST_RIGHT_MARGIN: usize = 16;
 const WIFI_SIGNAL_X_OFFSET: usize = 340;
 const WIFI_PASSWORD_CHARS: &str =
     "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-_=+[]{}\\|;:'\",.<>/?`~";
@@ -561,28 +559,22 @@ impl ReaderApp {
         self.display.clear_glyph_cache();
         self.display.clear(0xFF);
 
+        let path_title = if self.browser.current_dir.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.browser.current_dir)
+        };
+
         if self.browser.entries.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
                 "此目录为空",
                 LIST_X,
-                LIST_TOP_Y,
+                CONTENT_TOP,
                 Display::width() - LIST_RIGHT_MARGIN,
                 3,
             );
-
-            let path_title = if self.browser.current_dir.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{}", self.browser.current_dir)
-            };
-            let path_title = truncate_for_width(&self.ui_font, &path_title, Display::width() - 48);
-            self.display.draw_text_font(
-                &self.ui_font,
-                &path_title,
-                LIST_X,
-                Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET,
-            );
+            self.draw_bottom_bar(&path_title, "");
             return;
         }
 
@@ -594,10 +586,10 @@ impl ReaderApp {
         let end = (first_visible + row_count).min(self.browser.entries.len());
 
         for (row, idx) in (first_visible..end).enumerate() {
-            let y = LIST_TOP_Y + row * row_height;
+            let y = CONTENT_TOP + row * row_height;
             let selected_row = idx == selected;
             if selected_row {
-                self.display.fill_rect(30, y - 2, 2, row_height - 10, 0x00);
+                self.display.fill_rect(12, y, 2, row_height - 6, 0x00);
             }
 
             let entry = &self.browser.entries[idx];
@@ -615,18 +607,7 @@ impl ReaderApp {
             self.display.draw_text_font(&self.ui_font, &name, LIST_X, y);
         }
 
-        let path_title = if self.browser.current_dir.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", self.browser.current_dir)
-        };
-        let path_title = truncate_for_width(&self.ui_font, &path_title, Display::width() - 48);
-        self.display.draw_text_font(
-            &self.ui_font,
-            &path_title,
-            LIST_X,
-            Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET,
-        );
+        self.draw_bottom_bar(&path_title, "");
 
         debug!(
             "Rendering file browser: dir='{}' selected {}/{}",
@@ -669,16 +650,15 @@ impl ReaderApp {
 
     fn render_sync_status_light(&mut self, status: &str) {
         self.display.clear(0xFF);
+        let title = "同步中...";
+        let title_w = self.ui_font.text_width(title);
+        let title_x = (Display::width() - title_w) / 2;
+        let title_y = (Display::height() - self.ui_font.glyph_height as usize) / 2 - 10;
         self.display
-            .draw_text_font(&self.ui_font, "同步中...", LIST_X, LIST_TOP_Y);
+            .draw_text_font(&self.ui_font, title, title_x, title_y);
         let status_text = format!("状态: {}", status);
-        let status_line = truncate_for_width(&self.ui_font, &status_text, Display::width() - 48);
-        self.display.draw_text_font(
-            &self.ui_font,
-            &status_line,
-            LIST_X,
-            LIST_TOP_Y + self.ui_font.glyph_height as usize + 18,
-        );
+        let status_text = truncate_for_width(&self.ui_font, &status_text, Display::width() - LIST_X - LIST_RIGHT_MARGIN);
+        self.draw_bottom_bar(&status_text, "");
     }
 
     fn trigger_manual_sync(&mut self) {
@@ -826,35 +806,27 @@ impl ReaderApp {
         ];
 
         for (i, option) in options.iter().enumerate() {
-            let y = LIST_TOP_Y + i * (self.ui_font.glyph_height as usize + 18);
+            let y = CONTENT_TOP + i * (self.ui_font.glyph_height as usize + 10);
             if i == self.settings_selected {
                 self.display
-                    .fill_rect(30, y - 2, 2, self.ui_font.glyph_height as usize + 4, 0x00);
+                    .fill_rect(12, y, 2, self.ui_font.glyph_height as usize + 4, 0x00);
             }
             self.display
                 .draw_text_font(&self.ui_font, option, LIST_X, y);
         }
 
-        let root_line = format!("当前根目录: {}", current_root);
-        let root_line = truncate_for_width(&self.ui_font, &root_line, Display::width() - 48);
-        self.display.draw_text_font(
-            &self.ui_font,
-            &root_line,
-            LIST_X,
-            Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET - 20,
-        );
-
-        if !self.settings_status.is_empty() {
-            let status_text = format!("状态: {}", self.settings_status);
-            let status_line =
-                truncate_for_width(&self.ui_font, &status_text, Display::width() - 48);
-            self.display.draw_text_font(
+        let root_line = format!("当前: {}", current_root);
+        let right = if self.settings_status.is_empty() {
+            String::new()
+        } else {
+            let status = truncate_for_width(
                 &self.ui_font,
-                &status_line,
-                LIST_X,
-                Display::height() - self.ui_font.glyph_height as usize - PAGE_PATH_Y_OFFSET,
+                &self.settings_status,
+                Display::width() - LIST_X - LIST_RIGHT_MARGIN - self.ui_font.text_width(&root_line) - 12,
             );
-        }
+            status.to_string()
+        };
+        self.draw_bottom_bar(&root_line, &right);
     }
 
     /// Cycle the wiki link selection on the current page.
@@ -981,9 +953,9 @@ impl ReaderApp {
             self.display.draw_text_wrapped(
                 &self.ui_font,
                 "没有 Markdown 文件\n/sdcard/vault",
-                24,
+                READER_X,
                 20,
-                Display::width() - 24,
+                Display::width() - READER_X,
                 4,
             );
             debug!("No files to render");
@@ -1028,11 +1000,6 @@ impl ReaderApp {
 
                 let (_, name) = file_browser_parts(&rel_path);
                 let title = format!("[{}] {}", file_index + 1, name);
-                let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
-                self.display
-                    .draw_text_font(&self.ui_font, &title, READER_X, 10);
-                self.display
-                    .fill_rect(READER_X, 34, Display::width() - 48, 1, 0x00);
 
                 let page = self
                     .reader_cache
@@ -1047,14 +1014,12 @@ impl ReaderApp {
                     });
                 }
                 let footer = format!("{}/{}", page_index + 1, page_count);
-                let footer_x =
-                    Display::width().saturating_sub(READER_X + self.ui_font.text_width(&footer));
-                self.display.draw_text_font(
+                let title = truncate_for_width(
                     &self.ui_font,
-                    &footer,
-                    footer_x,
-                    Display::height() - self.ui_font.glyph_height as usize - 8,
+                    &title,
+                    Display::width() - LIST_X - LIST_RIGHT_MARGIN - self.ui_font.text_width(&footer) - 12,
                 );
+                self.draw_bottom_bar(&title, &footer);
                 debug!(
                     "Rendering file {}/{} page {}/{}: {}",
                     file_index + 1,
@@ -1068,9 +1033,9 @@ impl ReaderApp {
                 self.display.draw_text_wrapped(
                     &self.ui_font,
                     &format!("Error reading {}:\n{}", rel_path, e),
-                    24,
+                    READER_X,
                     20,
-                    Display::width() - 24,
+                    Display::width() - READER_X,
                     4,
                 );
                 warn!("Failed to read {}: {}", rel_path, e);
@@ -1133,11 +1098,39 @@ impl ReaderApp {
 
     fn browser_row_count(&self) -> usize {
         let row_height = self.browser_row_height();
-        (Display::height() - LIST_TOP_Y - LIST_BOTTOM_MARGIN) / row_height
+        let bottom_reserved = self.bottom_bar_total_height();
+        (Display::height() - CONTENT_TOP - bottom_reserved) / row_height
     }
 
     fn browser_row_height(&self) -> usize {
+        self.ui_font.glyph_height as usize + 6
+    }
+
+    fn bottom_bar_total_height(&self) -> usize {
         self.ui_font.glyph_height as usize + 12
+    }
+
+    fn bottom_bar_sep_y(&self) -> usize {
+        Display::height() - self.ui_font.glyph_height as usize - 12
+    }
+
+    fn bottom_bar_text_y(&self) -> usize {
+        Display::height() - self.ui_font.glyph_height as usize - 6
+    }
+
+    fn draw_bottom_bar(&mut self, left: &str, right: &str) {
+        let sep_y = self.bottom_bar_sep_y();
+        let text_y = self.bottom_bar_text_y();
+        let bar_width = Display::width() - LIST_X - LIST_RIGHT_MARGIN;
+        self.display.fill_rect(LIST_X, sep_y, bar_width, 1, 0x00);
+        let max_left = bar_width.saturating_sub(60);
+        let left = truncate_for_width(&self.ui_font, left, max_left);
+        self.display.draw_text_font(&self.ui_font, &left, LIST_X, text_y);
+        if !right.is_empty() {
+            let right_w = self.ui_font.text_width(right);
+            let right_x = (Display::width() - LIST_RIGHT_MARGIN).saturating_sub(right_w);
+            self.display.draw_text_font(&self.ui_font, right, right_x, text_y);
+        }
     }
 
     pub fn loop_delay_ms(&self) -> u32 {
@@ -1465,27 +1458,16 @@ impl ReaderApp {
     fn render_wifi_network_list(&mut self, state: &WifiState) {
         self.display.clear(0xFF);
 
-        // Title
-        self.display
-            .draw_text_font(&self.ui_font, "Wi-Fi 设置", LIST_X, 8);
-        self.display.fill_rect(
-            LIST_X,
-            8 + self.ui_font.glyph_height as usize + 2,
-            Display::width() - LIST_X - LIST_RIGHT_MARGIN,
-            1,
-            0x00,
-        );
-
-        let header_bottom = 8 + self.ui_font.glyph_height as usize + 6;
         let row_height = self.ui_font.glyph_height as usize + 10;
-        let visible_rows = (Display::height() - header_bottom - LIST_BOTTOM_MARGIN - 24) / row_height;
+        let bottom_reserved = self.bottom_bar_total_height() + 6;
+        let visible_rows = (Display::height() - CONTENT_TOP - bottom_reserved) / row_height;
 
         if state.scanned_aps.is_empty() {
             self.display.draw_text_wrapped(
                 &self.ui_font,
                 "未发现 WiFi 网络",
                 LIST_X,
-                header_bottom + 8,
+                CONTENT_TOP,
                 Display::width() - LIST_RIGHT_MARGIN,
                 3,
             );
@@ -1496,11 +1478,11 @@ impl ReaderApp {
 
             for i in start..end {
                 let row = i - start;
-                let y = header_bottom + row * row_height;
+                let y = CONTENT_TOP + row * row_height;
 
                 if i == state.selected_index {
                     self.display
-                        .fill_rect(30, y - 1, 2, row_height - 6, 0x00);
+                        .fill_rect(12, y, 2, row_height - 4, 0x00);
                 }
 
                 let ap = &state.scanned_aps[i];
@@ -1517,10 +1499,8 @@ impl ReaderApp {
                 self.display
                     .draw_text_font(&self.ui_font, &ssid, LIST_X, y);
 
-                // Signal strength bar
                 self.draw_signal_bars(y, ap.signal_strength);
 
-                // Auth method indicator
                 let auth_text = match ap.auth_method {
                     None | Some(AuthMethod::None) => "(开放)",
                     _ => "",
@@ -1533,17 +1513,7 @@ impl ReaderApp {
             }
         }
 
-        // Status line
-        if !state.status_message.is_empty() {
-            let status =
-                truncate_for_width(&self.ui_font, &state.status_message, Display::width() - 48);
-            self.display.draw_text_font(
-                &self.ui_font,
-                &status,
-                LIST_X,
-                Display::height() - self.ui_font.glyph_height as usize - 12,
-            );
-        }
+        self.draw_bottom_bar(&state.status_message, "");
     }
 
     fn render_wifi_password_choice(&mut self, state: &WifiState) {
@@ -1554,19 +1524,8 @@ impl ReaderApp {
             .get(state.selected_ap_index)
             .map(|ap| ap.ssid.clone())
             .unwrap_or_default();
-        let title = format!("选择密码: {}", ap);
-        let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
-        self.display.draw_text_font(&self.ui_font, &title, LIST_X, 8);
-        self.display.fill_rect(
-            LIST_X,
-            8 + self.ui_font.glyph_height as usize + 2,
-            Display::width() - LIST_X - LIST_RIGHT_MARGIN,
-            1,
-            0x00,
-        );
 
-        let header_bottom = 8 + self.ui_font.glyph_height as usize + 6;
-        let row_height = self.ui_font.glyph_height as usize + 16;
+        let row_height = self.ui_font.glyph_height as usize + 10;
 
         let options: Vec<String> = WIFI_PRESET_PASSWORDS
             .iter()
@@ -1576,15 +1535,18 @@ impl ReaderApp {
             .collect();
 
         for (i, option) in options.iter().enumerate() {
-            let y = header_bottom + 12 + i * row_height;
+            let y = CONTENT_TOP + 4 + i * row_height;
             if i == state.selected_index {
                 self.display
-                    .fill_rect(30, y - 2, 2, self.ui_font.glyph_height as usize + 4, 0x00);
+                    .fill_rect(12, y, 2, self.ui_font.glyph_height as usize + 4, 0x00);
             }
             let label =
                 truncate_for_width(&self.ui_font, option, Display::width() - LIST_X - LIST_RIGHT_MARGIN);
             self.display.draw_text_font(&self.ui_font, &label, LIST_X, y);
         }
+
+        let bottom_label = format!("选择密码: {}", ap);
+        self.draw_bottom_bar(&bottom_label, "");
     }
 
     fn render_wifi_password_input(&mut self, state: &WifiState) {
@@ -1595,18 +1557,8 @@ impl ReaderApp {
             .get(state.selected_ap_index)
             .map(|ap| ap.ssid.clone())
             .unwrap_or_default();
-        let title = format!("输入密码: {}", ap);
-        let title = truncate_for_width(&self.ui_font, &title, Display::width() - 48);
-        self.display.draw_text_font(&self.ui_font, &title, LIST_X, 8);
-        self.display.fill_rect(
-            LIST_X,
-            8 + self.ui_font.glyph_height as usize + 2,
-            Display::width() - LIST_X - LIST_RIGHT_MARGIN,
-            1,
-            0x00,
-        );
 
-        let input_y = 8 + self.ui_font.glyph_height as usize + 20;
+        let input_y = CONTENT_TOP + 12;
 
         // Render password characters with cursor highlight
         let max_display = 20; // max chars to show on screen
@@ -1738,45 +1690,31 @@ impl ReaderApp {
         self.display
             .draw_text_font(&self.ui_font, &preview_str, LIST_X + label_w, preview_y);
 
-        // Help text
+        // Help text (condensed, placed above bottom bar)
         let help_y = preview_y + self.ui_font.glyph_height as usize + 8;
         self.display.draw_text_wrapped(
             &self.ui_font,
-            "上下键切换字符  左右键移动光标  确认键连接  返回键取消",
+            "上下切换字符  左右移动光标  确认连接  返回取消",
             LIST_X,
             help_y,
             Display::width() - LIST_RIGHT_MARGIN,
             4,
         );
+
+        let bottom_label = format!("连接到: {}", ap);
+        self.draw_bottom_bar(&bottom_label, "");
     }
 
     fn render_wifi_status(&mut self, message: &str, hint: &str) {
         self.display.clear(0xFF);
 
-        self.display
-            .draw_text_font(&self.ui_font, "Wi-Fi 设置", LIST_X, 8);
-        self.display.fill_rect(
-            LIST_X,
-            8 + self.ui_font.glyph_height as usize + 2,
-            Display::width() - LIST_X - LIST_RIGHT_MARGIN,
-            1,
-            0x00,
-        );
-
         let msg_y = Display::height() / 2 - self.ui_font.glyph_height as usize;
-        let msg = truncate_for_width(&self.ui_font, message, Display::width() - 48);
+        let msg = truncate_for_width(&self.ui_font, message, Display::width() - 2 * LIST_X);
         let msg_w = self.ui_font.text_width(&msg);
         let msg_x = (Display::width() - msg_w) / 2;
         self.display.draw_text_font(&self.ui_font, &msg, msg_x, msg_y);
 
-        if !hint.is_empty() {
-            let hint_y = msg_y + self.ui_font.glyph_height as usize + 16;
-            let hint = truncate_for_width(&self.ui_font, hint, Display::width() - 48);
-            let hint_w = self.ui_font.text_width(&hint);
-            let hint_x = (Display::width() - hint_w) / 2;
-            self.display
-                .draw_text_font(&self.ui_font, &hint, hint_x, hint_y);
-        }
+        self.draw_bottom_bar(hint, "");
     }
 
     fn draw_signal_bars(&mut self, y: usize, signal_strength: i8) {
