@@ -35,6 +35,16 @@ impl super::Storage {
         info!("No WiFi config found under {}", SD_MOUNT_POINT);
         Ok(None)
     }
+
+    /// Write WiFi credentials to /sdcard/wifi.conf so S3 sync can use them.
+    pub fn write_wifi_credentials(&self, ssid: &str, password: &str) -> Result<()> {
+        let path = WIFI_CONFIG_PATHS[0];
+        let contents = format!("ssid={}\npassword={}\n", ssid, password);
+        fs::write(path, &contents)
+            .map_err(|e| anyhow!("write {}: {}", path, e))?;
+        info!("WiFi credentials saved to {}", path);
+        Ok(())
+    }
 }
 
 fn parse_wifi_credentials(contents: &str) -> Result<WifiCredentials> {

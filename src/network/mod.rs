@@ -4,7 +4,10 @@ use core::convert::TryInto;
 use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+pub use esp_idf_svc::wifi::AccessPointInfo;
+use esp_idf_svc::wifi::{
+    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
+};
 use log::{info, warn};
 
 fn free_heap() -> u32 {
@@ -54,6 +57,11 @@ impl NetworkManager {
             last_credentials: None,
             suspended: false,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn status(&self) -> &WifiStatus {
+        &self.status
     }
 
     pub fn connect_from_storage(&mut self, storage: &Storage) -> WifiStatus {
@@ -141,15 +149,63 @@ impl NetworkManager {
         }
     }
 
-    fn connect(&mut self, credentials: WifiCredentials) -> Result<WifiStatus> {
-        warn!("Heap before WiFi connect: {}", free_heap());
-        let ssid = credentials.ssid.clone();
-        let password_len = credentials.password.as_bytes().len();
-        info!(
-            "Connecting WiFi ssid={} password_len={} from {}",
-            ssid, password_len, credentials.source_path
-        );
+    /// Scan for nearby WiFi access points. Initializes the WiFi driver in station
+    /// mode if not already running. Results are sorted by signal strength (best first).
+    pub fn scan(&mut self) -> Result<Vec<AccessPointInfo>> {
+        self.ensure_wifi_started()?;
+        let wifi = self
+            .wifi
+            .as_mut()
+            .ok_or_else(|| anyhow!("WiFi driver unavailable"))?;
 
+        info!("Starting WiFi scan...");
+        let mut aps = wifi
+            .scan()
+            .map_err(|e| anyhow!("WiFi scan failed: {}", e))?;
+        aps.sort_by(|a, b| b.signal_strength.cmp(&a.signal_strength));
+        info!("WiFi scan complete: {} access points found", aps.len());
+        Ok(aps)
+    }
+
+    /// Connect using explicitly provided credentials (not from storage).
+    pub fn connect_with_credentials(&mut self, ssid: &str, password: &str) -> WifiStatus {
+        let credentials = WifiCredentials {
+            ssid: ssid.to_string(),
+            password: password.to_string(),
+            source_path: "(manual)".to_string(),
+        };
+
+        match self.connect(credentials.clone()) {
+            Ok(status) => {
+                self.last_credentials = Some(credentials);
+                self.suspended = false;
+                self.status = status;
+            }
+            Err(e) => {
+                warn!("Manual WiFi connection failed: {}", e);
+                self.status = WifiStatus::Failed {
+                    ssid: Some(ssid.to_string()),
+                    reason: e.to_string(),
+                };
+            }
+        }
+
+        self.status.clone()
+    }
+
+    /// Disconnect and stop WiFi. Used when leaving WiFi settings to free heap.
+    /// Unlike `shutdown_after_sync`, this does not log heap warnings.
+    pub fn disconnect_wifi(&mut self) {
+        if let Some(wifi) = self.wifi.as_mut() {
+            let _ = wifi.disconnect();
+            let _ = wifi.stop();
+        }
+        self.suspended = false;
+        info!("WiFi disconnected");
+    }
+
+    /// Ensure WiFi driver is initialized and started in station mode.
+    fn ensure_wifi_started(&mut self) -> Result<()> {
         if self.wifi.is_none() {
             let modem = self
                 .modem
@@ -160,6 +216,28 @@ impl NetworkManager {
             let wifi = EspWifi::new(modem, sys_loop.clone(), Some(nvs))?;
             self.wifi = Some(BlockingWifi::wrap(wifi, sys_loop)?);
         }
+
+        let wifi = self
+            .wifi
+            .as_mut()
+            .ok_or_else(|| anyhow!("WiFi driver unavailable"))?;
+
+        let configuration = Configuration::Client(ClientConfiguration::default());
+        wifi.set_configuration(&configuration)?;
+        wifi.start()?;
+        Ok(())
+    }
+
+    fn connect(&mut self, credentials: WifiCredentials) -> Result<WifiStatus> {
+        warn!("Heap before WiFi connect: {}", free_heap());
+        let ssid = credentials.ssid.clone();
+        let password_len = credentials.password.as_bytes().len();
+        info!(
+            "Connecting WiFi ssid={} password_len={} from {}",
+            ssid, password_len, credentials.source_path
+        );
+
+        self.ensure_wifi_started()?;
 
         let wifi = self
             .wifi

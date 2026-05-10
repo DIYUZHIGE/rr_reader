@@ -53,6 +53,23 @@ impl Hardware {
         self.network.shutdown_after_sync();
     }
 
+    pub fn scan_wifi(&mut self) -> Result<Vec<crate::network::AccessPointInfo>> {
+        self.network.scan()
+    }
+
+    pub fn connect_wifi_with_credentials(&mut self, ssid: &str, password: &str) -> WifiStatus {
+        self.network.connect_with_credentials(ssid, password)
+    }
+
+    pub fn disconnect_wifi(&mut self) {
+        self.network.disconnect_wifi()
+    }
+
+    #[allow(dead_code)]
+    pub fn wifi_status(&self) -> &WifiStatus {
+        self.network.status()
+    }
+
     /// Update button state. Call once per loop iteration.
     pub fn update_inputs(&mut self, idle_ticks: u32) {
         self.input.update_with_idle_ticks(idle_ticks);

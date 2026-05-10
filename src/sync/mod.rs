@@ -10,7 +10,7 @@ use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConne
 use esp_idf_svc::http::Method;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hmac::{Hmac, Mac};
-use log::{info, warn};
+use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Write;

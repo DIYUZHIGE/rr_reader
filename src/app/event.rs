@@ -11,14 +11,26 @@ const READER_REPEAT_INTERVAL_MS: u64 = 450;
 const SETTINGS_REPEAT_START_MS: u32 = 280;
 const SETTINGS_REPEAT_INTERVAL_MS: u64 = 140;
 const BROWSER_SETTINGS_LONG_PRESS_MS: u32 = 700;
+const WIFI_NAV_REPEAT_START_MS: u32 = 280;
+const WIFI_NAV_REPEAT_INTERVAL_MS: u64 = 140;
+const WIFI_CHAR_REPEAT_START_MS: u32 = 200;
+const WIFI_CHAR_REPEAT_INTERVAL_MS: u64 = 80;
 const READER_CONFIRM_LONG_PRESS_MS: u32 = 500;
 const READER_BACK_LONG_PRESS_MS: u32 = 500;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum WifiInputMode {
+    Navigate,
+    PasswordInput,
+    Waiting,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum EventMode {
     FileBrowser,
     Reader,
     Settings,
+    WifiSettings(WifiInputMode),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +49,11 @@ pub(super) enum AppEvent {
     SettingsMove(isize),
     SettingsConfirm,
     SettingsBack,
+    WifiMove(isize),
+    WifiConfirm,
+    WifiBack,
+    WifiCursorMove(i8),
+    WifiCharChange(i8),
     IdleTimeout { idle_ticks: u32 },
 }
 
@@ -47,8 +64,11 @@ pub(super) struct EventPump {
     browser_repeater: NavigationRepeater,
     reader_repeater: NavigationRepeater,
     settings_repeater: NavigationRepeater,
+    wifi_nav_repeater: NavigationRepeater,
+    wifi_char_repeater: NavigationRepeater,
     browser_back_long_handled: bool,
     suppress_settings_back_release: bool,
+    suppress_wifi_back_release: bool,
     reader_confirm_long_handled: bool,
     reader_back_long_handled: bool,
 }
@@ -62,8 +82,11 @@ impl EventPump {
             browser_repeater: NavigationRepeater::new(),
             reader_repeater: NavigationRepeater::new(),
             settings_repeater: NavigationRepeater::new(),
+            wifi_nav_repeater: NavigationRepeater::new(),
+            wifi_char_repeater: NavigationRepeater::new(),
             browser_back_long_handled: false,
             suppress_settings_back_release: false,
+            suppress_wifi_back_release: false,
             reader_confirm_long_handled: false,
             reader_back_long_handled: false,
         }
@@ -107,6 +130,9 @@ impl EventPump {
             EventMode::FileBrowser => self.collect_browser_events(&mut hardware.input, &mut events),
             EventMode::Reader => self.collect_reader_events(&mut hardware.input, &mut events),
             EventMode::Settings => self.collect_settings_events(&mut hardware.input, &mut events),
+            EventMode::WifiSettings(input_mode) => {
+                self.collect_wifi_settings_events(&mut hardware.input, &mut events, input_mode)
+            }
         }
 
         if events.is_empty() && power.should_sleep() {
@@ -251,6 +277,73 @@ impl EventPump {
 
         if input.logical_was_pressed(Confirm) {
             events.push(AppEvent::SettingsConfirm);
+        }
+    }
+
+    fn collect_wifi_settings_events(
+        &mut self,
+        input: &mut InputManager,
+        events: &mut Vec<AppEvent>,
+        mode: WifiInputMode,
+    ) {
+        use Button::*;
+
+        if input.logical_was_released(Back) {
+            if self.suppress_wifi_back_release {
+                self.suppress_wifi_back_release = false;
+                return;
+            }
+            events.push(AppEvent::WifiBack);
+            return;
+        }
+
+        match mode {
+            WifiInputMode::Waiting => {
+                // No interactive input during scan/connect — only Back handled above
+            }
+            WifiInputMode::Navigate => {
+                if let Some(delta) = self.wifi_nav_repeater.navigation_delta(
+                    input,
+                    &[Down, Right],
+                    &[Up, Left],
+                    WIFI_NAV_REPEAT_START_MS,
+                    WIFI_NAV_REPEAT_INTERVAL_MS,
+                ) {
+                    events.push(AppEvent::WifiMove(delta));
+                    return;
+                }
+
+                if input.logical_was_pressed(Confirm) {
+                    events.push(AppEvent::WifiConfirm);
+                }
+            }
+            WifiInputMode::PasswordInput => {
+                // Up/Down: change character at cursor
+                if let Some(delta) = self.wifi_char_repeater.navigation_delta(
+                    input,
+                    &[Down],
+                    &[Up],
+                    WIFI_CHAR_REPEAT_START_MS,
+                    WIFI_CHAR_REPEAT_INTERVAL_MS,
+                ) {
+                    events.push(AppEvent::WifiCharChange(delta as i8));
+                    return;
+                }
+
+                // Left/Right: move cursor (using nav repeater with slower timing)
+                if input.logical_was_pressed(Left) {
+                    events.push(AppEvent::WifiCursorMove(-1));
+                    return;
+                }
+                if input.logical_was_pressed(Right) {
+                    events.push(AppEvent::WifiCursorMove(1));
+                    return;
+                }
+
+                if input.logical_was_pressed(Confirm) {
+                    events.push(AppEvent::WifiConfirm);
+                }
+            }
         }
     }
 }

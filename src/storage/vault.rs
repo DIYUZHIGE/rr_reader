@@ -3,7 +3,7 @@ use super::path::{
 };
 use super::{Storage, SD_MOUNT_POINT, VAULT_DIR};
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use log::info;
 use std::fs;
 use std::path::{Path, PathBuf};
 
