@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 mod image;
 pub mod markdown;
 mod math;
@@ -54,6 +54,10 @@ pub struct ReaderCache {
 }
 
 const CACHE_ROOT: &str = "/sdcard/vault/.rr_cache";
+/// New indexed page-cache format (version 2). Old format (no version byte)
+/// used sequential seek; any file not starting with this version byte is
+/// treated as stale and rebuilt.
+const CACHE_VERSION: u8 = 2;
 fn file_hash(path: &str) -> u64 {
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
@@ -78,6 +82,11 @@ impl ReaderCache {
 
     fn from_cache(file_index: usize, path: &str) -> Result<Self> {
         let mut f = File::open(path)?;
+        let mut ver = [0u8; 1];
+        f.read_exact(&mut ver)?;
+        if ver[0] != CACHE_VERSION {
+            return Err(anyhow!("stale page-cache format"));
+        }
         let mut buf = [0u8; 8];
         f.read_exact(&mut buf)?;
         let page_count = u64::from_le_bytes(buf) as usize;
@@ -99,18 +108,38 @@ impl ReaderCache {
         let all_pages = markdown_blocks_and_pages(markdown, fonts);
         let page_count = all_pages.len();
 
-        // Create cache dir and write pages
-        if let Some(parent) = std::path::Path::new(cpath).parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let mut f = File::create(cpath)?;
-        f.write_all(&(page_count as u64).to_le_bytes())?;
+        // Pre-serialize all pages to compute offsets for the O(1) index.
+        let mut page_data: Vec<Vec<u8>> = Vec::with_capacity(page_count);
+        let mut offsets = Vec::with_capacity(page_count + 1);
+        let mut cur: u32 = 0;
         for page in &all_pages {
             let data = page.to_bytes();
-            f.write_all(&(data.len() as u32).to_le_bytes())?;
-            f.write_all(&data)?;
+            offsets.push(cur);
+            cur = cur.saturating_add(data.len() as u32);
+            page_data.push(data);
+        }
+        offsets.push(cur); // sentinel: total data size
+
+        if let Some(parent) = std::path::Path::new(cpath).parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::warn!("create page cache dir {:?}: {}", parent, e);
+            }
+        }
+        let mut f = File::create(cpath)?;
+        // Header: [version:u8][page_count:u64]
+        f.write_all(&[CACHE_VERSION])?;
+        f.write_all(&(page_count as u64).to_le_bytes())?;
+        // Index: page_count + 1 u32 offsets
+        for off in &offsets {
+            f.write_all(&off.to_le_bytes())?;
+        }
+        // Page data blob
+        for data in &page_data {
+            f.write_all(data)?;
         }
         drop(f);
+        drop(page_data);
+        drop(offsets);
         drop(all_pages);
 
         Ok(Self {
@@ -142,24 +171,29 @@ impl ReaderCache {
 
     fn read_page_from_sd(&self, page_index: usize) -> Result<ReaderPage> {
         let mut f = File::open(&self.cache_dir)?;
+        // Skip version byte already validated in from_cache
+        let _ = f.seek(std::io::SeekFrom::Start(1));
+
         let mut buf = [0u8; 8];
         f.read_exact(&mut buf)?;
         let count = u64::from_le_bytes(buf) as usize;
         if page_index >= count {
             return Err(anyhow!("page index out of range"));
         }
-        // Skip pages before target
-        for _ in 0..page_index {
-            let mut len_buf = [0u8; 4];
-            f.read_exact(&mut len_buf)?;
-            let len = u32::from_le_bytes(len_buf) as usize;
-            // seek forward
-            use std::io::Seek;
-            f.seek(std::io::SeekFrom::Current(len as i64))?;
-        }
-        let mut len_buf = [0u8; 4];
-        f.read_exact(&mut len_buf)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
+
+        // O(1): read two consecutive u32 offsets from the index
+        let index_base = 1 + 8; // version + page_count
+        let offset_pos = index_base + page_index * 4;
+        f.seek(std::io::SeekFrom::Start(offset_pos as u64))?;
+        let mut off_buf = [0u8; 8]; // read two u32 at once
+        f.read_exact(&mut off_buf)?;
+        let start_off = u32::from_le_bytes([off_buf[0], off_buf[1], off_buf[2], off_buf[3]]) as u64;
+        let end_off = u32::from_le_bytes([off_buf[4], off_buf[5], off_buf[6], off_buf[7]]) as u64;
+        let len = (end_off - start_off) as usize;
+
+        // Seek directly to page data
+        let data_start = (index_base + (count + 1) * 4) as u64;
+        f.seek(std::io::SeekFrom::Start(data_start + start_off))?;
         let mut data = vec![0u8; len];
         f.read_exact(&mut data)?;
         ReaderPage::from_bytes(&data)

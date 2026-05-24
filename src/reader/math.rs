@@ -3,6 +3,8 @@ use crate::font::{Font, FontSet};
 
 use super::{RenderMath, QUOTE_BAR_WIDTH, QUOTE_INDENT, READER_X};
 
+const MAX_MATH_NESTING_DEPTH: usize = 32;
+
 #[derive(Clone, Debug)]
 pub(super) enum MathNode {
     Row(Vec<MathNode>),
@@ -112,7 +114,7 @@ pub(super) fn draw_math_layout(
         } => {
             display.draw_text_font(
                 fonts.math,
-                "√",
+                "\u{221a}",
                 x,
                 y + layout
                     .baseline
@@ -125,7 +127,7 @@ pub(super) fn draw_math_layout(
 }
 
 pub(super) fn parse_math(source: &str) -> MathNode {
-    MathParser::new(source).parse_row(false)
+    MathParser::new(source).parse_row(false, 0)
 }
 
 struct MathParser<'a> {
@@ -139,7 +141,12 @@ impl<'a> MathParser<'a> {
         }
     }
 
-    fn parse_row(&mut self, stop_on_group: bool) -> MathNode {
+    fn parse_row(&mut self, stop_on_group: bool, depth: usize) -> MathNode {
+        if depth > MAX_MATH_NESTING_DEPTH {
+            self.skip_to_group_end(stop_on_group);
+            return MathNode::Text("\u{2026}".to_owned());
+        }
+
         let mut nodes = Vec::new();
         let mut text = String::new();
 
@@ -153,19 +160,19 @@ impl<'a> MathParser<'a> {
                 '^' | '_' => {
                     self.chars.next();
                     flush_math_text(&mut text, &mut nodes);
-                    let script = self.parse_script_argument();
+                    let script = self.parse_script_argument(depth + 1);
                     let base = nodes.pop().unwrap_or_else(|| MathNode::Text(String::new()));
                     nodes.push(merge_script(base, ch == '^', script));
                 }
                 '{' => {
                     self.chars.next();
                     flush_math_text(&mut text, &mut nodes);
-                    nodes.push(self.parse_row(true));
+                    nodes.push(self.parse_row(true, depth + 1));
                 }
                 '\\' => {
                     self.chars.next();
                     flush_math_text(&mut text, &mut nodes);
-                    nodes.push(self.parse_command());
+                    nodes.push(self.parse_command(depth + 1));
                 }
                 _ => {
                     self.chars.next();
@@ -184,15 +191,31 @@ impl<'a> MathParser<'a> {
         }
     }
 
-    fn parse_script_argument(&mut self) -> MathNode {
+    /// Consume chars until the current group ends or end-of-input.
+    fn skip_to_group_end(&mut self, stop_on_group: bool) {
+        let mut brace_depth = 0usize;
+        while let Some(ch) = self.chars.next() {
+            match ch {
+                '{' => brace_depth += 1,
+                '}' if stop_on_group && brace_depth == 0 => break,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+
+    fn parse_script_argument(&mut self, depth: usize) -> MathNode {
+        if depth > MAX_MATH_NESTING_DEPTH {
+            return MathNode::Text("\u{2026}".to_owned());
+        }
         match self.chars.peek().copied() {
             Some('{') => {
                 self.chars.next();
-                self.parse_row(true)
+                self.parse_row(true, depth + 1)
             }
             Some('\\') => {
                 self.chars.next();
-                self.parse_command()
+                self.parse_command(depth + 1)
             }
             Some(ch) => {
                 self.chars.next();
@@ -202,17 +225,23 @@ impl<'a> MathParser<'a> {
         }
     }
 
-    fn parse_required_group(&mut self) -> MathNode {
+    fn parse_required_group(&mut self, depth: usize) -> MathNode {
+        if depth > MAX_MATH_NESTING_DEPTH {
+            return MathNode::Text("\u{2026}".to_owned());
+        }
         consume_math_spaces(&mut self.chars);
         if matches!(self.chars.peek(), Some('{')) {
             self.chars.next();
-            self.parse_row(true)
+            self.parse_row(true, depth + 1)
         } else {
-            self.parse_script_argument()
+            self.parse_script_argument(depth)
         }
     }
 
-    fn parse_command(&mut self) -> MathNode {
+    fn parse_command(&mut self, depth: usize) -> MathNode {
+        if depth > MAX_MATH_NESTING_DEPTH {
+            return MathNode::Text("\u{2026}".to_owned());
+        }
         let mut command = String::new();
         while let Some(&next) = self.chars.peek() {
             if next.is_ascii_alphabetic() {
@@ -233,8 +262,8 @@ impl<'a> MathParser<'a> {
 
         match command.as_str() {
             "frac" => {
-                let numerator = self.parse_required_group();
-                let denominator = self.parse_required_group();
+                let numerator = self.parse_required_group(depth + 1);
+                let denominator = self.parse_required_group(depth + 1);
                 MathNode::Fraction {
                     numerator: Box::new(numerator),
                     denominator: Box::new(denominator),
@@ -242,7 +271,7 @@ impl<'a> MathParser<'a> {
             }
             "sqrt" => {
                 skip_optional_math_group(&mut self.chars);
-                MathNode::Sqrt(Box::new(self.parse_required_group()))
+                MathNode::Sqrt(Box::new(self.parse_required_group(depth + 1)))
             }
             "left" | "right" => {
                 consume_math_spaces(&mut self.chars);
@@ -513,7 +542,7 @@ fn layout_math_fraction(
 
 fn layout_math_sqrt(body: &MathNode, fonts: &FontSet<'_>) -> MathLayout {
     let body = layout_math(body, fonts, false);
-    let sign_width = fonts.math.text_width("√");
+    let sign_width = fonts.math.text_width("\u{221a}");
     let body_x = sign_width + 2;
     let body_y = 2usize;
     let sign_height = fonts.math.glyph_height as usize;
@@ -552,68 +581,68 @@ pub(super) fn math_text_baseline(font: &Font) -> usize {
 
 fn tex_symbol(command: &str) -> Option<&'static str> {
     match command {
-        "alpha" => Some("α"),
-        "beta" => Some("β"),
-        "gamma" => Some("γ"),
-        "delta" => Some("δ"),
-        "epsilon" => Some("ε"),
-        "varepsilon" => Some("ϵ"),
-        "zeta" => Some("ζ"),
-        "eta" => Some("η"),
-        "theta" => Some("θ"),
-        "vartheta" => Some("ϑ"),
-        "iota" => Some("ι"),
-        "kappa" => Some("κ"),
-        "lambda" => Some("λ"),
-        "mu" => Some("μ"),
-        "nu" => Some("ν"),
-        "xi" => Some("ξ"),
-        "pi" => Some("π"),
-        "rho" => Some("ρ"),
-        "sigma" => Some("σ"),
-        "tau" => Some("τ"),
-        "upsilon" => Some("υ"),
-        "phi" => Some("φ"),
-        "varphi" => Some("ϕ"),
-        "chi" => Some("χ"),
-        "psi" => Some("ψ"),
-        "omega" => Some("ω"),
-        "Gamma" => Some("Γ"),
-        "Delta" => Some("Δ"),
-        "Theta" => Some("Θ"),
-        "Lambda" => Some("Λ"),
-        "Xi" => Some("Ξ"),
-        "Pi" => Some("Π"),
-        "Sigma" => Some("Σ"),
-        "Upsilon" => Some("Υ"),
-        "Phi" => Some("Φ"),
-        "Psi" => Some("Ψ"),
-        "Omega" => Some("Ω"),
-        "times" => Some("×"),
-        "cdot" => Some("·"),
-        "pm" => Some("±"),
-        "mp" => Some("∓"),
-        "le" | "leq" => Some("≤"),
-        "ge" | "geq" => Some("≥"),
-        "ne" | "neq" => Some("≠"),
-        "approx" => Some("≈"),
-        "infty" => Some("∞"),
-        "partial" => Some("∂"),
-        "nabla" => Some("∇"),
-        "sum" => Some("∑"),
-        "prod" => Some("∏"),
-        "int" => Some("∫"),
-        "sqrt" => Some("√"),
-        "to" | "rightarrow" => Some("→"),
-        "leftarrow" => Some("←"),
-        "Rightarrow" => Some("⇒"),
-        "Leftarrow" => Some("⇐"),
-        "in" => Some("∈"),
-        "notin" => Some("∉"),
-        "subset" => Some("⊂"),
-        "subseteq" => Some("⊆"),
-        "cup" => Some("∪"),
-        "cap" => Some("∩"),
+        "alpha" => Some("\u{03b1}"),
+        "beta" => Some("\u{03b2}"),
+        "gamma" => Some("\u{03b3}"),
+        "delta" => Some("\u{03b4}"),
+        "epsilon" => Some("\u{03b5}"),
+        "varepsilon" => Some("\u{03f5}"),
+        "zeta" => Some("\u{03b6}"),
+        "eta" => Some("\u{03b7}"),
+        "theta" => Some("\u{03b8}"),
+        "vartheta" => Some("\u{03d1}"),
+        "iota" => Some("\u{03b9}"),
+        "kappa" => Some("\u{03ba}"),
+        "lambda" => Some("\u{03bb}"),
+        "mu" => Some("\u{03bc}"),
+        "nu" => Some("\u{03bd}"),
+        "xi" => Some("\u{03be}"),
+        "pi" => Some("\u{03c0}"),
+        "rho" => Some("\u{03c1}"),
+        "sigma" => Some("\u{03c3}"),
+        "tau" => Some("\u{03c4}"),
+        "upsilon" => Some("\u{03c5}"),
+        "phi" => Some("\u{03c6}"),
+        "varphi" => Some("\u{03d5}"),
+        "chi" => Some("\u{03c7}"),
+        "psi" => Some("\u{03c8}"),
+        "omega" => Some("\u{03c9}"),
+        "Gamma" => Some("\u{0393}"),
+        "Delta" => Some("\u{0394}"),
+        "Theta" => Some("\u{0398}"),
+        "Lambda" => Some("\u{039b}"),
+        "Xi" => Some("\u{039e}"),
+        "Pi" => Some("\u{03a0}"),
+        "Sigma" => Some("\u{03a3}"),
+        "Upsilon" => Some("\u{03a5}"),
+        "Phi" => Some("\u{03a6}"),
+        "Psi" => Some("\u{03a8}"),
+        "Omega" => Some("\u{03a9}"),
+        "times" => Some("\u{00d7}"),
+        "cdot" => Some("\u{00b7}"),
+        "pm" => Some("\u{00b1}"),
+        "mp" => Some("\u{2213}"),
+        "le" | "leq" => Some("\u{2264}"),
+        "ge" | "geq" => Some("\u{2265}"),
+        "ne" | "neq" => Some("\u{2260}"),
+        "approx" => Some("\u{2248}"),
+        "infty" => Some("\u{221e}"),
+        "partial" => Some("\u{2202}"),
+        "nabla" => Some("\u{2207}"),
+        "sum" => Some("\u{2211}"),
+        "prod" => Some("\u{220f}"),
+        "int" => Some("\u{222b}"),
+        "sqrt" => Some("\u{221a}"),
+        "to" | "rightarrow" => Some("\u{2192}"),
+        "leftarrow" => Some("\u{2190}"),
+        "Rightarrow" => Some("\u{21d2}"),
+        "Leftarrow" => Some("\u{21d0}"),
+        "in" => Some("\u{2208}"),
+        "notin" => Some("\u{2209}"),
+        "subset" => Some("\u{2282}"),
+        "subseteq" => Some("\u{2286}"),
+        "cup" => Some("\u{222a}"),
+        "cap" => Some("\u{2229}"),
         _ => None,
     }
 }

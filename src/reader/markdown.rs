@@ -809,3 +809,128 @@ fn next_utf8_char(text: &str, pos: &mut usize) -> char {
     *pos += ch.len_utf8();
     ch
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_wiki_links_simple() {
+        let (text, links) = extract_wiki_links("Hello [[world]]!");
+        assert_eq!(text, "Hello world!");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "world");
+        assert_eq!(links[0].alias, "world");
+    }
+
+    #[test]
+    fn test_extract_wiki_links_with_alias() {
+        let (text, links) = extract_wiki_links("See [[target|display name]] here");
+        assert_eq!(text, "See display name here");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "target");
+        assert_eq!(links[0].alias, "display name");
+    }
+
+    #[test]
+    fn test_extract_wiki_links_multiple() {
+        let (text, links) = extract_wiki_links("[[a]] and [[b|c]]");
+        assert_eq!(text, "a and c");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].alias, "a");
+        assert_eq!(links[1].alias, "c");
+    }
+
+    #[test]
+    fn test_extract_wiki_links_skip_image_embed() {
+        let (text, links) = extract_wiki_links("![[photo.jpg]] and [[page]]");
+        assert_eq!(text, "![[photo.jpg]] and page");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "page");
+    }
+
+    #[test]
+    fn test_extract_wiki_links_no_links() {
+        let (text, links) = extract_wiki_links("Plain text without links");
+        assert_eq!(text, "Plain text without links");
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_extract_wiki_links_utf8_alias() {
+        let (text, links) = extract_wiki_links("[[note|中文显示]]测试");
+        assert_eq!(text, "中文显示测试");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "note");
+        assert_eq!(links[0].alias, "中文显示");
+        // Byte offsets should be correct for UTF-8
+        assert_eq!(&text[links[0].start_byte..links[0].end_byte], "中文显示");
+    }
+
+    #[test]
+    fn test_preprocess_obsidian_embeds_simple() {
+        let input = "Look at ![[image.png]] here";
+        let output = preprocess_obsidian_embeds(input);
+        assert!(output.contains("![image.png](<image.png>)"));
+    }
+
+    #[test]
+    fn test_preprocess_obsidian_embeds_with_label() {
+        let input = "See ![[diagram.jpg|My Diagram]]";
+        let output = preprocess_obsidian_embeds(input);
+        assert!(output.contains("My Diagram"));
+        assert!(output.contains("diagram.jpg"));
+    }
+
+    #[test]
+    fn test_preprocess_obsidian_embeds_ignores_code_fences() {
+        let input = "```\n![[ignored.png]]\n```\n![[real.png]]";
+        let output = preprocess_obsidian_embeds(input);
+        // Inside fence should remain unchanged
+        assert!(output.contains("![[ignored.png]]"));
+        // Outside fence should be converted
+        assert!(output.contains("![real.png](<real.png>)"));
+    }
+
+    #[test]
+    fn test_parse_markdown_blocks_heading() {
+        let blocks = parse_markdown_blocks("# Hello\n\nWorld");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].style, BlockStyle::Heading(1));
+        assert_eq!(blocks[0].text, "Hello");
+        assert_eq!(blocks[1].style, BlockStyle::Paragraph);
+        assert_eq!(blocks[1].text, "World");
+    }
+
+    #[test]
+    fn test_parse_markdown_blocks_wiki_links_in_paragraph() {
+        let blocks = parse_markdown_blocks("See [[target]] here");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].style, BlockStyle::Paragraph);
+        assert_eq!(blocks[0].text, "See target here");
+        assert_eq!(blocks[0].wiki_links.len(), 1);
+        assert_eq!(blocks[0].wiki_links[0].target, "target");
+    }
+
+    #[test]
+    fn test_parse_markdown_blocks_no_wiki_links_in_code() {
+        let blocks = parse_markdown_blocks("```\n[[not a link]]\n```");
+        // Wiki links inside code blocks should not be extracted
+        let code_block = blocks.iter().find(|b| b.style == BlockStyle::Code);
+        if let Some(b) = code_block {
+            assert!(b.wiki_links.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_markdown_blocks_list() {
+        let blocks = parse_markdown_blocks("- Item 1\n- Item 2");
+        let list_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.style == BlockStyle::ListItem)
+            .collect();
+        assert_eq!(list_blocks.len(), 2);
+        assert!(list_blocks[0].text.contains("Item 1"));
+        assert!(list_blocks[1].text.contains("Item 2"));
+    }
+}

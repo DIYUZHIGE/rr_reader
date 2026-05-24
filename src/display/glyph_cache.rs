@@ -58,30 +58,43 @@ impl GlyphCache {
             return None;
         }
 
-        let bitmap = self.scratch[..size].to_vec();
-        let entry = GlyphCacheEntry {
-            font_id,
-            codepoint,
-            bitmap,
-            last_used: now,
-        };
-
-        let index = if self.entries.len() < GLYPH_CACHE_CAPACITY {
-            self.entries.push(entry);
-            self.entries.len() - 1
+        let bitmap = if self.entries.len() < GLYPH_CACHE_CAPACITY {
+            // Under capacity: allocate a fresh bitmap.
+            let mut v = Vec::with_capacity(size);
+            v.extend_from_slice(&self.scratch[..size]);
+            v
         } else {
-            let index = self
+            // Evict the LRU entry and reuse its allocation to avoid a free+alloc pair.
+            let evict = self
                 .entries
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(index, _)| index)
                 .unwrap_or(0);
-            self.entries[index] = entry;
-            index
+            let mut v = std::mem::take(&mut self.entries[evict].bitmap);
+            v.clear();
+            if v.capacity() < size {
+                v.reserve_exact(size - v.capacity());
+            }
+            v.extend_from_slice(&self.scratch[..size]);
+            self.entries[evict] = GlyphCacheEntry {
+                font_id,
+                codepoint,
+                bitmap: v,
+                last_used: now,
+            };
+            return Some(&self.entries[evict].bitmap);
         };
 
-        Some(&self.entries[index].bitmap)
+        let entry = GlyphCacheEntry {
+            font_id,
+            codepoint,
+            bitmap,
+            last_used: now,
+        };
+        self.entries.push(entry);
+        Some(&self.entries[self.entries.len() - 1].bitmap)
     }
 
     /// Free all cached glyph bitmaps to reclaim heap for large allocations.
