@@ -30,8 +30,7 @@
 - 阅读进度保存
 - Obsidian wiki link 跳转
 - 目录树浏览
-- S3 / remotely-save 同步
-- WiFi 配置
+- 自动同步（目前仅支持手动触发同步）
 
 ## SD 卡布局
 
@@ -171,6 +170,70 @@ cargo check
 
 公式支持走轻量自研路线。设备是 ESP32-C3、无 PSRAM、黑白墨水屏，直接集成完整 TeX 或 KaTeX 级别的布局/字体系统成本较高。当前实现优先覆盖 Obsidian 笔记里最常见的块公式结构，后续再按实际笔记补语法。
 
+## S3 同步配置
+
+将配置文件放到 SD 卡上，设备会在以下位置按顺序查找（找到第一个即停止）：
+
+1. `/sdcard/remotely_save.conf`
+2. `/sdcard/remotely_save.txt`
+3. `/sdcard/vault/remotely_save.conf`
+
+文件最大 16KB，支持两种格式：
+
+### 格式一：键值对（推荐）
+
+```ini
+endpoint=https://s3.amazonaws.com
+region=us-east-1
+access_key_id=AKIAIOSFODNN7EXAMPLE
+secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+bucket=my-obsidian-vault
+# 可选：
+remote_prefix=obsidian/
+force_path_style=true
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `endpoint` / `s3_endpoint` | ✅ | S3 兼容服务的端点 URL |
+| `region` / `s3_region` | ✅ | S3 区域，如 `us-east-1` |
+| `access_key_id` / `s3_access_key_id` | ✅ | Access Key ID |
+| `secret_access_key` / `s3_secret_access_key` | ✅ | Secret Access Key |
+| `bucket` / `bucket_name` / `s3_bucket_name` | ✅ | S3 存储桶名称 |
+| `remote_prefix` / `prefix` | ❌ | 远程路径前缀，默认为空 |
+| `force_path_style` | ❌ | 是否使用路径风格访问（`true`/`false`/`1`/`0`），默认 `false` |
+
+支持 `#` 和 `//` 开头的注释行，值可以用引号包裹。
+
+### 格式二：Obsidian remotely-save 深度链接
+
+如果你使用 Obsidian 的 [remotely-save](https://github.com/remotely-save/remotely-save) 插件，可以直接把插件的同步配置导出为深度链接格式写入配置文件：
+
+```
+obsidian://remotely-save?data=%7B%22s3%22%3A%7B%22s3Endpoint%22%...
+```
+
+设备会自动解析其中的 S3 配置。
+
+### WiFi 配置
+
+同步需要 WiFi 连接。配置文件查找顺序：
+
+1. `/sdcard/wifi.conf`
+2. `/sdcard/wifi.txt`
+3. `/sdcard/vault/wifi.conf`
+
+```ini
+ssid=MyWiFi
+password=MyPassword
+```
+
+也可以通过设备的 **Wi-Fi 设置** 界面扫描连接，连接成功后凭据会自动保存到 `/sdcard/wifi.conf`。
+
+### 手动触发同步
+
+进入 **设置** → 选择 **手动同步（S3）**，设备会连接 WiFi 并从 S3 下载 vault 到 `/sdcard/vault`。
+
 ## 下一步
 
 建议优先级：
@@ -181,4 +244,3 @@ cargo check
 4. Markdown 渲染补齐：链接文本、粗体/斜体/删除线的视觉区分。
 5. Obsidian 特性：`[[wiki link]]`、标签、callout。
 6. 公式支持：补齐矩阵、复杂定界符伸缩和公式自动换行。
-7. WiFi + S3 同步：读取 remotely-save 配置并下载 vault。
