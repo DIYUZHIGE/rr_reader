@@ -1,4 +1,7 @@
 # rr_reader
+---
+> 我本人对ESP32几乎一无所知，这个项目的所有代码由DeepSeek完成。
+---
 
 在**阅星瞳 X4** 墨水屏设备上阅读 Obsidian vault 的固件。
 

@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     // as a device on the already-initialized bus.
     platform::init_shared_spi_bus()?;
 
+
     // Display adds itself as a raw SPI device on the shared bus.
     // Takes full Peripherals (uses GPIO pins; SPI peripherals are unused here).
     let display = display::Display::new(pins)?;
