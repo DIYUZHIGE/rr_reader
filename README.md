@@ -1,178 +1,153 @@
 # rr_reader
 
-在阅星瞳 X4 墨水屏设备上离线浏览一个 Obsidian vault。
+在**阅星瞳 X4** 墨水屏设备上阅读 Obsidian vault 的固件。
 
-当前目标很具体：把 Obsidian vault 放到 SD 卡的 `/vault` 目录，设备启动后递归扫描其中的 Markdown 文件，在墨水屏上显示文件列表，选择文件后显示内容。
+- 将 vault 放到 SD 卡，设备启动后即可浏览和阅读所有 Markdown 文件
+- 支持公式渲染、图片显示、WiFi 连接、S3 同步
+- 基于 ESP32-C3 + ESP-IDF + Rust 构建
 
-## 当前状态
+## 功能概览
 
-已实现：
+### 文件浏览
 
-- ESP32-C3 + ESP-IDF Rust 工程启动
-- SD 卡挂载，挂载点为 `/sdcard`
-- 递归扫描 `/sdcard/vault` 下的 Markdown 文件
-- 支持 `.md`、`.markdown`，扩展名大小写不敏感
-- SSD1677 800x480 墨水屏驱动
-- 共享 SPI2 总线：显示屏和 SD 卡共用总线，不同 CS
-- 多字号压缩点阵字体：20px UI、23px 阅读支持 CJK，14px math 和 12px script 支持 Latin、Greek 和常用数学符号，统一使用更纱黑体
-- 文件浏览器：显示文件列表、当前选中项、文件总数
-- 基础 Reader：打开 Markdown 文件并按屏幕尺寸分页显示
-- Reader 翻页：侧键或左右键在当前文件内翻页
-- 基础 Markdown 渲染：标题、列表、任务列表、引用、代码块、分割线、表格简化显示
-- 公式渲染：支持识别 `$...$` 行内公式和 `$$...$$` 块公式；支持 `^`、`_`、`\frac`、`\sqrt` 的轻量二维布局，并替换常见希腊字母和数学符号
-- 图片显示：支持 Markdown 图片、Obsidian `![[...]]` 图片嵌入和 JPEG 解码，其他图片格式显示占位框
-- 按键输入：前键、侧键、电源键，参考 crosspoint 的 ADC 阈值和去抖模型
-- 深度睡眠入口：长按电源键进入睡眠
+- 递归扫描 `/sdcard/vault` 下的 `.md` / `.markdown` 文件
+- 目录层级浏览：进入子目录、返回上级
+- 显示文件名（不含扩展名）、当前选中项、目录内文件总数
+- 支持通过 `/sdcard/vault/.rr_reader.conf` 配置默认浏览根目录
 
-还没实现：
+### Markdown 阅读
 
-- 完整 TeX / LaTeX 公式排版：暂不支持矩阵、自动换行、复杂定界符伸缩等完整 TeX 布局
-- 阅读进度保存
-- Obsidian wiki link 跳转
-- 目录树浏览
-- 自动同步（目前仅支持手动触发同步）
+- 使用 `pulldown-cmark` 解析 Markdown，按屏幕尺寸自动分页
+- 支持标题（1–6 级）、段落、无序/有序列表、任务列表、引用块、代码块、分割线、表格
+- **Obsidian wiki 链接**：识别 `[[target|alias]]`，支持链接选中跳转和阅读历史回溯
+- 边距缩进：列表、引用块、代码块均有独立缩进层级
+- 页面缓存到 SD 卡，二次打开无需重新解析
 
-## SD 卡布局
+### 公式渲染
 
-把 Obsidian vault 放到 SD 卡根目录下的 `vault` 文件夹：
+- 行内公式 `$...$` 和块公式 `$$...$$`
+- 支持的 LaTeX 结构：上标 `^`、下标 `_`、分数 `\frac{}{}`、根号 `\sqrt{}`、`\text{}`
+- ~50 个常用符号映射（希腊字母、运算符、关系符、箭头等）
+- 双字体系统：14px math 字体 + 12px script 字体，支持嵌套表达式
+- 递归布局引擎：像素级精确的上下标偏移、分数线绘制、根号笔画
 
-```text
-/vault/
-├── Daily/
-│   └── 2026-05-01.md
-├── Projects/
-│   └── rr_reader.md
-└── index.md
-```
+### 图片显示
 
-设备启动后会扫描：
+- Markdown 图片 `![](path)` 和 Obsidian 嵌入 `![[path]]`
+- JPEG 硬件加速解码（ESP-IDF tjpgd），自动缩放适配屏幕
+- Floyd-Steinberg 抖动算法转 1-bit 单色
+- 解码后的位图缓存到 SD 卡（`/sdcard/vault/.rr_cache/`），二次打开即时显示
+- 非 JPEG 格式显示占位框（含文件名）
+- 支持 Obsidian 尺寸提示（`|widthxheight`）
 
-```text
-/sdcard/vault
-```
+### WiFi 与 S3 同步
 
-扫描规则：
+- WiFi STA 模式：扫描、密码连接、凭据持久化
+- 支持 WPA2 和开放网络
+- **S3 同步引擎**：兼容阿里云 OSS 及 S3 协议
+  - OSS V4 签名（`OSS4-HMAC-SHA256`）
+  - 分页列出远程对象，流式 XML 解析
+  - 小文件直接下载，大文件分块续传（支持断点续传）
+  - 清单驱动的增量同步（跳过未变更文件）
+  - 自动清理远程已删除的本地文件
+- 设置界面提供：手动同步、删除本地并重新同步、缓存所有图片
+- 进入阅读模式自动暂停 WiFi，退出后恢复
 
-- 递归扫描所有子目录
-- 只显示 `.md` 和 `.markdown`
-- 扩展名大小写不敏感，例如 `.MD` 也会识别
-- 列表里显示的是相对 `/sdcard/vault` 的路径
+### 电源管理
 
-## 按键
+- 30 分钟无操作自动提示睡眠
+- 长按电源键 2 秒进入深度睡眠
+- 电源键唤醒（需按住确认）
 
-文件浏览器：
+### 显示刷新
 
-| 操作 | 按键 |
-|------|------|
-| 下一项 | 侧下 / Right |
-| 上一项 | 侧上 / Left |
-| 打开文件 | Confirm |
-| 长按滚动 | 侧键或 Left/Right 长按 |
+三种刷新模式自动调度：
 
-阅读界面：
+| 模式 | 耗时 | 场景 |
+|------|------|------|
+| Full | ~1600ms | 开机、唤醒 |
+| Half | ~900ms | 菜单切换 |
+| Fast | ~400ms | 翻页 |
 
-| 操作 | 按键 |
-|------|------|
-| 返回文件列表 | Back / Left |
-| 下一页 | 侧下 / Right |
-| 上一页 | 侧上 / Left |
-| 重新渲染当前文件 | Confirm |
-| 睡眠 | 长按电源键 |
+每 50 次 Fast 刷新自动插入一次 Half 清理残影。
 
 ## 硬件
 
-目标设备：阅星瞳 X4。
-
-已按 crosspoint-reader 实测参数配置：
+目标设备：**阅星瞳 X4**
 
 | 部件 | 参数 |
 |------|------|
 | MCU | ESP32-C3 |
-| RAM | 无 PSRAM，约 380KB 可用 |
+| RAM | 约 380KB 可用（无 PSRAM） |
 | Flash | 16MB |
-| 屏幕 | 4.26" E-Ink，SSD1677，800x480，黑白 |
-| 存储 | MicroSD，SPI |
+| 屏幕 | 4.26" E-Ink，SSD1677，800×480 黑白 |
+| 存储 | MicroSD，SPI 模式 |
 | 输入 | 4 个前键、2 个侧键、电源键 |
 
-GPIO：
+### GPIO
 
-```text
-显示屏:
-  SCLK  GPIO8
-  MISO  GPIO7
-  MOSI  GPIO10
-  CS    GPIO21
-  DC    GPIO4
-  RST   GPIO5
-  BUSY  GPIO6
-
-SD 卡:
-  CS    GPIO12
-
-按键:
-  前按钮组  GPIO1 / ADC1_CH1
-  侧按钮组  GPIO2 / ADC1_CH2
-  电源键    GPIO3，active low
+```
+显示屏:  SCLK=GPIO8  MISO=GPIO7  MOSI=GPIO10  CS=GPIO21  DC=GPIO4  RST=GPIO5  BUSY=GPIO6
+SD 卡:   CS=GPIO12
+按键:    前按钮组=GPIO1(ADC1_CH1)  侧按钮组=GPIO2(ADC1_CH2)  电源键=GPIO3(active low)
 ```
 
-ADC 阈值来自 crosspoint 实测：
+显示屏和 SD 卡共享 SPI2 总线，通过不同 CS 引脚区分。
 
-| 按键 | ADC 范围 |
-|------|----------|
-| Back | 3100-3800 |
-| Confirm | 2090-3100 |
-| Left | 750-2090 |
-| Right | 0-750 |
-| Up | 1120-3800 |
-| Down | 0-1120 |
-| 无按下 | >= 3800 |
+### ADC 按键阈值
 
-## 构建和刷机
+| 按键 | 前按钮组 (GPIO1) | 侧按钮组 (GPIO2) |
+|------|-------------------|-------------------|
+| Back | 3100–3800 | — |
+| Confirm | 2090–3100 | — |
+| Left | 750–2090 | — |
+| Right | 0–750 | — |
+| Up | — | 1120–3800 |
+| Down | — | 0–1120 |
+| 无按下 | ≥ 3800 | ≥ 3800 |
 
-在 `rr_reader` 目录运行：
+## 按键操作
 
-```bash
-cargo run --release
+### 文件浏览器
+
+| 操作 | 按键 |
+|------|------|
+| 上/下一项 | 侧上 / 侧下 或 Left / Right |
+| 打开文件/进入目录 | Confirm |
+| 返回上级目录 | Back |
+| 打开设置 | 长按 Confirm |
+| 随机打开文件 | 长按 Back |
+
+### 阅读界面
+
+| 操作 | 按键 |
+|------|------|
+| 上/下一页 | 侧上 / 侧下 或 Left / Right |
+| 返回文件列表 | Back |
+| 返回阅读历史（上一步） | Left |
+| 重新渲染当前页 | Confirm |
+| 选中/取消 wiki 链接 | 长按 Confirm |
+| 跳转到选中的链接 | Confirm（有链接选中时） |
+| 进入睡眠 | 长按电源键 2 秒 |
+
+## SD 卡布局
+
 ```
-
-这会构建固件，并通过 `espflash flash --monitor` 刷入设备和打开串口监视器。
-
-常用检查：
-
-```bash
-cargo fmt
-cargo check
+/sdcard/
+├── vault/                     ← vault 内容（本地或 S3 同步）
+│   ├── Daily/
+│   ├── Projects/
+│   ├── .rr_cache/             ← 图片解码缓存
+│   ├── .rr_reader.conf        ← 浏览器根目录配置
+│   └── ...
+├── remotely_save.conf          ← S3 同步配置
+├── wifi.conf                   ← WiFi 凭据
+└── ...
 ```
-
-## 设计取舍
-
-### 先做本地 vault，再做同步
-
-这个项目最终可以接 Obsidian remotely-save 的 S3 配置，但当前阶段优先保证本地阅读闭环：
-
-1. SD 卡能稳定读取 vault
-2. 文件列表能正确显示
-3. 按键选择和打开文件可靠
-4. Markdown 能分页阅读
-5. 阅读进度能保存
-
-同步功能会放到阅读体验稳定之后再做，否则 SD、显示、按键、网络问题会混在一起，不利于调试。
-
-### 当前 Reader 是轻量 Markdown 分页器
-
-现在 Reader 使用 `pulldown-cmark` 解析 Markdown，再按字体宽度和屏幕高度分页。当前重点是把常见 Obsidian 笔记以稳定、低内存的方式显示出来，因此渲染能力是取舍后的子集：
-
-- 支持标题、列表、任务列表、引用、代码块、分割线、表格简化显示。
-- 支持识别 Obsidian / TeX 风格的 `$...$` 和 `$$...$$`；行内公式和块公式使用 14px math 字体和 12px script 字体绘制 `^`、`_`、`\frac`、`\sqrt` 的轻量二维布局。
-- 支持 Markdown 图片和 Obsidian `![[...]]` 图片嵌入；JPEG 会尝试解码显示，其他格式显示图片占位框。
-- 不支持完整富文本排版，粗体/斜体/删除线目前不会表现为不同字形。
-- 不支持完整 TeX / LaTeX 公式排版；矩阵、自动换行、复杂定界符伸缩等高级布局还未实现。
-
-公式支持走轻量自研路线。设备是 ESP32-C3、无 PSRAM、黑白墨水屏，直接集成完整 TeX 或 KaTeX 级别的布局/字体系统成本较高。当前实现优先覆盖 Obsidian 笔记里最常见的块公式结构，后续再按实际笔记补语法。
 
 ## S3 同步配置
 
-将配置文件放到 SD 卡上，设备会在以下位置按顺序查找（找到第一个即停止）：
+配置文件按以下顺序查找（找到第一个即停止）：
 
 1. `/sdcard/remotely_save.conf`
 2. `/sdcard/remotely_save.txt`
@@ -183,41 +158,39 @@ cargo check
 ### 格式一：键值对（推荐）
 
 ```ini
-endpoint=https://s3.amazonaws.com
-region=us-east-1
-access_key_id=AKIAIOSFODNN7EXAMPLE
-secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+endpoint=https://oss-cn-hangzhou.aliyuncs.com
+region=cn-hangzhou
+access_key_id=LTAI5tXXXXXXXXXXXXXX
+secret_access_key=XXXXXXXXXXXXXXXXXXXXXXXX
 bucket=my-obsidian-vault
-# 可选：
+# 以下可选
 remote_prefix=obsidian/
-force_path_style=true
+force_path_style=false
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `endpoint` / `s3_endpoint` | ✅ | S3 兼容服务的端点 URL |
-| `region` / `s3_region` | ✅ | S3 区域，如 `us-east-1` |
+| `endpoint` / `s3_endpoint` | ✅ | S3 兼容端点 URL |
+| `region` / `s3_region` | ✅ | 区域，如 `cn-hangzhou` |
 | `access_key_id` / `s3_access_key_id` | ✅ | Access Key ID |
 | `secret_access_key` / `s3_secret_access_key` | ✅ | Secret Access Key |
-| `bucket` / `bucket_name` / `s3_bucket_name` | ✅ | S3 存储桶名称 |
-| `remote_prefix` / `prefix` | ❌ | 远程路径前缀，默认为空 |
-| `force_path_style` | ❌ | 是否使用路径风格访问（`true`/`false`/`1`/`0`），默认 `false` |
+| `bucket` / `bucket_name` / `s3_bucket_name` | ✅ | 存储桶名称 |
+| `remote_prefix` / `prefix` | ❌ | 远程路径前缀 |
+| `force_path_style` | ❌ | 路径风格访问（`true`/`false`），默认 `false` |
 
-支持 `#` 和 `//` 开头的注释行，值可以用引号包裹。
+支持 `#` 和 `//` 开头的注释行，值可以用单引号或双引号包裹。
 
 ### 格式二：Obsidian remotely-save 深度链接
 
-如果你使用 Obsidian 的 [remotely-save](https://github.com/remotely-save/remotely-save) 插件，可以直接把插件的同步配置导出为深度链接格式写入配置文件：
+如果使用 Obsidian [remotely-save](https://github.com/remotely-save/remotely-save) 插件，可直接粘贴导出的深度链接：
 
 ```
-obsidian://remotely-save?data=%7B%22s3%22%3A%7B%22s3Endpoint%22%...
+obsidian://remotely-save?data=%7B%22s3%22%3A%7B...
 ```
-
-设备会自动解析其中的 S3 配置。
 
 ### WiFi 配置
 
-同步需要 WiFi 连接。配置文件查找顺序：
+配置文件按顺序查找：
 
 1. `/sdcard/wifi.conf`
 2. `/sdcard/wifi.txt`
@@ -228,19 +201,60 @@ ssid=MyWiFi
 password=MyPassword
 ```
 
-也可以通过设备的 **Wi-Fi 设置** 界面扫描连接，连接成功后凭据会自动保存到 `/sdcard/wifi.conf`。
+也可通过设备上 **设置 → Wi-Fi 设置** 扫描连接，成功后凭据自动保存。
 
-### 手动触发同步
+## 构建与刷机
 
-进入 **设置** → 选择 **手动同步（S3）**，设备会连接 WiFi 并从 S3 下载 vault 到 `/sdcard/vault`。
+需要安装 [espup](https://github.com/esp-rs/espup) 和 `espflash`：
 
-## 下一步
+```bash
+# 在 rr_reader 目录下
+cargo run --release
+```
 
-建议优先级：
+此命令会构建固件并通过 `espflash flash --monitor` 刷入设备并打开串口监视器。
 
-1. 修稳按键和刷新：确认侧键、前键、Half refresh 在真机上都可靠。
-2. 保存阅读进度：记录每个文件最后阅读页。
-3. 文件浏览器目录化：支持文件夹展开/进入，而不是扁平路径列表。
-4. Markdown 渲染补齐：链接文本、粗体/斜体/删除线的视觉区分。
-5. Obsidian 特性：`[[wiki link]]`、标签、callout。
-6. 公式支持：补齐矩阵、复杂定界符伸缩和公式自动换行。
+```bash
+cargo fmt      # 格式化
+cargo check    # 类型检查
+```
+
+### 字体生成
+
+字体使用自定义 FNT2 压缩点阵格式，通过 `tools/generate_font.py` 从 TTF 生成。
+
+当前字体规格：
+
+| 字体 | 字号 | 用途 | 字符集 |
+|------|------|------|--------|
+| ui | 20px | 文件列表、设置、WiFi UI | CJK |
+| reader | 23px | 正文阅读 | CJK |
+| math | 14px | 公式主体 | Latin、Greek、数学符号 |
+| script | 12px | 上下标 | Latin、Greek、数学符号 |
+
+## 设计说明
+
+### 内存策略
+
+ESP32-C3 仅有约 380KB 堆内存，必须精打细算：
+
+- **静态帧缓冲**：384KB 的显示帧缓冲放在 `.bss` 段，不占用堆
+- **字形缓存**：12 条目 LRU 缓存，复用解压缓冲区
+- **分页缓存**：Reader 将解析后的页面序列化到 SD 卡，二次打开无需重新解析整个文件
+- **图片缓存**：JPEG 解码后的单色位图持久化到 SD 卡
+- **流式 S3**：XML 解析和分块下载均为流式，不将完整响应加载到内存
+- **同步清单**：增量写入临时文件，定期原子替换，避免内存中持有完整清单
+- 关键路径有堆诊断日志，方便发现内存泄漏
+
+### 公式走轻量自研路线
+
+设备无 PSRAM、黑白墨水屏，集成完整 TeX/KaTeX 成本过高。当前实现覆盖了 Obsidian 笔记中最常见的块公式结构，后续按实际笔记补语法。
+
+## 尚未实现
+
+- 完整 TeX 排版：矩阵、自动换行、复杂定界符伸缩
+- 粗体/斜体/删除线视觉区分
+- Obsidian callout
+- 标签解析与显示
+- 阅读进度保存
+- 自动定时同步
